@@ -57,6 +57,88 @@
     "max_drawdown_pct": 0.25,
     "loss_threshold_pct": -0.08
   },
+  
+  "policies": [
+    {
+      "name": "Portfolio drawdown escalation",
+      "description": "Escalate when the portfolio drawdown exceeds 15%.",
+      "trigger": {
+        "type": "metric_threshold",
+        "metric": "portfolio.drawdown_pct",
+        "operator": ">=",
+        "value": 0.15,
+        "cooldown_seconds": 600
+      },
+      "actions": [
+        {
+          "type": "log",
+          "message": "Portfolio drawdown is {value:.2%} (limit {threshold:.2%}).",
+          "severity": "warning"
+        },
+        {
+          "type": "notify",
+          "message": "Portfolio drawdown of {value:.2%} breached the {threshold:.2%} policy.",
+          "channels": ["email", "slack"],
+          "subject": "Risk policy breach: portfolio drawdown"
+        },
+        {
+          "type": "require_confirmation",
+          "message": "Confirm whether to trigger the global kill switch due to drawdown breach.",
+          "confirmation_key": "portfolio-kill-switch"
+        }
+      ],
+      "manual_override": {
+        "allowed": true,
+        "instructions": "Desk lead approval required to keep trading after breach.",
+        "expires_after_seconds": 3600
+      }
+    },
+    {
+      "name": "Binance balance floor",
+      "description": "Alert when the Binance futures account balance drops below $40k.",
+      "trigger": {
+        "type": "metric_threshold",
+        "metric": "account.Binance Futures TheAlter.balance",
+        "operator": "<",
+        "value": 40000
+      },
+      "actions": [
+        {
+          "type": "log",
+          "message": "Binance balance is ${value:,.2f}, below the ${threshold:,.2f} floor.",
+          "severity": "warning"
+        },
+        {
+          "type": "notify",
+          "message": "Binance account balance fell to ${value:,.2f} (policy floor ${threshold:,.2f}).",
+          "channels": ["email"],
+          "subject": "Risk policy breach: Binance balance"
+        }
+      ],
+      "manual_override": {
+        "allowed": true,
+        "instructions": "Escalate to exchange coverage before overriding the balance floor.",
+        "expires_after_seconds": 7200
+      }
+
+  "scenarios": [
+    {
+      "id": "btc_minus_10",
+      "name": "BTC -10%",
+      "description": "Bitcoin sells off by ten percent.",
+      "shocks": [
+        {"symbol": "BTCUSDT", "price_pct": -0.10}
+      ]
+    },
+    {
+      "id": "eth_minus_15",
+      "name": "ETH -15%",
+      "description": "Ethereum retraces sharply.",
+      "shocks": [
+        {"symbol": "ETHUSDT", "price_pct": -0.15}
+      ]
+    }
+  ],
   "email": {
     "host": "smtppro.zoho.in",
     "port": 587,

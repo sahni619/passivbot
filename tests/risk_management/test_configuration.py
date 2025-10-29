@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from risk_management.audit import reset_audit_registry
 from risk_management.configuration import (  # noqa: E402
     _ensure_debug_logging_enabled,
     _merge_credentials,
@@ -238,6 +239,67 @@ def test_load_realtime_config_supports_nested_user_entries(tmp_path: Path) -> No
     assert okx.credentials["secret"] == "d"
     assert okx.credentials["password"] == "p"
     assert config.config_root == config_path.parent.resolve()
+
+
+def test_policies_parsed_from_configuration(tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["policies"] = [
+        {
+            "name": "Balance guard",
+            "description": "Alert when portfolio balance exceeds $10k",
+            "trigger": {
+                "metric": "portfolio.balance",
+                "operator": ">=",
+                "value": 10_000,
+                "cooldown_seconds": 300,
+            },
+            "actions": [
+                {
+                    "type": "notify",
+                    "message": "Balance is ${value:,.2f}",
+                    "channels": ["email"],
+                    "severity": "warning",
+                    "confirmation_key": "balance-ack",
+                }
+            ],
+            "manual_override": {
+                "allowed": True,
+                "instructions": "Desk approval required.",
+                "expires_after_seconds": 1800,
+            },
+        }
+    ]
+    config_path = _write_config(tmp_path, payload)
+
+    config = load_realtime_config(config_path)
+
+    assert len(config.policies) == 1
+    policy = config.policies[0]
+    assert policy.name == "Balance guard"
+    assert policy.description == "Alert when portfolio balance exceeds $10k"
+    assert policy.trigger.metric == "portfolio.balance"
+    assert policy.trigger.operator == ">="
+    assert policy.trigger.value == pytest.approx(10_000.0)
+    assert policy.trigger.cooldown_seconds == 300
+    assert len(policy.actions) == 1
+    action = policy.actions[0]
+    assert action.type == "notify"
+    assert action.channels == ["email"]
+    assert action.severity == "warning"
+    assert action.confirmation_key == "balance-ack"
+    assert policy.manual_override is not None
+    assert policy.manual_override.allowed is True
+    assert policy.manual_override.instructions == "Desk approval required."
+    assert policy.manual_override.expires_after_seconds == 1800
+
+
+def test_policies_require_array(tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["policies"] = {"policy": {"trigger": {"metric": "portfolio.balance", "operator": ">=", "value": 1}}}
+    config_path = _write_config(tmp_path, payload)
+
+    with pytest.raises(TypeError, match="policies' must be an array"):
+        load_realtime_config(config_path)
 
 
 
@@ -497,3 +559,22 @@ def test_load_realtime_config_discovers_api_keys_file(tmp_path: Path) -> None:
 
     assert config.accounts[0].credentials["apiKey"] == "auto"
 
+
+def test_load_realtime_config_parses_audit_settings(tmp_path: Path) -> None:
+    reset_audit_registry()
+    payload = _base_payload()
+    payload["audit"] = {
+        "log_path": "logs/audit.log",
+        "redact_fields": ["token", "password"],
+        "syslog": {"address": "127.0.0.1", "port": 1514, "facility": "local0"},
+    }
+    config_path = _write_config(tmp_path, payload)
+
+    config = load_realtime_config(config_path)
+
+    assert config.audit is not None
+    expected_path = (config_path.parent / "logs" / "audit.log").resolve()
+    assert config.audit.log_path == expected_path
+    assert tuple(config.audit.redact_fields) == ("token", "password")
+    assert config.audit.syslog is not None
+    assert config.audit.syslog.port == 1514

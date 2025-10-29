@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence
+
+
+from dataclasses import dataclass, field
+from typing import Dict, Mapping, Optional, Sequence
+
 
 
 @dataclass
@@ -26,6 +32,8 @@ class Position:
     volatility: Optional[Mapping[str, float]] = None
     funding_rates: Optional[Mapping[str, float]] = None
     daily_realized_pnl: float = 0.0
+    liquidity: Optional[Mapping[str, Any]] = None
+    liquidity_warnings: Sequence[str] = ()
 
     def exposure_relative_to(self, balance: float) -> float:
         if balance == 0:
@@ -120,9 +128,68 @@ class AlertThresholds:
     loss_threshold_pct: float = -0.12
 
 
+@dataclass(frozen=True)
+class ScenarioShock:
+    """Market shock to apply to a symbol when running stress simulations."""
+
+    symbol: str
+    price_pct: float = 0.0
+
+
+@dataclass
+class Scenario:
+    """Collection of shocks representing a stress test scenario."""
+
+    name: str
+    shocks: Sequence[ScenarioShock] = field(default_factory=tuple)
+    id: Optional[str] = None
+    description: Optional[str] = None
+
+
+@dataclass
+class ScenarioSymbolExposure:
+    """Exposure details for a single symbol under a simulated scenario."""
+
+    symbol: str
+    gross_notional: float
+    net_notional: float
+    gross_pct: float
+    net_pct: float
+    pnl: float
+
+
+@dataclass
+class ScenarioAccountImpact:
+    """Impact of a scenario on an account or the aggregated portfolio."""
+
+    name: str
+    balance_before: float
+    balance_after: float
+    pnl: float
+    gross_exposure: float
+    gross_exposure_pct: float
+    net_exposure: float
+    net_exposure_pct: float
+    symbols: Sequence[ScenarioSymbolExposure] = field(default_factory=tuple)
+
+
+@dataclass
+class ScenarioResult:
+    """Simulation output combining portfolio and account level impacts."""
+
+    scenario: Scenario
+    portfolio: ScenarioAccountImpact
+    accounts: Sequence[ScenarioAccountImpact] = field(default_factory=tuple)
+
+
 __all__ = [
     "Position",
     "Order",
     "Account",
     "AlertThresholds",
+    "ScenarioShock",
+    "Scenario",
+    "ScenarioSymbolExposure",
+    "ScenarioAccountImpact",
+    "ScenarioResult",
 ]

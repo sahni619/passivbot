@@ -24,10 +24,102 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .configuration import CustomEndpointSettings, load_realtime_config
-from .domain.models import Account, AlertThresholds, Order, Position
+from .domain.models import (
+    Account,
+    AlertThresholds,
+    Order,
+    Position,
+    Scenario,
+    ScenarioResult,
+    ScenarioShock,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _select_configured_scenarios(
+    configured: Sequence[Scenario],
+    requested: Optional[Sequence[str]],
+) -> List[Scenario]:
+    if not configured:
+        if requested:
+            names = ", ".join(str(name) for name in requested)
+            raise ValueError(
+                f"No configured scenarios available to match: {names}",
+            )
+        return []
+
+    if not requested:
+        return list(configured)
+
+    index: Dict[str, Scenario] = {}
+    for scenario in configured:
+        keys = {scenario.name.lower()}
+        if scenario.id:
+            keys.add(scenario.id.lower())
+        for key in keys:
+            index.setdefault(key, scenario)
+
+    selected: List[Scenario] = []
+    missing: List[str] = []
+
+    for entry in requested:
+        key = str(entry).strip().lower()
+        if not key:
+            continue
+        match = index.get(key)
+        if match is None:
+            missing.append(str(entry))
+            continue
+        if match not in selected:
+            selected.append(match)
+
+    if missing:
+        raise ValueError(f"Unknown scenario(s): {', '.join(missing)}")
+
+    return selected
+
+
+def _parse_ad_hoc_scenario(values: Optional[Sequence[str]]) -> Optional[Scenario]:
+    if not values:
+        return None
+
+    shocks: List[ScenarioShock] = []
+    for raw in values:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if ":" not in text:
+            raise ValueError(
+                "Ad-hoc shocks must use the format SYMBOL:PCT (for example BTCUSDT:-0.10).",
+            )
+        symbol_part, pct_part = text.split(":", 1)
+        symbol = symbol_part.strip().upper()
+        if not symbol:
+            raise ValueError("Shock definitions must include a symbol name before ':'.")
+        try:
+            pct = float(pct_part)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Shock '{text}' must include a numeric percentage change.",
+            ) from exc
+        shocks.append(ScenarioShock(symbol=symbol, price_pct=pct))
+
+    if not shocks:
+        return None
+
+    description = ", ".join(
+        f"{shock.symbol} {shock.price_pct:+.2%}" for shock in shocks
+    )
+    return Scenario(
+        id="adhoc",
+        name="Ad-hoc shock",
+        description=description,
+        shocks=tuple(shocks),
+    )
 
 
 def _format_currency(value: float) -> str:
@@ -42,6 +134,21 @@ def _format_price(value: Optional[float]) -> str:
     if value is None or math.isnan(value):
         return "-"
     return f"{value:,.2f}"
+
+
+def _format_simple_number(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:,.4f}"
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_position(raw: Dict[str, Any]) -> Position:
@@ -59,6 +166,48 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
 
     size_raw = raw.get("size")
     signed_notional_raw = raw.get("signed_notional")
+    volatility = (
+        {str(key): float(value) for key, value in raw.get("volatility", {}).items()}
+        if isinstance(raw.get("volatility"), Mapping)
+        else None
+    )
+    funding_rates = (
+        {str(key): float(value) for key, value in raw.get("funding_rates", {}).items()}
+        if isinstance(raw.get("funding_rates"), Mapping)
+        else None
+    )
+    liquidity_raw = raw.get("liquidity") if isinstance(raw.get("liquidity"), Mapping) else None
+    liquidity: Optional[Dict[str, Any]] = None
+    liquidity_warnings: List[str] = []
+    if isinstance(liquidity_raw, Mapping):
+        liquidity = {}
+        for key, value in liquidity_raw.items():
+            if key == "warnings" and isinstance(value, Iterable):
+                liquidity_warnings = [str(item) for item in value if isinstance(item, str)]
+                liquidity["warnings"] = list(liquidity_warnings)
+                continue
+            if key in {
+                "filled_size",
+                "filled_notional",
+                "average_price",
+                "slippage_pct",
+                "unfilled_size",
+                "coverage_pct",
+                "reference_price",
+                "warning_threshold_pct",
+                "timestamp",
+            }:
+                try:
+                    liquidity[key] = float(value) if value is not None else None
+                except (TypeError, ValueError):
+                    liquidity[key] = None
+            else:
+                liquidity[key] = value
+    extra_warnings = raw.get("liquidity_warnings")
+    if isinstance(extra_warnings, Iterable):
+        for warning in extra_warnings:
+            if isinstance(warning, str) and warning not in liquidity_warnings:
+                liquidity_warnings.append(warning)
     return Position(
         symbol=str(raw["symbol"]),
         side=str(raw.get("side", "")),
@@ -97,17 +246,11 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
             if signed_notional_raw not in (None, "")
             else None
         ),
-        volatility=(
-            {str(key): float(value) for key, value in raw.get("volatility", {}).items()}
-            if isinstance(raw.get("volatility"), Mapping)
-            else None
-        ),
-        funding_rates=(
-            {str(key): float(value) for key, value in raw.get("funding_rates", {}).items()}
-            if isinstance(raw.get("funding_rates"), Mapping)
-            else None
-        ),
+        volatility=volatility,
+        funding_rates=funding_rates,
         daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
+        liquidity=liquidity,
+        liquidity_warnings=tuple(liquidity_warnings),
     )
 
 
@@ -241,7 +384,88 @@ def evaluate_alerts(accounts: Sequence[Account], thresholds: AlertThresholds) ->
                 alerts.append(
                     f"{account.name} {position.symbol}: drawdown {position.max_drawdown_pct:.2%} exceeds {thresholds.max_drawdown_pct:.2%}"
                 )
+            liquidity = position.liquidity or {}
+            raw_warnings = list(position.liquidity_warnings)
+            if isinstance(liquidity, Mapping):
+                warning_entries = liquidity.get("warnings")
+                if isinstance(warning_entries, Iterable):
+                    raw_warnings.extend([str(item) for item in warning_entries if isinstance(item, str)])
+            seen: set[str] = set()
+            for warning in raw_warnings:
+                if warning in seen:
+                    continue
+                seen.add(warning)
+                if warning == "depth_unavailable":
+                    alerts.append(
+                        f"{account.name} {position.symbol}: order book depth unavailable; liquidity estimates rely on fallbacks"
+                    )
+                elif warning == "insufficient_depth":
+                    coverage = None
+                    if isinstance(liquidity, Mapping):
+                        coverage = liquidity.get("coverage_pct")
+                        if isinstance(coverage, (int, float)):
+                            coverage = float(coverage)
+                    if isinstance(coverage, float):
+                        alerts.append(
+                            f"{account.name} {position.symbol}: order book covers only {coverage:.0%} of position size"
+                        )
+                    else:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: insufficient order book depth to exit position"
+                        )
+                elif warning == "slippage_threshold_exceeded":
+                    slippage = None
+                    threshold_value = None
+                    if isinstance(liquidity, Mapping):
+                        slippage = liquidity.get("slippage_pct")
+                        threshold_value = liquidity.get("warning_threshold_pct")
+                    slippage_str = None
+                    if isinstance(slippage, (int, float)):
+                        slippage_str = f"{float(slippage):.2%}"
+                    threshold_str = None
+                    if isinstance(threshold_value, (int, float)):
+                        threshold_str = f"{float(threshold_value):.2%}"
+                    if slippage_str and threshold_str:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: estimated slippage {slippage_str} exceeds threshold {threshold_str}"
+                        )
+                    elif slippage_str:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: estimated slippage {slippage_str} exceeds configured threshold"
+                        )
+                    else:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: estimated slippage exceeds configured threshold"
+                        )
+                elif warning == "position_size_undefined":
+                    alerts.append(
+                        f"{account.name} {position.symbol}: unable to determine position size for liquidity analysis"
+                    )
     return alerts
+
+
+def _normalise_policy_summary(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return None
+    summary: Dict[str, Any] = {}
+    evaluations_raw = payload.get("evaluations", [])
+    evaluations: List[Dict[str, Any]] = []
+    if isinstance(evaluations_raw, Iterable):
+        for entry in evaluations_raw:
+            if isinstance(entry, Mapping):
+                evaluations.append(dict(entry))
+    summary["evaluations"] = evaluations
+
+    for key in ("active", "pending_actions", "manual_overrides"):
+        values_raw = payload.get(key)
+        items: List[Dict[str, Any]] = []
+        if isinstance(values_raw, Iterable):
+            for entry in values_raw:
+                if isinstance(entry, Mapping):
+                    items.append(dict(entry))
+        if items:
+            summary[key] = items
+    return summary
 
 
 def render_dashboard(
@@ -250,6 +474,11 @@ def render_dashboard(
     alerts: Sequence[str],
     notifications: Sequence[str],
     account_messages: Optional[Mapping[str, str]] = None,
+
+    policy_summary: Optional[Mapping[str, Any]] = None,
+
+    scenario_results: Optional[Sequence[ScenarioResult]] = None,
+
 ) -> str:
     lines: List[str] = []
     lines.append("=" * 80)
@@ -337,9 +566,79 @@ def render_dashboard(
                     + f"{_format_pct(position.max_drawdown_pct or 0.0):>10}"
                     + f"{_format_price(position.take_profit_price):>12}{_format_price(position.stop_loss_price):>12}"
                 )
+                liquidity = position.liquidity if isinstance(position.liquidity, Mapping) else None
+                if liquidity:
+                    details: List[str] = []
+                    coverage = liquidity.get("coverage_pct")
+                    if isinstance(coverage, (int, float)):
+                        details.append(f"coverage {float(coverage):.0%}")
+                    slippage = liquidity.get("slippage_pct")
+                    if isinstance(slippage, (int, float)):
+                        details.append(f"slippage {float(slippage):.2%}")
+                    average_price = liquidity.get("average_price")
+                    if isinstance(average_price, (int, float)):
+                        details.append(f"avg {float(average_price):,.2f}")
+                    source = liquidity.get("source")
+                    if isinstance(source, str) and source:
+                        details.append(f"source {source}")
+                    if details:
+                        lines.append("      Liquidity: " + ", ".join(details))
+                    warnings = list(position.liquidity_warnings)
+                    warning_entries = liquidity.get("warnings")
+                    if isinstance(warning_entries, Iterable):
+                        warnings.extend([str(item) for item in warning_entries if isinstance(item, str)])
+                    if warnings:
+                        unique = list(dict.fromkeys(warnings))
+                        lines.append("      Liquidity warnings: " + ", ".join(unique))
         else:
             lines.append("    No open positions.")
         lines.append("")
+
+    if scenario_results:
+        lines.append("Scenario analysis")
+        lines.append("-" * 80)
+        for result in scenario_results:
+            scenario = result.scenario
+            identifier = scenario.name
+            if scenario.id and scenario.id.lower() != scenario.name.lower():
+                identifier = f"{identifier} [{scenario.id}]"
+            lines.append(identifier)
+            if scenario.description:
+                lines.append(f"  {scenario.description}")
+            if scenario.shocks:
+                shocks_summary = ", ".join(
+                    f"{shock.symbol}: {_format_pct(shock.price_pct)}"
+                    for shock in scenario.shocks
+                )
+                lines.append(f"  Shocks: {shocks_summary}")
+            portfolio = result.portfolio
+            lines.append(
+                "  "
+                + f"Portfolio PnL: {_format_currency(portfolio.pnl)} | "
+                + f"Balance: {_format_currency(portfolio.balance_after)} "
+                + f"(from {_format_currency(portfolio.balance_before)})"
+            )
+            lines.append(
+                "  "
+                + f"Gross exposure: {_format_currency(portfolio.gross_exposure)} "
+                + f"({_format_pct(portfolio.gross_exposure_pct)})"
+            )
+            lines.append(
+                "  "
+                + f"Net exposure: {_format_currency(portfolio.net_exposure)} "
+                + f"({_format_pct(portfolio.net_exposure_pct)})"
+            )
+            top_symbols = list(portfolio.symbols)[:3]
+            if top_symbols:
+                lines.append("  Top exposures:")
+                for symbol in top_symbols:
+                    lines.append(
+                        "    "
+                        + f"{symbol.symbol}: gross {_format_currency(symbol.gross_notional)} "
+                        + f"({_format_pct(symbol.gross_pct)}) net {_format_currency(symbol.net_notional)} "
+                        + f"({_format_pct(symbol.net_pct)}) pnl {_format_currency(symbol.pnl)}"
+                    )
+            lines.append("")
 
     lines.append("Alerts")
     lines.append("-" * 80)
@@ -349,6 +648,80 @@ def render_dashboard(
     else:
         lines.append("No active alerts. All monitored metrics are within thresholds.")
     lines.append("")
+
+    lines.append("Policies")
+    lines.append("-" * 80)
+    evaluations = (
+        list(policy_summary.get("evaluations", []))
+        if isinstance(policy_summary, Mapping)
+        else []
+    )
+    if not evaluations:
+        lines.append("No automated risk policies are configured.")
+    else:
+        for evaluation in evaluations:
+            name = str(evaluation.get("name", "Unnamed policy"))
+            status_bits: List[str] = []
+            if evaluation.get("triggered"):
+                status_bits.append("ACTIVE")
+            else:
+                status_bits.append("idle")
+            if evaluation.get("cooldown_active"):
+                status_bits.append("cooldown")
+            if evaluation.get("override_active"):
+                status_bits.append("override")
+            status = ", ".join(status_bits)
+            lines.append(f"• {name} [{status}]")
+            description = evaluation.get("description")
+            if description:
+                lines.append(f"    {description}")
+            metric = evaluation.get("metric")
+            operator = evaluation.get("operator")
+            threshold_value = _format_simple_number(
+                _safe_float(evaluation.get("threshold"))
+            )
+            current_value = _format_simple_number(
+                _safe_float(evaluation.get("value"))
+            )
+            lines.append(
+                f"    Metric: {metric} {operator} {threshold_value} | current {current_value}"
+            )
+            actions = evaluation.get("actions", [])
+            if isinstance(actions, Iterable):
+                for action in actions:
+                    if not isinstance(action, Mapping):
+                        continue
+                    action_type = action.get("type", "action")
+                    action_status = action.get("status", "idle")
+                    action_message = action.get("message")
+                    suffix = f" – {action_message}" if action_message else ""
+                    lines.append(
+                        f"    - {action_type} [{action_status}]{suffix}"
+                    )
+            manual_override = evaluation.get("manual_override")
+            if isinstance(manual_override, Mapping) and manual_override.get("allowed"):
+                state = "active" if manual_override.get("active") else "available"
+                lines.append(f"    Manual override {state}")
+                instructions = manual_override.get("instructions")
+                if instructions:
+                    lines.append(f"      {instructions}")
+    lines.append("")
+
+    pending_actions = (
+        list(policy_summary.get("pending_actions", []))
+        if isinstance(policy_summary, Mapping)
+        else []
+    )
+    if pending_actions:
+        lines.append("Pending policy actions")
+        lines.append("-" * 80)
+        for pending in pending_actions:
+            if not isinstance(pending, Mapping):
+                continue
+            policy_name = pending.get("policy", "Unknown policy")
+            message = pending.get("message") or "Awaiting operator confirmation"
+            lines.append(f"• {policy_name}: {message}")
+        lines.append("")
 
     if notifications:
         lines.append("Notification channels")
@@ -367,11 +740,31 @@ def run_dashboard(config_path: Path) -> str:
     return build_dashboard(snapshot)
 
 
-def build_dashboard(snapshot: Dict[str, Any]) -> str:
+def build_dashboard(
+    snapshot: Dict[str, Any],
+    *,
+    scenario_results: Optional[Sequence[ScenarioResult]] = None,
+) -> str:
     generated_at, accounts, thresholds, notifications = parse_snapshot(snapshot)
     alerts = evaluate_alerts(accounts, thresholds)
     account_messages = snapshot.get("account_messages", {}) if isinstance(snapshot, Mapping) else {}
-    return render_dashboard(generated_at, accounts, alerts, notifications, account_messages=account_messages)
+
+    policy_summary = None
+    if isinstance(snapshot, Mapping):
+        policy_summary = _normalise_policy_summary(snapshot.get("policies"))
+
+    return render_dashboard(
+        generated_at,
+        accounts,
+        alerts,
+        notifications,
+        account_messages=account_messages,
+
+        policy_summary=policy_summary,
+
+        scenario_results=scenario_results,
+
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -408,6 +801,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "disable overrides."
         ),
     )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        dest="scenario_names",
+        help=(
+            "Name or ID of a configured scenario to evaluate. Repeat to include multiple scenarios."
+        ),
+    )
+    parser.add_argument(
+        "--shock",
+        action="append",
+        dest="shocks",
+        metavar="SYMBOL:PCT",
+        help=(
+            "Ad-hoc price shock expressed as a decimal percentage. Example: --shock BTCUSDT:-0.10"
+        ),
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -431,6 +841,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
     from .services import RiskService
 
     realtime_service: Optional[RiskService] = None
+    configured_scenarios: Sequence[Scenario] = []
     if args.realtime_config:
         realtime_config = load_realtime_config(Path(args.realtime_config))
         override = args.custom_endpoints
@@ -452,17 +863,35 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     realtime_config.custom_endpoints = CustomEndpointSettings(
                         path=override_normalized, autodiscover=False
                     )
+        configured_scenarios = list(realtime_config.scenarios)
         realtime_service = RiskService.from_config(realtime_config)
         logger.info("Starting realtime dashboard using %s", args.realtime_config)
 
     try:
+        selected_configured = _select_configured_scenarios(
+            configured_scenarios,
+            getattr(args, "scenario_names", None),
+        )
+        ad_hoc = _parse_ad_hoc_scenario(getattr(args, "shocks", None))
+        scenarios_to_run: List[Scenario] = list(selected_configured)
+        if ad_hoc is not None:
+            scenarios_to_run.append(ad_hoc)
+        simulate = None
+        if scenarios_to_run:
+            from .stress import simulate_scenarios
+
+            simulate = simulate_scenarios
+
         iteration = 0
         while True:
             if realtime_service is not None:
                 snapshot = await realtime_service.fetch_snapshot()
             else:
                 snapshot = load_snapshot(Path(args.config))
-            dashboard = build_dashboard(snapshot)
+            scenario_results: Sequence[ScenarioResult] = []
+            if simulate is not None:
+                scenario_results = simulate(snapshot, scenarios_to_run)
+            dashboard = build_dashboard(snapshot, scenario_results=scenario_results)
             print(dashboard)
             iteration += 1
             if args.iterations and iteration >= args.iterations:

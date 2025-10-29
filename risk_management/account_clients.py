@@ -48,6 +48,7 @@ from ._parsing import (
     parse_position as _parse_position,
 )
 from .realized_pnl import fetch_realized_pnl_history
+from .liquidity import calculate_position_liquidity, normalise_order_book
 
 try:  # pragma: no cover - passivbot is optional when running tests
     from passivbot.utils import load_ccxt_instance, normalize_exchange_name
@@ -373,6 +374,7 @@ class CCXTAccountClient(AccountClientProtocol):
         self._using_custom_endpoints = bool(apply_override and not apply_override.is_noop())
         source_path = get_custom_endpoint_source()
         self._custom_endpoint_source = str(source_path) if source_path else None
+        self._liquidity_settings = config.liquidity
 
     def _refresh_open_order_preferences(self) -> None:
         """Re-apply exchange options that silence noisy open-order warnings."""
@@ -655,9 +657,22 @@ class CCXTAccountClient(AccountClientProtocol):
             parsed = _parse_position(position_raw, balance_value)
             if parsed is not None:
                 positions.append(parsed)
+        symbol_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
+        order_books: Dict[str, MutableMapping[str, Any]] = {}
+        ticker_fallbacks: Dict[str, Dict[str, float]] = {}
+        fallback_mode = (self._liquidity_settings.fallback_mode or "").lower()
         if positions:
             symbols = [position.get("symbol") for position in positions if position.get("symbol")]
-            symbol_metrics = await self._collect_symbol_metrics(symbols)
+            if symbols:
+                symbol_metrics = await self._collect_symbol_metrics(symbols)
+                if self._liquidity_settings.fetch_order_book:
+                    order_books = await self._collect_order_books(symbols)
+                missing_depth = [symbol for symbol in symbols if symbol and symbol not in order_books]
+                if missing_depth and fallback_mode == "ticker":
+                    for symbol in missing_depth:
+                        prices = await self._fetch_ticker_prices(symbol)
+                        if prices:
+                            ticker_fallbacks[symbol] = prices
             for position in positions:
                 symbol = position.get("symbol")
                 if not symbol:
@@ -665,6 +680,31 @@ class CCXTAccountClient(AccountClientProtocol):
                 metrics = symbol_metrics.get(symbol)
                 if metrics:
                     position.update(metrics)
+                order_book_snapshot = order_books.get(symbol)
+                if order_book_snapshot:
+                    position.setdefault("order_book", dict(order_book_snapshot))
+                fallback_price: Optional[float] = None
+                if not order_book_snapshot:
+                    if fallback_mode == "ticker":
+                        quotes = ticker_fallbacks.get(symbol)
+                        if quotes:
+                            side = str(position.get("side", "")).lower()
+                            if side == "long":
+                                fallback_price = quotes.get("sell") or quotes.get("buy")
+                            else:
+                                fallback_price = quotes.get("buy") or quotes.get("sell")
+                    elif fallback_mode == "mark":
+                        fallback_price = _first_float(
+                            position.get("mark_price"),
+                            position.get("entry_price"),
+                        )
+                liquidity_metrics = calculate_position_liquidity(
+                    position,
+                    order_book_snapshot,
+                    fallback_price=fallback_price,
+                    warning_threshold=self._liquidity_settings.slippage_warning_pct,
+                )
+                position["liquidity"] = dict(liquidity_metrics)
         if not hasattr(self.client, "fetch_positions") and self._debug_api_payloads:
             logger.debug(
                 "[%s] fetch_positions not available on exchange client", self.config.name
@@ -754,6 +794,7 @@ class CCXTAccountClient(AccountClientProtocol):
             "positions": positions,
             "open_orders": open_orders,
             "daily_realized_pnl": realized_total,
+            "order_books": list(order_books.values()) if order_books else [],
         }
 
     async def close(self) -> None:
@@ -881,6 +922,48 @@ class CCXTAccountClient(AccountClientProtocol):
                 continue
             if response:
                 results[symbol] = response
+        return results
+
+    async def _collect_order_books(
+        self, symbols: Iterable[str]
+    ) -> Dict[str, MutableMapping[str, Any]]:
+        settings = self._liquidity_settings
+        if not settings.fetch_order_book:
+            return {}
+        fetch_order_book = getattr(self.client, "fetch_order_book", None)
+        if fetch_order_book is None:
+            return {}
+        unique_symbols = [symbol for symbol in dict.fromkeys(symbols) if symbol]
+        if not unique_symbols:
+            return {}
+        results: Dict[str, MutableMapping[str, Any]] = {}
+        for symbol in unique_symbols:
+            params = dict(self._positions_params)
+            try:
+                if settings.depth:
+                    order_book = await fetch_order_book(symbol, limit=settings.depth, params=params)
+                else:
+                    order_book = await fetch_order_book(symbol, params=params)
+            except BaseError as exc:
+                logger.debug(
+                    "[%s] fetch_order_book failed for %s: %s",
+                    self.config.name,
+                    symbol,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            request_meta = dict(params)
+            request_meta["symbol"] = symbol
+            if settings.depth:
+                request_meta["limit"] = settings.depth
+            self._log_exchange_payload("fetch_order_book", order_book, request_meta)
+            normalised = normalise_order_book(order_book, depth=settings.depth)
+            if not normalised:
+                continue
+            snapshot: MutableMapping[str, Any] = dict(normalised)
+            snapshot["symbol"] = symbol
+            results[symbol] = snapshot
         return results
 
     async def _fetch_symbol_metrics(self, symbol: str) -> Dict[str, Dict[str, float]]:

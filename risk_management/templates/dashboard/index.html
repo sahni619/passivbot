@@ -219,6 +219,210 @@
           <p style="color: var(--muted); margin-top: 1rem;">No active exposures.</p>
         {% endif %}
       </section>
+
+      <section class="card" data-policy-overview>
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;">
+          <div>
+            <h2 style="margin: 0;">Policy status</h2>
+            <p style="color: var(--muted); margin: 0;">Automated guardrails and pending operator actions.</p>
+          </div>
+          {% set policy_summary = snapshot.policies if snapshot.policies is defined else None %}
+          {% set active_policies = policy_summary.active if policy_summary and policy_summary.active is defined else [] %}
+          <span class="badge {% if active_policies %}alert{% else %}ok{% endif %}" data-policy-active-count>
+            {% if active_policies %}
+              {{ active_policies|length }} active
+            {% else %}
+              All clear
+            {% endif %}
+          </span>
+        </div>
+        <p
+          class="muted"
+          data-policy-empty
+          {% if policy_summary and policy_summary.evaluations is defined and policy_summary.evaluations %}
+            hidden
+          {% endif %}
+          style="color: var(--muted); margin-top: 1rem;"
+        >
+          No automated policies are configured.
+        </p>
+        <div
+          class="policy-status-grid"
+          data-policy-summary
+          {% if not policy_summary or not (policy_summary.evaluations is defined and policy_summary.evaluations) %}
+            hidden
+          {% endif %}
+        >
+          <div>
+            <h3>Active policies</h3>
+            {% set active_items = policy_summary.active if policy_summary and policy_summary.active is defined else [] %}
+            <ul class="policy-list" data-policy-active>
+              {% if active_items %}
+                {% for item in active_items %}
+                  <li>
+                    <strong>{{ item.name }}</strong>
+                    <span>
+                      {% if item.value is defined and item.value is not none %}
+                        {{ item.value | float | round(4) }}
+                      {% else %}
+                        -
+                      {% endif %}
+                    </span>
+                  </li>
+                {% endfor %}
+              {% else %}
+                <li class="muted">No active policy triggers.</li>
+              {% endif %}
+            </ul>
+          </div>
+          <div>
+            <h3>Pending actions</h3>
+            {% set pending_items = policy_summary.pending_actions if policy_summary and policy_summary.pending_actions is defined else [] %}
+            <ul class="policy-list" data-policy-pending>
+              {% if pending_items %}
+                {% for item in pending_items %}
+                  <li>
+                    <strong>{{ item.policy }}</strong>
+                    <span>{{ item.message }}</span>
+                  </li>
+                {% endfor %}
+              {% else %}
+                <li class="muted">No confirmations requested.</li>
+              {% endif %}
+            </ul>
+          </div>
+        </div>
+        <div
+          class="policy-evaluations"
+          data-policy-evaluations
+          {% if not policy_summary or not (policy_summary.evaluations is defined and policy_summary.evaluations) %}
+            hidden
+          {% endif %}
+        >
+          {% if policy_summary and policy_summary.evaluations is defined %}
+            {% for evaluation in policy_summary.evaluations %}
+              <article class="policy-evaluation">
+                <header>
+                  <h3>{{ evaluation.name }}</h3>
+                  <span class="badge {{ 'alert' if evaluation.triggered else 'ok' }}">
+                    {% if evaluation.triggered %}Active{% else %}Idle{% endif %}
+                  </span>
+                </header>
+                {% if evaluation.description %}
+                  <p>{{ evaluation.description }}</p>
+                {% endif %}
+                <p class="policy-evaluation__metric">
+                  Metric: <strong>{{ evaluation.metric }}</strong>
+                  {{ evaluation.operator }} {{ evaluation.threshold }}
+                  (current {{ evaluation.value if evaluation.value is not none else '-' }})
+                </p>
+                {% if evaluation.actions %}
+                  <ul>
+                    {% for action in evaluation.actions %}
+                      <li>
+                        <strong>{{ action.type }}</strong>
+                        <span class="policy-action-status">{{ action.status }}</span>
+                        {% if action.message %}<span>– {{ action.message }}</span>{% endif %}
+                      </li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+                {% set manual_override = evaluation.manual_override %}
+                {% if manual_override and manual_override.allowed %}
+                  <p class="policy-override {{ 'active' if manual_override.active else '' }}">
+                    Manual override {% if manual_override.active %}active{% else %}available{% endif %}.
+                    {% if manual_override.instructions %}{{ manual_override.instructions }}{% endif %}
+                  </p>
+                {% endif %}
+              </article>
+            {% endfor %}
+          {% endif %}
+        </div>
+      </section>
+
+      {% if snapshot.scenarios %}
+        <section class="card" data-scenarios>
+          <h2 style="margin-bottom: 0.5rem;">Scenario analysis</h2>
+          <p style="color: var(--muted); margin: 0;">
+            Simulated portfolio impact under configured market shocks.
+          </p>
+          <div class="table-wrapper" style="margin-top: 1.5rem;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Scenario</th>
+                  <th>Portfolio PnL</th>
+                  <th>Balance</th>
+                  <th>Gross Exposure</th>
+                  <th>Net Exposure</th>
+                  <th>Top exposures</th>
+                  <th>Shocks</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for scenario in snapshot.scenarios %}
+                  {% set scenario_meta = scenario.scenario %}
+                  {% set portfolio = scenario.portfolio %}
+                  {% set pnl_class = 'gain' if portfolio.pnl >= 0 else 'loss' %}
+                  {% set net_class = 'gain' if portfolio.net_exposure >= 0 else 'loss' %}
+                  <tr>
+                    <td>
+                      <div style="font-weight: 600;">{{ scenario_meta.name }}</div>
+                      {% if scenario_meta.id and scenario_meta.id|lower != scenario_meta.name|lower %}
+                        <div style="color: var(--muted); font-size: 0.85rem;">{{ scenario_meta.id }}</div>
+                      {% endif %}
+                      {% if scenario_meta.description %}
+                        <div style="color: var(--muted); font-size: 0.9rem;">{{ scenario_meta.description }}</div>
+                      {% endif %}
+                    </td>
+                    <td class="{{ pnl_class }}">{{ portfolio.pnl|currency }}</td>
+                    <td>
+                      <div>{{ portfolio.balance_after|currency }}</div>
+                      <div class="subvalue">from {{ portfolio.balance_before|currency }}</div>
+                    </td>
+                    <td>
+                      <div>{{ portfolio.gross_exposure|currency }}</div>
+                      <div class="subvalue">{{ portfolio.gross_exposure_pct|pct }}</div>
+                    </td>
+                    <td class="{{ net_class }}">
+                      <div>{{ portfolio.net_exposure|currency }}</div>
+                      <div class="subvalue">{{ portfolio.net_exposure_pct|pct }}</div>
+                    </td>
+                    <td>
+                      {% set top_symbols = portfolio.symbols[:3] %}
+                      {% if top_symbols %}
+                        {% for entry in top_symbols %}
+                          <div>
+                            {{ entry.symbol }}: {{ entry.gross_notional|currency }} ({{ entry.gross_pct|pct }})
+                          </div>
+                        {% endfor %}
+                      {% else %}
+                        -
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% if scenario_meta.shocks %}
+                        {% for shock in scenario_meta.shocks %}
+                          <div>{{ shock.symbol }}: {{ shock.price_pct|pct }}</div>
+                        {% endfor %}
+                      {% else %}
+                        -
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            <div class="table-pagination" aria-label="Scenario analysis">
+              <button type="button" disabled>Prev</button>
+              <span>
+                {{ snapshot.scenarios|length }} scenario{{ 's' if snapshot.scenarios|length != 1 else '' }}
+              </span>
+              <button type="button" disabled>Next</button>
+            </div>
+          </div>
+        </section>
+      {% endif %}
     </div>
 
     <div class="page-section" data-page-section="accounts" hidden>
@@ -552,6 +756,10 @@
                       <th>Max DD</th>
                       <th>TP</th>
                       <th>SL</th>
+                      <th>Depth coverage</th>
+                      <th>Est. slippage</th>
+                      <th>Avg exit</th>
+                      <th>Liquidity warnings</th>
                       <th>Vol 4h</th>
                       <th>Vol 24h</th>
                       <th>Vol 3d</th>
@@ -580,6 +788,10 @@
                         <td>{% if position.max_drawdown_pct is not none %}{{ position.max_drawdown_pct|pct }}{% else %}-{% endif %}</td>
                         <td>{% if position.take_profit_price is not none %}{{ position.take_profit_price|currency }}{% else %}-{% endif %}</td>
                         <td>{% if position.stop_loss_price is not none %}{{ position.stop_loss_price|currency }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_coverage_pct is not none %}{{ position.liquidity_coverage_pct|pct }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_slippage_pct is not none %}{{ position.liquidity_slippage_pct|pct }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_average_price is not none %}{{ position.liquidity_average_price|currency }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_warnings %}{{ position.liquidity_warnings|join(', ') }}{% else %}-{% endif %}</td>
                         <td>{% if position_vol and position_vol.get("4h") is not none %}{{ position_vol.get("4h")|pct }}{% else %}-{% endif %}</td>
                         <td>{% if position_vol and position_vol.get("24h") is not none %}{{ position_vol.get("24h")|pct }}{% else %}-{% endif %}</td>
                         <td>{% if position_vol and position_vol.get("3d") is not none %}{{ position_vol.get("3d")|pct }}{% else %}-{% endif %}</td>
@@ -857,6 +1069,10 @@
                 <th>Max DD</th>
                 <th>TP</th>
                 <th>SL</th>
+                <th>Depth coverage</th>
+                <th>Est. slippage</th>
+                <th>Avg exit</th>
+                <th>Liquidity warnings</th>
                 <th>Actions</th>
               </tr>
             </thead>
@@ -917,6 +1133,67 @@
         {% else %}
           <p data-notifications style="color: var(--muted);">No notification channels configured.</p>
         {% endif %}
+      </section>
+
+      <section class="card policy-details">
+        <h2>Policy details</h2>
+        {% set policy_summary = snapshot.policies if snapshot.policies is defined else None %}
+        <p
+          class="muted"
+          data-policy-details-empty
+          {% if policy_summary and policy_summary.evaluations is defined and policy_summary.evaluations %}
+            hidden
+          {% endif %}
+          style="color: var(--muted);"
+        >
+          No automated policies are configured.
+        </p>
+        <div
+          class="policy-evaluations"
+          data-policy-details
+          {% if not policy_summary or not (policy_summary.evaluations is defined and policy_summary.evaluations) %}
+            hidden
+          {% endif %}
+        >
+          {% if policy_summary and policy_summary.evaluations is defined %}
+            {% for evaluation in policy_summary.evaluations %}
+              <article class="policy-evaluation">
+                <header>
+                  <h3>{{ evaluation.name }}</h3>
+                  <span class="badge {{ 'alert' if evaluation.triggered else 'ok' }}">
+                    {% if evaluation.triggered %}Active{% else %}Idle{% endif %}
+                  </span>
+                </header>
+                {% if evaluation.description %}
+                  <p>{{ evaluation.description }}</p>
+                {% endif %}
+                <p class="policy-evaluation__metric">
+                  Metric: <strong>{{ evaluation.metric }}</strong>
+                  {{ evaluation.operator }} {{ evaluation.threshold }}
+                  (current {{ evaluation.value if evaluation.value is not none else '-' }})
+                </p>
+                {% if evaluation.actions %}
+                  <ul>
+                    {% for action in evaluation.actions %}
+                      <li>
+                        <strong>{{ action.type }}</strong>
+                        <span class="policy-action-status">{{ action.status }}</span>
+                        {% if action.message %}<span>– {{ action.message }}</span>{% endif %}
+                      </li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+                {% set manual_override = evaluation.manual_override %}
+                {% if manual_override and manual_override.allowed %}
+                  <p class="policy-override {{ 'active' if manual_override.active else '' }}">
+                    Manual override {% if manual_override.active %}active{% else %}available{% endif %}.
+                    {% if manual_override.instructions %}{{ manual_override.instructions }}{% endif %}
+                  </p>
+                {% endif %}
+              </article>
+            {% endfor %}
+          {% endif %}
+        </div>
       </section>
     </div>
 
@@ -1402,6 +1679,10 @@
                 <td>${maxDrawdown}</td>
                 <td>${takeProfit}</td>
                 <td>${stopLossPrice}</td>
+                <td>${position.liquidity_coverage_pct !== null && position.liquidity_coverage_pct !== undefined ? formatPct(position.liquidity_coverage_pct) : "-"}</td>
+                <td>${position.liquidity_slippage_pct !== null && position.liquidity_slippage_pct !== undefined ? formatPct(position.liquidity_slippage_pct) : "-"}</td>
+                <td>${position.liquidity_average_price !== null && position.liquidity_average_price !== undefined ? formatCurrency(position.liquidity_average_price) : "-"}</td>
+                <td>${Array.isArray(position.liquidity_warnings) && position.liquidity_warnings.length > 0 ? position.liquidity_warnings.join(", ") : "-"}</td>
                 <td>
                   <div class="actions-column">
                     <button type="button" class="button danger small" data-close-position data-symbol="${position.symbol}">Close</button>
@@ -1877,6 +2158,65 @@
 
     const formatMetricValue = (value) => (isFiniteNumber(value) ? formatPct(value) : "-");
 
+    const formatPolicyValue = (value) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) {
+        return "-";
+      }
+      if (Math.abs(number) >= 1) {
+        return number.toFixed(2);
+      }
+      return number.toFixed(4);
+    };
+
+    const buildPolicyCards = (evaluations = []) =>
+      evaluations
+        .map((evaluation) => {
+          const name = escapeHtml(evaluation?.name ?? "Policy");
+          const description = evaluation?.description
+            ? `<p>${escapeHtml(evaluation.description)}</p>`
+            : "";
+          const metric = escapeHtml(evaluation?.metric ?? "metric");
+          const operator = escapeHtml(evaluation?.operator ?? "");
+          const threshold = formatPolicyValue(evaluation?.threshold);
+          const currentValue = formatPolicyValue(evaluation?.value);
+          const statusBadge = evaluation?.triggered ? "alert" : "ok";
+          const statusLabel = evaluation?.triggered ? "Active" : "Idle";
+          const actions = Array.isArray(evaluation?.actions)
+            ? evaluation.actions
+                .map((action) => {
+                  const type = escapeHtml(action?.type ?? "action");
+                  const status = escapeHtml(action?.status ?? "idle");
+                  const message = action?.message ? ` – ${escapeHtml(action.message)}` : "";
+                  return `<li><strong>${type}</strong><span class="policy-action-status">${status}</span>${message}</li>`;
+                })
+                .join("")
+            : "";
+          const actionsBlock = actions ? `<ul>${actions}</ul>` : "";
+          const override = evaluation?.manual_override;
+          let overrideBlock = "";
+          if (override && override.allowed) {
+            const active = override.active ? " active" : "";
+            const instructions = override.instructions ? ` ${escapeHtml(override.instructions)}` : "";
+            overrideBlock = `<p class="policy-override${active}">Manual override ${override.active ? "active" : "available"}.${instructions}</p>`;
+          }
+          return `
+            <article class="policy-evaluation">
+              <header>
+                <h3>${name}</h3>
+                <span class="badge ${statusBadge}">${statusLabel}</span>
+              </header>
+              ${description}
+              <p class="policy-evaluation__metric">
+                Metric: <strong>${metric}</strong> ${operator} ${threshold} (current ${currentValue})
+              </p>
+              ${actionsBlock}
+              ${overrideBlock}
+            </article>
+          `;
+        })
+        .join("");
+
     const formatBytes = (value) => {
       const number = Number(value);
       if (!Number.isFinite(number) || number <= 0) {
@@ -2140,6 +2480,10 @@
                   <td>${maxDd}</td>
                   <td>${formatPrice(position.take_profit_price)}</td>
                   <td>${formatPrice(position.stop_loss_price)}</td>
+                  <td>${position.liquidity_coverage_pct !== null && position.liquidity_coverage_pct !== undefined ? formatPct(position.liquidity_coverage_pct) : "-"}</td>
+                  <td>${position.liquidity_slippage_pct !== null && position.liquidity_slippage_pct !== undefined ? formatPct(position.liquidity_slippage_pct) : "-"}</td>
+                  <td>${position.liquidity_average_price !== null && position.liquidity_average_price !== undefined ? formatCurrency(position.liquidity_average_price) : "-"}</td>
+                  <td>${Array.isArray(position.liquidity_warnings) && position.liquidity_warnings.length > 0 ? position.liquidity_warnings.join(", ") : "-"}</td>
                   ${METRIC_WINDOWS.map((window) => `<td>${formatMetricValue(volatility?.[window])}</td>`).join("")}
                   ${METRIC_WINDOWS.map((window) => `<td>${formatMetricValue(funding?.[window])}</td>`).join("")}
                   <td>
@@ -2224,6 +2568,10 @@
                         <th>Max DD</th>
                         <th>TP</th>
                         <th>SL</th>
+                        <th>Depth coverage</th>
+                        <th>Est. slippage</th>
+                        <th>Avg exit</th>
+                        <th>Liquidity warnings</th>
                         ${METRIC_WINDOWS.map((window) => `<th>Vol ${window}</th>`).join("")}
                         ${METRIC_WINDOWS.map((window) => `<th>Fund ${window}</th>`).join("")}
                         <th>Actions</th>
@@ -2619,6 +2967,78 @@
       }
     };
 
+    const renderPolicies = (snapshot) => {
+      const summary = snapshot?.policies || {};
+      const evaluations = Array.isArray(summary.evaluations) ? summary.evaluations : [];
+      const active = Array.isArray(summary.active) ? summary.active : [];
+      const pending = Array.isArray(summary.pending_actions) ? summary.pending_actions : [];
+      const hasEvaluations = evaluations.length > 0;
+
+      const overview = document.querySelector('[data-policy-overview]');
+      if (overview) {
+        const emptyEl = overview.querySelector('[data-policy-empty]');
+        const summaryEl = overview.querySelector('[data-policy-summary]');
+        const evaluationsEl = overview.querySelector('[data-policy-evaluations]');
+        const activeBadge = overview.querySelector('[data-policy-active-count]');
+        if (emptyEl) {
+          emptyEl.hidden = hasEvaluations;
+        }
+        if (summaryEl) {
+          summaryEl.hidden = !hasEvaluations;
+        }
+        if (evaluationsEl) {
+          evaluationsEl.hidden = !hasEvaluations;
+        }
+        if (activeBadge) {
+          activeBadge.textContent = active.length ? `${active.length} active` : 'All clear';
+          activeBadge.classList.toggle('alert', active.length > 0);
+          activeBadge.classList.toggle('ok', active.length === 0);
+        }
+        const activeList = overview.querySelector('[data-policy-active]');
+        if (activeList) {
+          activeList.innerHTML = active.length
+            ? active
+                .map((item) => {
+                  const name = escapeHtml(item?.name ?? 'Policy');
+                  const value = formatPolicyValue(item?.value);
+                  return `<li><strong>${name}</strong><span>${value}</span></li>`;
+                })
+                .join('')
+            : '<li class="muted">No active policy triggers.</li>';
+        }
+        const pendingList = overview.querySelector('[data-policy-pending]');
+        if (pendingList) {
+          pendingList.innerHTML = pending.length
+            ? pending
+                .map((item) => {
+                  const name = escapeHtml(item?.policy ?? 'Policy');
+                  const message = escapeHtml(item?.message ?? 'Awaiting operator confirmation');
+                  return `<li><strong>${name}</strong><span>${message}</span></li>`;
+                })
+                .join('')
+            : '<li class="muted">No confirmations requested.</li>';
+        }
+        if (evaluationsEl) {
+          evaluationsEl.innerHTML = hasEvaluations ? buildPolicyCards(evaluations) : '';
+        }
+      }
+
+      const detailsEmpty = document.querySelector('[data-policy-details-empty]');
+      const detailsContainer = document.querySelector('[data-policy-details]');
+      if (detailsEmpty) {
+        detailsEmpty.hidden = hasEvaluations;
+      }
+      if (detailsContainer) {
+        if (hasEvaluations) {
+          detailsContainer.hidden = false;
+          detailsContainer.innerHTML = buildPolicyCards(evaluations);
+        } else {
+          detailsContainer.hidden = true;
+          detailsContainer.innerHTML = '';
+        }
+      }
+    };
+
     const renderSnapshot = (snapshot) => {
       latestSnapshot = snapshot;
       const generatedAtEl = document.querySelector("[data-generated-at]");
@@ -2629,6 +3049,7 @@
       renderAccounts(snapshot);
       renderAlerts(snapshot);
       renderNotifications(snapshot);
+      renderPolicies(snapshot);
       if (tradingModule) {
         tradingModule.updateSnapshot(snapshot);
       }
