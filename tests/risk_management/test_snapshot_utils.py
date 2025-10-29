@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from risk_management.snapshot_utils import build_presentable_snapshot
@@ -99,3 +101,41 @@ def test_snapshot_utils_preserves_position_fields() -> None:
     assert portfolio_perf["latest_snapshot"]["balance"] == 980.0
 
     assert view["account_stop_losses"]["Demo"]["current_balance"] == 950.0
+
+
+def test_portfolio_daily_realized_aggregates_account_values() -> None:
+    snapshot = {
+        "generated_at": "2024-03-02T00:00:00+00:00",
+        "accounts": [
+            {
+                "name": "Primary",
+                "balance": 20_000,
+                "daily_realized_pnl": 150.75,
+                "positions": [
+                    {
+                        "symbol": "ETH/USDT",
+                        "side": "long",
+                        "notional": 0,
+                        "entry_price": 0,
+                        "mark_price": 0,
+                        "unrealized_pnl": 0,
+                        "daily_realized_pnl": 0,
+                    }
+                ],
+            },
+            {
+                "name": "Secondary",
+                "balance": 5_000,
+                "daily_realized_pnl": -25.5,
+                "positions": [],
+            },
+        ],
+        "alert_thresholds": {},
+        "notification_channels": [],
+    }
+
+    view = build_presentable_snapshot(snapshot)
+
+    assert view["portfolio"]["daily_realized_pnl"] == pytest.approx(125.25)
+    realised_values = [account["daily_realized_pnl"] for account in view["accounts"]]
+    assert realised_values == [pytest.approx(150.75), pytest.approx(-25.5)]
