@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Seque
 
 try:  # pragma: no cover - optional dependency in some envs
     import ccxt.async_support as ccxt_async
-    from ccxt.base.errors import AuthenticationError, BaseError
+    from ccxt.base.errors import AuthenticationError, BaseError, NotSupported
 except ModuleNotFoundError:  # pragma: no cover - allow tests without ccxt
     ccxt_async = None  # type: ignore[assignment]
 
@@ -24,6 +24,11 @@ except ModuleNotFoundError:  # pragma: no cover - allow tests without ccxt
 
     class AuthenticationError(BaseError):
         """Fallback authentication error when ccxt is unavailable."""
+
+        pass
+
+    class NotSupported(BaseError):
+        """Fallback not supported error when ccxt is unavailable."""
 
         pass
 
@@ -1242,7 +1247,16 @@ class CCXTAccountClient(AccountClientProtocol):
     async def _cancel_open_orders(
         self, summary: Dict[str, Any], symbol_filter: Optional[str]
     ) -> None:
+        can_bulk_cancel = False
         if hasattr(self.client, "cancel_all_orders"):
+            can_bulk_cancel = True
+            capabilities = getattr(self.client, "has", None)
+            if isinstance(capabilities, Mapping):
+                bulk_flag = capabilities.get("cancelAllOrders")
+                if bulk_flag in (False, None):
+                    can_bulk_cancel = False
+
+        if can_bulk_cancel:
             try:
                 if symbol_filter:
                     await self.client.cancel_all_orders(
@@ -1257,6 +1271,12 @@ class CCXTAccountClient(AccountClientProtocol):
                     await self.client.cancel_all_orders(params=self._orders_params)
                     summary["cancelled_orders"].append({"symbol": None})
                 return
+            except NotSupported as exc:
+                logger.info(
+                    "%s cancel_all_orders not supported; falling back to per-order cancellation: %s",
+                    self.config.name,
+                    exc,
+                )
             except BaseError as exc:
                 logger.warning(
                     "cancel_all_orders failed for %s: %s", self.config.name, exc, exc_info=True
@@ -1360,18 +1380,44 @@ class CCXTAccountClient(AccountClientProtocol):
                 params["positionIdx"] = position_idx
 
             if self._normalized_exchange == "okx":
+
+                info = position.get("info") if isinstance(position.get("info"), Mapping) else None
+
+
                 okx_pos_side = None
                 raw_okx_side = position.get("posSide")
                 if isinstance(raw_okx_side, str) and raw_okx_side.strip():
                     okx_pos_side = raw_okx_side.strip().lower()
+
+                if okx_pos_side is None and isinstance(info, Mapping):
+                    info_side = info.get("posSide")
+
                 if okx_pos_side is None and isinstance(position.get("info"), Mapping):
                     info_side = position["info"].get("posSide")
+
                     if isinstance(info_side, str) and info_side.strip():
                         okx_pos_side = info_side.strip().lower()
                 if okx_pos_side is None and position_side:
                     okx_pos_side = position_side.lower()
                 if okx_pos_side in {"long", "short", "net"} and "posSide" not in params:
                     params["posSide"] = okx_pos_side
+
+
+                okx_td_mode: Optional[str] = None
+                for key in ("tdMode", "tradeMode", "marginMode", "mgnMode"):
+                    candidate = position.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        okx_td_mode = candidate.strip().lower()
+                        break
+                if okx_td_mode is None and isinstance(info, Mapping):
+                    for key in ("tdMode", "tradeMode", "marginMode", "mgnMode"):
+                        candidate = info.get(key)
+                        if isinstance(candidate, str) and candidate.strip():
+                            okx_td_mode = candidate.strip().lower()
+                            break
+                if okx_td_mode:
+                    params.setdefault("tdMode", okx_td_mode)
+
 
             if side_explicit:
                 params.pop("reduceOnly", None)
