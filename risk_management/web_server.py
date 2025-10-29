@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
+from .audit import get_audit_logger
 from .configuration import CustomEndpointSettings, load_realtime_config
 from .letsencrypt import LetsEncryptError, ensure_certificate
 
@@ -152,6 +153,22 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     config = load_realtime_config(args.config)
+    audit_logger = get_audit_logger(getattr(config, "audit", None))
+    if audit_logger:
+        try:
+            audit_logger.log(
+                action="web_server.start",
+                actor="system",
+                details={
+                    "host": args.host,
+                    "port": args.port,
+                    "reload": args.reload,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logging.getLogger("risk_management.web_server").warning(
+                "Failed to emit web server audit entry: %s", exc
+            )
     log_config, log_level = _determine_uvicorn_logging(config)
     from .web import create_app  # imported lazily to avoid heavy dependencies at import time
     override = args.custom_endpoints
