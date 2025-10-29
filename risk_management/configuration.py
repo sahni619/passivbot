@@ -22,6 +22,18 @@ from typing import (
 )
 
 
+from .audit import (
+    AuditSettings,
+    AuditS3Settings,
+    AuditSyslogSettings,
+    DEFAULT_REDACT_FIELDS,
+    get_audit_logger,
+)
+
+from .domain.models import Scenario, ScenarioShock
+
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -259,13 +271,18 @@ class RealtimeConfig:
     notification_channels: List[str] = field(default_factory=list)
     auth: Optional[AuthConfig] = None
     account_messages: Dict[str, str] = field(default_factory=dict)
+    scenarios: List[Scenario] = field(default_factory=list)
     custom_endpoints: Optional[CustomEndpointSettings] = None
     email: Optional[EmailSettings] = None
     config_root: Optional[Path] = None
     debug_api_payloads: bool = False
     reports_dir: Optional[Path] = None
     grafana: Optional[GrafanaConfig] = None
+
     policies: List[PolicyConfig] = field(default_factory=list)
+
+    audit: Optional[AuditSettings] = None
+
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -913,6 +930,175 @@ def _parse_auth(auth_raw: Optional[Mapping[str, Any]]) -> Optional[AuthConfig]:
     )
 
 
+def _parse_audit_settings(
+    audit_raw: Optional[Mapping[str, Any]],
+    *,
+    base_dir: Path,
+) -> Optional[AuditSettings]:
+    if not audit_raw:
+        return None
+    mapping = _ensure_mapping(audit_raw, description="Realtime configuration 'audit'")
+    enabled = _coerce_bool(mapping.get("enabled"), True)
+    log_path_raw = mapping.get("log_path")
+    if not log_path_raw:
+        raise ValueError("Audit configuration requires a 'log_path'.")
+    log_path = _resolve_path_relative_to(base_dir, log_path_raw)
+
+    redact_fields_raw = mapping.get("redact_fields")
+    redact_fields: Sequence[str]
+    if redact_fields_raw is None:
+        redact_fields = DEFAULT_REDACT_FIELDS
+    else:
+        if isinstance(redact_fields_raw, (str, bytes)):
+            raise TypeError("Audit 'redact_fields' must be an iterable of field names.")
+        if not isinstance(redact_fields_raw, Iterable):
+            raise TypeError("Audit 'redact_fields' must be an iterable of field names.")
+        processed: list[str] = []
+        for field in redact_fields_raw:
+            if field is None:
+                continue
+            field_str = str(field).strip()
+            if field_str:
+                processed.append(field_str)
+        redact_fields = tuple(processed) if processed else DEFAULT_REDACT_FIELDS
+
+    s3_settings: Optional[AuditS3Settings] = None
+    s3_raw = mapping.get("s3")
+    if s3_raw:
+        s3_mapping = _ensure_mapping(s3_raw, description="Realtime configuration 'audit.s3'")
+        bucket = s3_mapping.get("bucket")
+        if not bucket:
+            raise ValueError("Audit 's3' configuration requires a 'bucket'.")
+        prefix = str(s3_mapping.get("prefix", ""))
+        region_raw = s3_mapping.get("region_name")
+        profile_raw = s3_mapping.get("profile_name")
+        s3_settings = AuditS3Settings(
+            bucket=str(bucket),
+            prefix=prefix,
+            region_name=str(region_raw) if region_raw else None,
+            profile_name=str(profile_raw) if profile_raw else None,
+        )
+
+    syslog_settings: Optional[AuditSyslogSettings] = None
+    syslog_raw = mapping.get("syslog")
+    if syslog_raw:
+        syslog_mapping = _ensure_mapping(
+            syslog_raw, description="Realtime configuration 'audit.syslog'"
+        )
+        address = str(syslog_mapping.get("address", "localhost"))
+        port_raw = syslog_mapping.get("port", 514)
+        try:
+            port = int(port_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Audit 'syslog.port' must be an integer") from exc
+        facility = str(syslog_mapping.get("facility", "user"))
+        syslog_settings = AuditSyslogSettings(address=address, port=port, facility=facility)
+
+    return AuditSettings(
+        log_path=log_path,
+        enabled=enabled,
+        redact_fields=redact_fields,
+        s3=s3_settings,
+        syslog=syslog_settings,
+    )
+
+def _parse_scenarios(payload: Any) -> List[Scenario]:
+    if not payload:
+        return []
+
+    if isinstance(payload, Mapping):
+        iterable = payload.values()
+    elif isinstance(payload, Iterable) and not isinstance(payload, (str, bytes)):
+        iterable = payload
+    else:
+        raise TypeError(
+            "Realtime configuration 'scenarios' must be an iterable of scenario definitions.",
+        )
+
+    scenarios: List[Scenario] = []
+    for raw in iterable:
+        if not isinstance(raw, Mapping):
+            raise TypeError("Scenario definitions must be JSON objects.")
+        scenario_id = raw.get("id")
+        name = raw.get("name") or scenario_id
+        if not name:
+            raise ValueError("Scenario definitions must include a 'name' or 'id'.")
+        description_raw = raw.get("description")
+        description = (
+            str(description_raw).strip()
+            if isinstance(description_raw, str) and description_raw.strip()
+            else None
+        )
+        shocks_raw = raw.get("shocks")
+        shocks = _parse_shock_definitions(shocks_raw, str(name))
+        scenarios.append(
+            Scenario(
+                id=str(scenario_id) if scenario_id else None,
+                name=str(name),
+                description=description,
+                shocks=tuple(shocks),
+            )
+        )
+    return scenarios
+
+
+def _parse_shock_definitions(payload: Any, scenario_name: str) -> List[ScenarioShock]:
+    if not payload:
+        raise ValueError(f"Scenario '{scenario_name}' must include at least one shock definition.")
+
+    shocks: List[ScenarioShock] = []
+
+    if isinstance(payload, Mapping):
+        items = payload.items()
+        for symbol, value in items:
+            pct = _coerce_float(value, description=f"Scenario '{scenario_name}' shock for '{symbol}'")
+            shocks.append(ScenarioShock(symbol=str(symbol), price_pct=pct))
+    elif isinstance(payload, Iterable) and not isinstance(payload, (str, bytes)):
+        for raw in payload:
+            if not isinstance(raw, Mapping):
+                raise TypeError(
+                    f"Scenario '{scenario_name}' shock entries must be JSON objects.",
+                )
+            symbol = raw.get("symbol") or raw.get("pair") or raw.get("ticker")
+            if not symbol:
+                raise ValueError(
+                    f"Scenario '{scenario_name}' shock entries must include a 'symbol'.",
+                )
+            pct_raw = (
+                raw.get("price_pct")
+                if raw.get("price_pct") is not None
+                else raw.get("pct")
+                if raw.get("pct") is not None
+                else raw.get("percent")
+            )
+            pct = _coerce_float(
+                pct_raw,
+                description=f"Scenario '{scenario_name}' shock for '{symbol}'",
+            )
+            shocks.append(ScenarioShock(symbol=str(symbol), price_pct=pct))
+    else:
+        raise TypeError(
+            f"Scenario '{scenario_name}' shocks must be provided as a mapping or list of definitions.",
+        )
+
+    if not shocks:
+        raise ValueError(
+            f"Scenario '{scenario_name}' must include at least one shock definition.",
+        )
+
+    return shocks
+
+
+def _coerce_float(value: Any, *, description: str) -> float:
+    if value is None:
+        raise ValueError(f"{description} must be a number.")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{description} must be a number.") from exc
+
+
+
 def load_realtime_config(path: Path | str) -> RealtimeConfig:
     """Load a realtime configuration file.
 
@@ -1021,6 +1207,26 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
                 continue
             account_messages[str(name)] = str(message)
 
+
+    audit_settings = _parse_audit_settings(config.get("audit"), base_dir=path.parent)
+    audit_logger = get_audit_logger(audit_settings)
+    if audit_logger:
+        try:
+            audit_logger.log(
+                action="config.load",
+                actor="system",
+                details={
+                    "path": str(path),
+                    "accounts": [account.name for account in accounts],
+                    "notification_channels": list(notification_channels),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning("Failed to emit configuration audit entry: %s", exc)
+
+    scenarios = _parse_scenarios(config.get("scenarios"))
+
+
     return RealtimeConfig(
         accounts=accounts,
         alert_thresholds=alert_thresholds,
@@ -1033,5 +1239,11 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         reports_dir=reports_dir,
         grafana=grafana_settings,
         account_messages=account_messages,
+
         policies=policies,
+
+        audit=audit_settings,
+
+        scenarios=scenarios,
+
     )

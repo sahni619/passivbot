@@ -5,19 +5,29 @@ The application exposes REST endpoints and templated views backed by the
 """
 
 from __future__ import annotations
+import json
+import logging
 from collections.abc import Iterable as IterableABC
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
+from .audit import AuditLogWriter, AuditSettings, get_audit_logger, read_audit_entries
 from .configuration import RealtimeConfig
+from .domain.models import Scenario
 from .services.risk_service import RiskService, RiskServiceProtocol
 from .reporting import ReportManager
 from .services import PerformanceRepository
@@ -30,6 +40,7 @@ from .snapshot_utils import (
     MAX_ACCOUNTS_PAGE_SIZE,
     build_presentable_snapshot,
 )
+from .stress import scenario_results_to_dict, simulate_scenarios
 
 
 class AuthManager:
@@ -293,6 +304,59 @@ def create_app(
         performance_repository = PerformanceRepository(Path(reports_dir))
     app.state.performance_repository = performance_repository
 
+    audit_logger = get_audit_logger(config.audit)
+    app.state.audit_logger = audit_logger
+    app.state.audit_settings = config.audit
+    audit_log = logging.getLogger("risk_management.web.audit")
+
+    def emit_audit(
+        request: Request,
+        action: str,
+        details: Mapping[str, Any],
+        *,
+        actor: Optional[str] = None,
+    ) -> None:
+        logger_instance: Optional[AuditLogWriter] = getattr(
+            request.app.state, "audit_logger", None
+        )
+        if not logger_instance:
+            return
+        resolved_actor = actor or request.session.get("user") or "unknown"
+        try:
+            logger_instance.log(action=action, actor=str(resolved_actor), details=dict(details))
+        except Exception as exc:  # pragma: no cover - defensive guard
+            audit_log.warning("Failed to write audit entry '%s': %s", action, exc)
+
+    def resolve_audit_settings(request: Request) -> AuditSettings:
+        settings = getattr(request.app.state, "audit_settings", None)
+        if settings is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Audit logging is not enabled.",
+            )
+        return settings
+
+    def resolve_audit_filters(
+        request: Request,
+        *,
+        default_limit: Optional[int] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[int]]:
+        params = request.query_params
+        action_filter = params.get("action") or None
+        actor_filter = params.get("actor") or None
+        limit_value: Optional[int] = None
+        limit_raw = params.get("limit")
+        if limit_raw is not None:
+            parsed_limit = _parse_positive_int(limit_raw, "limit", maximum=5000)
+            if parsed_limit is not None:
+                limit_value = parsed_limit
+        elif default_limit is not None:
+            limit_value = default_limit
+        return action_filter, actor_filter, limit_value
+
+    app.state.scenarios = list(config.scenarios)
+
+
     def resolve_grafana_context() -> dict[str, Any]:
         grafana_cfg = config.grafana
         if grafana_cfg is None:
@@ -415,6 +479,11 @@ def create_app(
             sort_key=DEFAULT_ACCOUNT_SORT_KEY,
             sort_order=DEFAULT_ACCOUNT_SORT_ORDER,
         )
+        configured_scenarios: Sequence[Scenario] = request.app.state.scenarios
+        scenario_results = simulate_scenarios(snapshot, configured_scenarios)
+        view_model["scenarios"] = (
+            scenario_results_to_dict(scenario_results) if scenario_results else []
+        )
         grafana_context: dict[str, Any] = request.app.state.grafana_context
         return templates.TemplateResponse(
             "dashboard/index.html",
@@ -455,6 +524,11 @@ def create_app(
             page_size=page_size_param,
             sort_key=sort_param,
             sort_order=sort_order_param,
+        )
+        configured_scenarios: Sequence[Scenario] = request.app.state.scenarios
+        scenario_results = simulate_scenarios(snapshot, configured_scenarios)
+        view_model["scenarios"] = (
+            scenario_results_to_dict(scenario_results) if scenario_results else []
         )
         return JSONResponse(view_model)
 
@@ -764,11 +838,21 @@ def create_app(
 
     @app.post("/api/kill-switch", response_class=JSONResponse)
     async def api_global_kill_switch(
+        request: Request,
         service: RiskDashboardService = Depends(get_service),
-        _: str = Depends(require_user),
+        user: str = Depends(require_user),
     ) -> JSONResponse:
         results = await service.trigger_kill_switch()
         payload = _build_kill_switch_response(results)
+        emit_audit(
+            request,
+            "kill_switch.global",
+            {
+                "success": payload.get("success"),
+                "error_count": len(payload.get("errors", [])),
+            },
+            actor=user,
+        )
         return JSONResponse(payload)
 
     @app.post("/api/accounts/{account_name}/kill-switch", response_class=JSONResponse)
@@ -776,7 +860,7 @@ def create_app(
         request: Request,
         account_name: str,
         service: RiskDashboardService = Depends(get_service),
-        _: str = Depends(require_user),
+        user: str = Depends(require_user),
     ) -> JSONResponse:
         target = account_name.strip()
         symbol = request.query_params.get("symbol")
@@ -792,6 +876,17 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         payload = _build_kill_switch_response(results)
+        emit_audit(
+            request,
+            "kill_switch.account",
+            {
+                "account": target or "all",
+                "symbol": symbol or "all",
+                "success": payload.get("success"),
+                "error_count": len(payload.get("errors", [])),
+            },
+            actor=user,
+        )
         return JSONResponse(payload)
 
     @app.post(
@@ -802,7 +897,7 @@ def create_app(
         account_name: str,
         symbol: str,
         service: RiskDashboardService = Depends(get_service),
-        _: str = Depends(require_user),
+        user: str = Depends(require_user),
     ) -> JSONResponse:
         target_symbol = symbol.strip()
         if not target_symbol:
@@ -815,7 +910,104 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         payload = _build_kill_switch_response(results)
+        emit_audit(
+            request,
+            "kill_switch.position",
+            {
+                "account": target_account or "all",
+                "symbol": target_symbol,
+                "success": payload.get("success"),
+                "error_count": len(payload.get("errors", [])),
+            },
+            actor=user,
+        )
         return JSONResponse(payload)
+
+    @app.get("/audit", response_class=HTMLResponse)
+    async def audit_dashboard_view(
+        request: Request,
+        _: str = Depends(require_user),
+    ) -> HTMLResponse:
+        settings = resolve_audit_settings(request)
+        action_filter, actor_filter, limit_value = resolve_audit_filters(
+            request, default_limit=200
+        )
+        entries = read_audit_entries(
+            settings.log_path,
+            action=action_filter,
+            actor=actor_filter,
+            limit=limit_value,
+        )
+        ordered = list(reversed(entries))
+        download_params: dict[str, Any] = {}
+        if action_filter:
+            download_params["action"] = action_filter
+        if actor_filter:
+            download_params["actor"] = actor_filter
+        if limit_value:
+            download_params["limit"] = limit_value
+        download_url = request.url_for("audit_download")
+        if download_params:
+            download_url = f"{download_url}?{urlencode(download_params)}"
+        return templates.TemplateResponse(
+            "audit/index.html",
+            {
+                "request": request,
+                "entries": ordered,
+                "filters": {
+                    "action": action_filter or "",
+                    "actor": actor_filter or "",
+                    "limit": limit_value,
+                },
+                "download_url": download_url,
+            },
+        )
+
+    @app.get("/api/audit", response_class=JSONResponse)
+    async def api_audit_entries(
+        request: Request,
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        settings = resolve_audit_settings(request)
+        action_filter, actor_filter, limit_value = resolve_audit_filters(
+            request, default_limit=200
+        )
+        entries = read_audit_entries(
+            settings.log_path,
+            action=action_filter,
+            actor=actor_filter,
+            limit=limit_value,
+        )
+        payload = {
+            "entries": list(reversed(entries)),
+            "filters": {
+                "action": action_filter,
+                "actor": actor_filter,
+                "limit": limit_value,
+            },
+        }
+        return JSONResponse(payload)
+
+    @app.get("/audit/download", response_class=PlainTextResponse)
+    async def audit_download(
+        request: Request,
+        _: str = Depends(require_user),
+    ) -> PlainTextResponse:
+        settings = resolve_audit_settings(request)
+        action_filter, actor_filter, limit_value = resolve_audit_filters(request)
+        entries = read_audit_entries(
+            settings.log_path,
+            action=action_filter,
+            actor=actor_filter,
+            limit=limit_value,
+        )
+        lines = [json.dumps(entry, sort_keys=True) for entry in entries]
+        content = "\n".join(lines)
+        if content:
+            content += "\n"
+        response = PlainTextResponse(content, media_type="application/jsonl")
+        response.headers["Content-Disposition"] = "attachment; filename=audit-log.jsonl"
+        return response
 
     @app.get("/api/accounts/{account_name}/reports", response_class=JSONResponse)
     async def api_list_reports(

@@ -24,10 +24,102 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .configuration import CustomEndpointSettings, load_realtime_config
-from .domain.models import Account, AlertThresholds, Order, Position
+from .domain.models import (
+    Account,
+    AlertThresholds,
+    Order,
+    Position,
+    Scenario,
+    ScenarioResult,
+    ScenarioShock,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _select_configured_scenarios(
+    configured: Sequence[Scenario],
+    requested: Optional[Sequence[str]],
+) -> List[Scenario]:
+    if not configured:
+        if requested:
+            names = ", ".join(str(name) for name in requested)
+            raise ValueError(
+                f"No configured scenarios available to match: {names}",
+            )
+        return []
+
+    if not requested:
+        return list(configured)
+
+    index: Dict[str, Scenario] = {}
+    for scenario in configured:
+        keys = {scenario.name.lower()}
+        if scenario.id:
+            keys.add(scenario.id.lower())
+        for key in keys:
+            index.setdefault(key, scenario)
+
+    selected: List[Scenario] = []
+    missing: List[str] = []
+
+    for entry in requested:
+        key = str(entry).strip().lower()
+        if not key:
+            continue
+        match = index.get(key)
+        if match is None:
+            missing.append(str(entry))
+            continue
+        if match not in selected:
+            selected.append(match)
+
+    if missing:
+        raise ValueError(f"Unknown scenario(s): {', '.join(missing)}")
+
+    return selected
+
+
+def _parse_ad_hoc_scenario(values: Optional[Sequence[str]]) -> Optional[Scenario]:
+    if not values:
+        return None
+
+    shocks: List[ScenarioShock] = []
+    for raw in values:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if ":" not in text:
+            raise ValueError(
+                "Ad-hoc shocks must use the format SYMBOL:PCT (for example BTCUSDT:-0.10).",
+            )
+        symbol_part, pct_part = text.split(":", 1)
+        symbol = symbol_part.strip().upper()
+        if not symbol:
+            raise ValueError("Shock definitions must include a symbol name before ':'.")
+        try:
+            pct = float(pct_part)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Shock '{text}' must include a numeric percentage change.",
+            ) from exc
+        shocks.append(ScenarioShock(symbol=symbol, price_pct=pct))
+
+    if not shocks:
+        return None
+
+    description = ", ".join(
+        f"{shock.symbol} {shock.price_pct:+.2%}" for shock in shocks
+    )
+    return Scenario(
+        id="adhoc",
+        name="Ad-hoc shock",
+        description=description,
+        shocks=tuple(shocks),
+    )
 
 
 def _format_currency(value: float) -> str:
@@ -275,7 +367,11 @@ def render_dashboard(
     alerts: Sequence[str],
     notifications: Sequence[str],
     account_messages: Optional[Mapping[str, str]] = None,
+
     policy_summary: Optional[Mapping[str, Any]] = None,
+
+    scenario_results: Optional[Sequence[ScenarioResult]] = None,
+
 ) -> str:
     lines: List[str] = []
     lines.append("=" * 80)
@@ -320,6 +416,52 @@ def render_dashboard(
         else:
             lines.append("    No open positions.")
         lines.append("")
+
+    if scenario_results:
+        lines.append("Scenario analysis")
+        lines.append("-" * 80)
+        for result in scenario_results:
+            scenario = result.scenario
+            identifier = scenario.name
+            if scenario.id and scenario.id.lower() != scenario.name.lower():
+                identifier = f"{identifier} [{scenario.id}]"
+            lines.append(identifier)
+            if scenario.description:
+                lines.append(f"  {scenario.description}")
+            if scenario.shocks:
+                shocks_summary = ", ".join(
+                    f"{shock.symbol}: {_format_pct(shock.price_pct)}"
+                    for shock in scenario.shocks
+                )
+                lines.append(f"  Shocks: {shocks_summary}")
+            portfolio = result.portfolio
+            lines.append(
+                "  "
+                + f"Portfolio PnL: {_format_currency(portfolio.pnl)} | "
+                + f"Balance: {_format_currency(portfolio.balance_after)} "
+                + f"(from {_format_currency(portfolio.balance_before)})"
+            )
+            lines.append(
+                "  "
+                + f"Gross exposure: {_format_currency(portfolio.gross_exposure)} "
+                + f"({_format_pct(portfolio.gross_exposure_pct)})"
+            )
+            lines.append(
+                "  "
+                + f"Net exposure: {_format_currency(portfolio.net_exposure)} "
+                + f"({_format_pct(portfolio.net_exposure_pct)})"
+            )
+            top_symbols = list(portfolio.symbols)[:3]
+            if top_symbols:
+                lines.append("  Top exposures:")
+                for symbol in top_symbols:
+                    lines.append(
+                        "    "
+                        + f"{symbol.symbol}: gross {_format_currency(symbol.gross_notional)} "
+                        + f"({_format_pct(symbol.gross_pct)}) net {_format_currency(symbol.net_notional)} "
+                        + f"({_format_pct(symbol.net_pct)}) pnl {_format_currency(symbol.pnl)}"
+                    )
+            lines.append("")
 
     lines.append("Alerts")
     lines.append("-" * 80)
@@ -421,20 +563,30 @@ def run_dashboard(config_path: Path) -> str:
     return build_dashboard(snapshot)
 
 
-def build_dashboard(snapshot: Dict[str, Any]) -> str:
+def build_dashboard(
+    snapshot: Dict[str, Any],
+    *,
+    scenario_results: Optional[Sequence[ScenarioResult]] = None,
+) -> str:
     generated_at, accounts, thresholds, notifications = parse_snapshot(snapshot)
     alerts = evaluate_alerts(accounts, thresholds)
     account_messages = snapshot.get("account_messages", {}) if isinstance(snapshot, Mapping) else {}
+
     policy_summary = None
     if isinstance(snapshot, Mapping):
         policy_summary = _normalise_policy_summary(snapshot.get("policies"))
+
     return render_dashboard(
         generated_at,
         accounts,
         alerts,
         notifications,
         account_messages=account_messages,
+
         policy_summary=policy_summary,
+
+        scenario_results=scenario_results,
+
     )
 
 
@@ -472,6 +624,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "disable overrides."
         ),
     )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        dest="scenario_names",
+        help=(
+            "Name or ID of a configured scenario to evaluate. Repeat to include multiple scenarios."
+        ),
+    )
+    parser.add_argument(
+        "--shock",
+        action="append",
+        dest="shocks",
+        metavar="SYMBOL:PCT",
+        help=(
+            "Ad-hoc price shock expressed as a decimal percentage. Example: --shock BTCUSDT:-0.10"
+        ),
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -495,6 +664,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
     from .services import RiskService
 
     realtime_service: Optional[RiskService] = None
+    configured_scenarios: Sequence[Scenario] = []
     if args.realtime_config:
         realtime_config = load_realtime_config(Path(args.realtime_config))
         override = args.custom_endpoints
@@ -516,17 +686,35 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     realtime_config.custom_endpoints = CustomEndpointSettings(
                         path=override_normalized, autodiscover=False
                     )
+        configured_scenarios = list(realtime_config.scenarios)
         realtime_service = RiskService.from_config(realtime_config)
         logger.info("Starting realtime dashboard using %s", args.realtime_config)
 
     try:
+        selected_configured = _select_configured_scenarios(
+            configured_scenarios,
+            getattr(args, "scenario_names", None),
+        )
+        ad_hoc = _parse_ad_hoc_scenario(getattr(args, "shocks", None))
+        scenarios_to_run: List[Scenario] = list(selected_configured)
+        if ad_hoc is not None:
+            scenarios_to_run.append(ad_hoc)
+        simulate = None
+        if scenarios_to_run:
+            from .stress import simulate_scenarios
+
+            simulate = simulate_scenarios
+
         iteration = 0
         while True:
             if realtime_service is not None:
                 snapshot = await realtime_service.fetch_snapshot()
             else:
                 snapshot = load_snapshot(Path(args.config))
-            dashboard = build_dashboard(snapshot)
+            scenario_results: Sequence[ScenarioResult] = []
+            if simulate is not None:
+                scenario_results = simulate(snapshot, scenarios_to_run)
+            dashboard = build_dashboard(snapshot, scenario_results=scenario_results)
             print(dashboard)
             iteration += 1
             if args.iterations and iteration >= args.iterations:

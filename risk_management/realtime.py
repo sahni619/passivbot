@@ -32,6 +32,7 @@ from ._parsing import (
     parse_position as _parse_position,
 )
 from .account_clients import AccountClientProtocol, CCXTAccountClient
+from .audit import get_audit_logger
 from .configuration import CustomEndpointSettings, RealtimeConfig
 from .performance import PerformanceTracker
 from .policies import PolicyEvaluator
@@ -134,12 +135,19 @@ class RealtimeDataFetcher:
                 logger.info(
                     "Debug API payload logging enabled for account %s", account.name
                 )
+
         self._notifications = NotificationCoordinator(config)
         self._policy_evaluator: Optional[PolicyEvaluator]
         if config.policies:
             self._policy_evaluator = PolicyEvaluator(config.policies)
         else:
             self._policy_evaluator = None
+
+        self._notifications = NotificationCoordinator(
+            config,
+            audit_logger=get_audit_logger(config.audit),
+        )
+
         self._portfolio_stop_loss: Optional[Dict[str, Any]] = None
         self._last_portfolio_balance: Optional[float] = None
         self._account_stop_losses: Dict[str, Dict[str, Any]] = {}
