@@ -12,6 +12,7 @@ from .configuration import RealtimeConfig
 from .dashboard import evaluate_alerts, parse_snapshot
 from .email_notifications import EmailAlertSender
 from .telegram_notifications import TelegramNotifier
+from .policies import PolicyActionState, PolicyEvaluationResult
 
 __all__ = [
     "NotificationCoordinator",
@@ -166,6 +167,74 @@ class NotificationCoordinator:
                     "alert_count": len(new_alerts),
                     "destination_count": len(self._telegram_targets),
                 },
+            )
+
+    def handle_policy_evaluations(self, result: PolicyEvaluationResult) -> None:
+        """Log policy actions and forward notifications to downstream channels."""
+
+        if not result.evaluations:
+            return
+
+        for action in result.executed_actions:
+            message = action.rendered_message or action.message_template
+            if not message:
+                value = action.trigger_value
+                threshold = action.threshold
+                message = (
+                    f"Action {action.config.type} executed"
+                    f" (value={value!r}, threshold={threshold!r})"
+                )
+            self._log_policy_action(action, message)
+            if action.config.type in {"notify", "require_confirmation"}:
+                payload = message
+                if action.config.type == "require_confirmation" and action.confirmation_key:
+                    payload = f"{message}\nConfirmation key: {action.confirmation_key}"
+                self._dispatch_policy_notification(action, payload)
+
+        for pending in result.pending_confirmations:
+            logger.warning(
+                "Policy %s awaiting confirmation (key=%s)",
+                pending.policy_name,
+                pending.confirmation_key or "unspecified",
+            )
+
+    def _log_policy_action(self, action: PolicyActionState, message: str) -> None:
+        log_message = f"Policy {action.policy_name}: {message}"
+        severity = (action.severity or "info").lower()
+        if severity in {"warning", "warn"}:
+            logger.warning(log_message)
+        elif severity in {"error", "critical", "fatal"}:
+            logger.error(log_message)
+        elif severity == "debug":
+            logger.debug(log_message)
+        else:
+            logger.info(log_message)
+
+    def _dispatch_policy_notification(
+        self, action: PolicyActionState, message: str
+    ) -> None:
+        channels = [
+            str(channel).strip().lower()
+            for channel in action.channels
+            if str(channel).strip()
+        ]
+        if not channels:
+            channels = ["email", "telegram"]
+        subject = action.config.subject or f"Policy triggered: {action.policy_name}"
+
+        if "email" in channels and self._email_sender and self._email_recipients:
+            self._email_sender.send(subject, message, self._email_recipients)
+        if "telegram" in channels and self._telegram_notifier and self._telegram_targets:
+            for token, chat_id in self._telegram_targets:
+                self._telegram_notifier.send(token, chat_id, message)
+
+        for channel in channels:
+            if channel in {"email", "telegram"}:
+                continue
+            logger.info(
+                "Policy %s requested unsupported notification channel '%s'",
+                action.policy_name,
+                channel,
             )
 
     @property

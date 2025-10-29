@@ -11,7 +11,14 @@ from custom_endpoint_overrides import (
     resolve_custom_endpoint_override,
 )
 
-from risk_management.configuration import AccountConfig, RealtimeConfig
+from risk_management.configuration import (
+    AccountConfig,
+    ManualOverrideConfig,
+    PolicyActionConfig,
+    PolicyConfig,
+    PolicyTriggerConfig,
+    RealtimeConfig,
+)
 from risk_management.realtime import (
     AuthenticationError,
     RealtimeDataFetcher,
@@ -41,12 +48,16 @@ class RecordingNotifications:
     def __init__(self) -> None:
         self.daily: List[tuple[Mapping[str, object], float]] = []
         self.alerts: List[Mapping[str, object]] = []
+        self.policies: List[object] = []
 
     def send_daily_snapshot(self, snapshot: Mapping[str, object], portfolio_balance: float) -> None:
         self.daily.append((snapshot, portfolio_balance))
 
     def dispatch_alerts(self, snapshot: Mapping[str, object]) -> None:
         self.alerts.append(snapshot)
+
+    def handle_policy_evaluations(self, result) -> None:  # type: ignore[no-untyped-def]
+        self.policies.append(result)
 
 
 def _make_config() -> RealtimeConfig:
@@ -213,3 +224,62 @@ def test_portfolio_stop_loss_triggers_notifications() -> None:
     assert recorder.alerts[-1]["portfolio_stop_loss"]["triggered"] is True
 
     asyncio.run(fetcher.close())
+
+
+def test_policies_are_evaluated_and_recorded() -> None:
+    config = RealtimeConfig(
+        accounts=[AccountConfig(name="Alpha", exchange="test")],
+        notification_channels=["email:risk@example.com"],
+        policies=[
+            PolicyConfig(
+                name="Balance floor",
+                description="Alert when balance drops",
+                trigger=PolicyTriggerConfig(
+                    type="metric_threshold",
+                    metric="account.Alpha.balance",
+                    operator="<",
+                    value=50_000,
+                ),
+                actions=[
+                    PolicyActionConfig(
+                        type="notify",
+                        message="Balance is ${value:,.2f}",
+                        channels=["email"],
+                        severity="warning",
+                        confirmation_key="alpha-balance",
+                    ),
+                    PolicyActionConfig(
+                        type="require_confirmation",
+                        message="Confirm trading continuation",
+                        channels=["email"],
+                        severity="warning",
+                        confirmation_key="alpha-confirm",
+                        requires_confirmation=True,
+                    ),
+                ],
+                manual_override=ManualOverrideConfig(
+                    allowed=True,
+                    instructions="Contact the risk desk before overriding.",
+                    expires_after_seconds=600,
+                ),
+            )
+        ],
+    )
+    client = StubAccountClient([
+        {"name": "Alpha", "balance": 45_000.0, "positions": []},
+    ])
+    fetcher = RealtimeDataFetcher(config, account_clients=[client])
+    recorder = RecordingNotifications()
+    fetcher._notifications = recorder  # type: ignore[attr-defined]
+
+    snapshot = asyncio.run(fetcher.fetch_snapshot())
+
+    policies = snapshot.get("policies")
+    assert isinstance(policies, Mapping)
+    assert policies["active"][0]["name"] == "Balance floor"
+    pending = policies.get("pending_actions", [])
+    assert pending and pending[0]["policy"] == "Balance floor"
+    assert recorder.policies, "expected policy evaluations to be recorded"
+    evaluation_result = recorder.policies[-1]
+    assert evaluation_result.executed_actions
+    assert any(action.config.type == "notify" for action in evaluation_result.executed_actions)

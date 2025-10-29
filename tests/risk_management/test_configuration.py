@@ -241,6 +241,67 @@ def test_load_realtime_config_supports_nested_user_entries(tmp_path: Path) -> No
     assert config.config_root == config_path.parent.resolve()
 
 
+def test_policies_parsed_from_configuration(tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["policies"] = [
+        {
+            "name": "Balance guard",
+            "description": "Alert when portfolio balance exceeds $10k",
+            "trigger": {
+                "metric": "portfolio.balance",
+                "operator": ">=",
+                "value": 10_000,
+                "cooldown_seconds": 300,
+            },
+            "actions": [
+                {
+                    "type": "notify",
+                    "message": "Balance is ${value:,.2f}",
+                    "channels": ["email"],
+                    "severity": "warning",
+                    "confirmation_key": "balance-ack",
+                }
+            ],
+            "manual_override": {
+                "allowed": True,
+                "instructions": "Desk approval required.",
+                "expires_after_seconds": 1800,
+            },
+        }
+    ]
+    config_path = _write_config(tmp_path, payload)
+
+    config = load_realtime_config(config_path)
+
+    assert len(config.policies) == 1
+    policy = config.policies[0]
+    assert policy.name == "Balance guard"
+    assert policy.description == "Alert when portfolio balance exceeds $10k"
+    assert policy.trigger.metric == "portfolio.balance"
+    assert policy.trigger.operator == ">="
+    assert policy.trigger.value == pytest.approx(10_000.0)
+    assert policy.trigger.cooldown_seconds == 300
+    assert len(policy.actions) == 1
+    action = policy.actions[0]
+    assert action.type == "notify"
+    assert action.channels == ["email"]
+    assert action.severity == "warning"
+    assert action.confirmation_key == "balance-ack"
+    assert policy.manual_override is not None
+    assert policy.manual_override.allowed is True
+    assert policy.manual_override.instructions == "Desk approval required."
+    assert policy.manual_override.expires_after_seconds == 1800
+
+
+def test_policies_require_array(tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["policies"] = {"policy": {"trigger": {"metric": "portfolio.balance", "operator": ">=", "value": 1}}}
+    config_path = _write_config(tmp_path, payload)
+
+    with pytest.raises(TypeError, match="policies' must be an array"):
+        load_realtime_config(config_path)
+
+
 
 def test_load_realtime_config_expands_user_path(tmp_path: Path, monkeypatch) -> None:
     home_api_keys = tmp_path / "api-keys.json"
