@@ -219,6 +219,89 @@
           <p style="color: var(--muted); margin-top: 1rem;">No active exposures.</p>
         {% endif %}
       </section>
+      {% if snapshot.scenarios %}
+        <section class="card" data-scenarios>
+          <h2 style="margin-bottom: 0.5rem;">Scenario analysis</h2>
+          <p style="color: var(--muted); margin: 0;">
+            Simulated portfolio impact under configured market shocks.
+          </p>
+          <div class="table-wrapper" style="margin-top: 1.5rem;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Scenario</th>
+                  <th>Portfolio PnL</th>
+                  <th>Balance</th>
+                  <th>Gross Exposure</th>
+                  <th>Net Exposure</th>
+                  <th>Top exposures</th>
+                  <th>Shocks</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for scenario in snapshot.scenarios %}
+                  {% set scenario_meta = scenario.scenario %}
+                  {% set portfolio = scenario.portfolio %}
+                  {% set pnl_class = 'gain' if portfolio.pnl >= 0 else 'loss' %}
+                  {% set net_class = 'gain' if portfolio.net_exposure >= 0 else 'loss' %}
+                  <tr>
+                    <td>
+                      <div style="font-weight: 600;">{{ scenario_meta.name }}</div>
+                      {% if scenario_meta.id and scenario_meta.id|lower != scenario_meta.name|lower %}
+                        <div style="color: var(--muted); font-size: 0.85rem;">{{ scenario_meta.id }}</div>
+                      {% endif %}
+                      {% if scenario_meta.description %}
+                        <div style="color: var(--muted); font-size: 0.9rem;">{{ scenario_meta.description }}</div>
+                      {% endif %}
+                    </td>
+                    <td class="{{ pnl_class }}">{{ portfolio.pnl|currency }}</td>
+                    <td>
+                      <div>{{ portfolio.balance_after|currency }}</div>
+                      <div class="subvalue">from {{ portfolio.balance_before|currency }}</div>
+                    </td>
+                    <td>
+                      <div>{{ portfolio.gross_exposure|currency }}</div>
+                      <div class="subvalue">{{ portfolio.gross_exposure_pct|pct }}</div>
+                    </td>
+                    <td class="{{ net_class }}">
+                      <div>{{ portfolio.net_exposure|currency }}</div>
+                      <div class="subvalue">{{ portfolio.net_exposure_pct|pct }}</div>
+                    </td>
+                    <td>
+                      {% set top_symbols = portfolio.symbols[:3] %}
+                      {% if top_symbols %}
+                        {% for entry in top_symbols %}
+                          <div>
+                            {{ entry.symbol }}: {{ entry.gross_notional|currency }} ({{ entry.gross_pct|pct }})
+                          </div>
+                        {% endfor %}
+                      {% else %}
+                        -
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% if scenario_meta.shocks %}
+                        {% for shock in scenario_meta.shocks %}
+                          <div>{{ shock.symbol }}: {{ shock.price_pct|pct }}</div>
+                        {% endfor %}
+                      {% else %}
+                        -
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            <div class="table-pagination" aria-label="Scenario analysis">
+              <button type="button" disabled>Prev</button>
+              <span>
+                {{ snapshot.scenarios|length }} scenario{{ 's' if snapshot.scenarios|length != 1 else '' }}
+              </span>
+              <button type="button" disabled>Next</button>
+            </div>
+          </div>
+        </section>
+      {% endif %}
     </div>
 
     <div class="page-section" data-page-section="accounts" hidden>
