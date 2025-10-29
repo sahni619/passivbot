@@ -19,24 +19,28 @@ from custom_endpoint_overrides import (
 try:  # pragma: no cover - optional dependency when running tests
     from ccxt.base.errors import AuthenticationError
 except (ModuleNotFoundError, ImportError):  # pragma: no cover - ccxt is optional for tests
-    from .io.account_clients import AuthenticationError
+
+    class AuthenticationError(Exception):
+        """Fallback authentication error used when ccxt is unavailable."""
+
+        pass
 
 from ._notifications import NotificationCoordinator
-from .audit import get_audit_logger
+from ._parsing import (
+    extract_balance as _extract_balance,
+    parse_order as _parse_order,
+    parse_position as _parse_position,
+)
+from .account_clients import AccountClientProtocol, CCXTAccountClient
+
 from .configuration import AccountConfig, CustomEndpointSettings, RealtimeConfig
-from .core.policies import PolicyEvaluator
-from .io.account_clients import AccountClientProtocol, CCXTAccountClient
+
+from .audit import get_audit_logger
+from .configuration import CustomEndpointSettings, RealtimeConfig
 from .performance import PerformanceTracker
+from .policies import PolicyEvaluator
 
 logger = logging.getLogger(__name__)
-
-
-def _coerce_float(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
 
 def _exception_info(
     exc: BaseException,
@@ -135,16 +139,16 @@ class RealtimeDataFetcher:
                     "Debug API payload logging enabled for account %s", account.name
                 )
 
-        audit_logger = get_audit_logger(config.audit)
+        self._notifications = NotificationCoordinator(config)
+        self._policy_evaluator: Optional[PolicyEvaluator]
+        if config.policies:
+            self._policy_evaluator = PolicyEvaluator(config.policies)
+        else:
+            self._policy_evaluator = None
+
         self._notifications = NotificationCoordinator(
             config,
-            audit_logger=audit_logger,
-        )
-        self._policy_evaluator: Optional[PolicyEvaluator]
-        self._policy_evaluator = (
-            PolicyEvaluator(config.policies)
-            if config.policies
-            else None
+            audit_logger=get_audit_logger(config.audit),
         )
 
         self._portfolio_stop_loss: Optional[Dict[str, Any]] = None
@@ -263,14 +267,14 @@ class RealtimeDataFetcher:
                     signed_notional = position.get("signed_notional")
                     notional_value: Optional[float] = None
                     if signed_notional not in (None, ""):
-                        coerced = _coerce_float(signed_notional)
-                        if coerced is not None:
-                            notional_value = abs(coerced)
+                        try:
+                            notional_value = abs(float(signed_notional))
+                        except (TypeError, ValueError):
+                            notional_value = None
                     if notional_value is None:
-                        notional_value = _coerce_float(position.get("notional", 0.0))
-                        if notional_value is not None:
-                            notional_value = abs(notional_value)
-                        else:
+                        try:
+                            notional_value = abs(float(position.get("notional", 0.0)))
+                        except (TypeError, ValueError):
                             continue
                     if notional_value == 0.0:
                         continue

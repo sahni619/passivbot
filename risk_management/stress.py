@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
-from .core.domain import (
+from .domain.models import (
     Scenario,
     ScenarioAccountImpact,
     ScenarioResult,
@@ -23,10 +23,7 @@ def simulate_scenarios(
     if not scenarios:
         return []
 
-    from .presentation.snapshot_builder import (
-        MAX_ACCOUNTS_PAGE_SIZE,
-        build_presentable_snapshot,
-    )
+    from .snapshot_utils import MAX_ACCOUNTS_PAGE_SIZE, build_presentable_snapshot
 
     presentable = build_presentable_snapshot(
         snapshot,

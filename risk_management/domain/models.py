@@ -1,8 +1,14 @@
 """Domain models used by the risk management dashboard and utilities."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+
+
+from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence
+
+
+from dataclasses import dataclass, field
+from typing import Dict, Mapping, Optional, Sequence
 
 
 
