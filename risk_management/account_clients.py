@@ -1359,6 +1359,20 @@ class CCXTAccountClient(AccountClientProtocol):
             if position_idx is not None and "positionIdx" not in params:
                 params["positionIdx"] = position_idx
 
+            if self._normalized_exchange == "okx":
+                okx_pos_side = None
+                raw_okx_side = position.get("posSide")
+                if isinstance(raw_okx_side, str) and raw_okx_side.strip():
+                    okx_pos_side = raw_okx_side.strip().lower()
+                if okx_pos_side is None and isinstance(position.get("info"), Mapping):
+                    info_side = position["info"].get("posSide")
+                    if isinstance(info_side, str) and info_side.strip():
+                        okx_pos_side = info_side.strip().lower()
+                if okx_pos_side is None and position_side:
+                    okx_pos_side = position_side.lower()
+                if okx_pos_side in {"long", "short", "net"} and "posSide" not in params:
+                    params["posSide"] = okx_pos_side
+
             if side_explicit:
                 params.pop("reduceOnly", None)
                 params.pop("reduceonly", None)
