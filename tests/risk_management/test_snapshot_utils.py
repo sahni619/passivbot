@@ -33,6 +33,27 @@ def test_snapshot_utils_preserves_position_fields() -> None:
                 ],
                 "daily_realized_pnl": 10,
                 "open_orders": [],
+                "metadata": {
+                    "counterparty_rating": "Tier 1",
+                    "concentration": {
+                        "venue_concentration_pct": 0.4,
+                        "asset_concentration_pct": 0.6,
+                        "top_asset": "BTC/USDT",
+                    },
+                    "exposure_limits": {"asset_concentration_pct": 0.5},
+                    "limit_breaches": {
+                        "asset_concentration_pct": {
+                            "breached": True,
+                            "value": 0.6,
+                            "limit": 0.5,
+                        }
+                    },
+                    "scores": {
+                        "counterparty_rating": "Tier 1",
+                        "asset_concentration_pct": 0.6,
+                        "venue_concentration_pct": 0.4,
+                    },
+                },
             }
         ],
         "alert_thresholds": {},
@@ -78,6 +99,10 @@ def test_snapshot_utils_preserves_position_fields() -> None:
                 }
             },
         },
+        "concentration": {
+            "venues": {"Demo": 0.4},
+            "assets": {"BTC/USDT": 0.6, "ETH/USDT": 0.4},
+        },
     }
 
     view = build_presentable_snapshot(snapshot)
@@ -101,6 +126,13 @@ def test_snapshot_utils_preserves_position_fields() -> None:
     assert portfolio_perf["latest_snapshot"]["balance"] == 980.0
 
     assert view["account_stop_losses"]["Demo"]["current_balance"] == 950.0
+    assert view["accounts"][0]["counterparty_rating"] == "Tier 1"
+    assert (
+        view["accounts"][0]["limit_breaches"]["asset_concentration_pct"]["breached"]
+        is True
+    )
+    assert view["concentration"]["venues"]["Demo"] == pytest.approx(0.4)
+    assert view["concentration"]["assets"]["BTC/USDT"] == pytest.approx(0.6)
 
 
 def test_portfolio_daily_realized_aggregates_account_values() -> None:

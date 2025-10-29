@@ -108,6 +108,14 @@ Update the new file with the following information.
   - `credentials.enableRateLimit`: defaults to `true`.  The loader preserves
     ccxt's built-in throttling so API calls respect exchange rate limits unless
     you explicitly opt out.
+  - `counterparty_rating`: optional free-form score (for example `"Tier 1"` or
+    an internal risk grade) displayed alongside account health summaries.
+  - `exposure_limits`: dictionary of concentration thresholds expressed as
+    decimal ratios.  Supported keys include `venue_concentration_pct`
+    (account balance relative to the monitored portfolio) and
+    `asset_concentration_pct` (largest single-asset notional share for the
+    account).  When a metric exceeds the configured value the dashboards flag
+    the breach and notifications are emitted automatically.
 
 ### Credentials discovery
 
@@ -123,6 +131,8 @@ Override the lookup with `"custom_endpoints": {"path": "../configs/custom_endpoi
 
 - `alert_thresholds` – wallet-wide and per-position percentages that trigger
   alerts in both the terminal and web dashboards.
+- Limit breaches derived from `exposure_limits` also raise alerts so you can
+  react to concentration spikes in the same notification workflows.
 - `notification_channels` – free-form strings describing where alerts should be
   sent.  Entries prefixed with `email:` are used for SMTP delivery when email
   settings are provided; other values are displayed for situational awareness.

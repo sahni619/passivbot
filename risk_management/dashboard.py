@@ -270,12 +270,26 @@ def _parse_account(raw: Dict[str, Any]) -> Account:
             daily_realized = float(daily_realized_raw)
         except (TypeError, ValueError):
             daily_realized = sum(position.daily_realized_pnl for position in positions)
+    metadata: Dict[str, Any] = {}
+    metadata_raw = raw.get("metadata")
+    if isinstance(metadata_raw, Mapping):
+        metadata = {str(key): value for key, value in metadata_raw.items()}
+    for key in (
+        "counterparty_rating",
+        "exposure_limits",
+        "concentration",
+        "limit_breaches",
+        "scores",
+    ):
+        if key in raw and key not in metadata:
+            metadata[key] = raw[key]
     return Account(
         name=str(raw["name"]),
         balance=float(raw["balance"]),
         positions=positions,
         orders=orders,
         daily_realized_pnl=float(daily_realized),
+        metadata=metadata or None,
     )
 
 
@@ -483,6 +497,52 @@ def render_dashboard(
         lines.append(f"  Exposure: {_format_pct(account.exposure_pct())}")
         lines.append(f"  Unrealized PnL: {_format_currency(account.total_unrealized())}")
         lines.append(f"  Daily realized PnL: {_format_currency(account.daily_realized_pnl)}")
+        metadata = getattr(account, "metadata", None) or {}
+        scores = metadata.get("scores") if isinstance(metadata, Mapping) else {}
+        concentration = metadata.get("concentration") if isinstance(metadata, Mapping) else {}
+        limits = metadata.get("exposure_limits") if isinstance(metadata, Mapping) else {}
+        breaches = metadata.get("limit_breaches") if isinstance(metadata, Mapping) else {}
+        rating = None
+        if isinstance(scores, Mapping) and scores.get("counterparty_rating"):
+            rating = scores.get("counterparty_rating")
+        elif isinstance(metadata, Mapping):
+            rating = metadata.get("counterparty_rating")
+        if rating:
+            lines.append(f"  Counterparty rating: {rating}")
+
+        def _append_limit_line(metric_key: str, label: str, value: Optional[float], detail: Optional[str] = None) -> None:
+            if value is None:
+                return
+            line = f"  {label}: {_format_pct(value)}"
+            if detail:
+                line += f" ({detail})"
+            breach_info = breaches.get(metric_key) if isinstance(breaches, Mapping) else None
+            limit_value = None
+            if breach_info and breach_info.get("limit") is not None:
+                limit_value = breach_info.get("limit")
+            elif isinstance(limits, Mapping):
+                limit_value = limits.get(metric_key)
+            status = None
+            if breach_info:
+                status = "BREACHED" if breach_info.get("breached") else "within limit"
+            if limit_value is not None:
+                try:
+                    limit_float = float(limit_value)
+                except (TypeError, ValueError):
+                    limit_float = None
+                if limit_float is not None:
+                    line += f" (limit {_format_pct(limit_float)})"
+            if status:
+                line += f" [{status}]"
+            lines.append(line)
+
+        if isinstance(concentration, Mapping):
+            venue_value = concentration.get("venue_concentration_pct")
+            _append_limit_line("venue_concentration_pct", "Venue concentration", venue_value)
+            asset_value = concentration.get("asset_concentration_pct")
+            top_asset = concentration.get("top_asset")
+            detail = f"top: {top_asset}" if top_asset else None
+            _append_limit_line("asset_concentration_pct", "Asset concentration", asset_value, detail)
         status_message = account_messages.get(account.name)
         if status_message:
             lines.append(f"  Status: {status_message}")

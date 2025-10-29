@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timezone
 from types import TracebackType
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from custom_endpoint_overrides import (
     CustomEndpointConfigError,
@@ -32,6 +32,9 @@ from ._parsing import (
     parse_position as _parse_position,
 )
 from .account_clients import AccountClientProtocol, CCXTAccountClient
+
+from .configuration import AccountConfig, CustomEndpointSettings, RealtimeConfig
+
 from .audit import get_audit_logger
 from .configuration import CustomEndpointSettings, RealtimeConfig
 from .performance import PerformanceTracker
@@ -164,7 +167,10 @@ class RealtimeDataFetcher:
         accounts_payload: List[Dict[str, Any]] = []
         account_messages: Dict[str, str] = dict(self.config.account_messages)
         account_balances: Dict[str, float] = {}
+        account_entries: List[tuple[AccountConfig, Dict[str, Any], float]] = []
         for account_config, result in zip(self.config.accounts, results):
+            payload: Dict[str, Any]
+            balance_value = 0.0
             if isinstance(result, Exception):
                 if isinstance(result, AuthenticationError):
                     message = (
@@ -196,8 +202,6 @@ class RealtimeDataFetcher:
                     )
                 account_messages[account_config.name] = message
                 payload = {"name": account_config.name, "balance": 0.0, "positions": []}
-                accounts_payload.append(payload)
-                account_balances[account_config.name] = 0.0
             else:
                 if isinstance(result, Mapping):
                     payload = dict(result)
@@ -207,19 +211,148 @@ class RealtimeDataFetcher:
                         "balance": 0.0,
                         "positions": [],
                     }
-                accounts_payload.append(payload)
-                balance_value = 0.0
-                if isinstance(payload, Mapping):
-                    try:
-                        balance_value = float(payload.get("balance", 0.0))
-                    except (TypeError, ValueError):
-                        balance_value = 0.0
-                account_balances[account_config.name] = balance_value
+                try:
+                    balance_value = float(payload.get("balance", 0.0))
+                except (TypeError, ValueError):
+                    balance_value = 0.0
                 if account_config.name in self._last_auth_errors:
                     logger.info(
                         "Authentication for %s restored", account_config.name
                     )
                     self._last_auth_errors.pop(account_config.name, None)
+
+            metadata_raw = payload.get("metadata")
+            metadata: Dict[str, Any]
+            if isinstance(metadata_raw, Mapping):
+                metadata = dict(metadata_raw)
+            else:
+                metadata = {}
+            if account_config.counterparty_rating:
+                metadata.setdefault("counterparty_rating", account_config.counterparty_rating)
+            if account_config.exposure_limits:
+                metadata.setdefault("exposure_limits", dict(account_config.exposure_limits))
+            payload["metadata"] = metadata
+
+            accounts_payload.append(payload)
+            account_balances[account_config.name] = balance_value
+            account_entries.append((account_config, payload, balance_value))
+        portfolio_balance = sum(account_balances.values())
+
+        venue_concentration: Dict[str, float] = {}
+        portfolio_asset_totals: Dict[str, float] = {}
+
+        for account_config, payload, balance_value in account_entries:
+            metadata = payload.get("metadata") or {}
+            concentration: Dict[str, Any]
+            if isinstance(metadata.get("concentration"), Mapping):
+                concentration = dict(metadata["concentration"])
+            else:
+                concentration = {}
+
+            ratio = balance_value / portfolio_balance if portfolio_balance else 0.0
+            venue_concentration[account_config.name] = ratio
+            concentration["venue_concentration_pct"] = ratio
+
+            positions = payload.get("positions")
+            symbol_totals: Dict[str, float] = {}
+            total_abs_notional = 0.0
+            if isinstance(positions, Iterable):
+                for position in positions:
+                    if not isinstance(position, Mapping):
+                        continue
+                    symbol_raw = position.get("symbol")
+                    symbol = str(symbol_raw).strip()
+                    if not symbol:
+                        continue
+                    signed_notional = position.get("signed_notional")
+                    notional_value: Optional[float] = None
+                    if signed_notional not in (None, ""):
+                        try:
+                            notional_value = abs(float(signed_notional))
+                        except (TypeError, ValueError):
+                            notional_value = None
+                    if notional_value is None:
+                        try:
+                            notional_value = abs(float(position.get("notional", 0.0)))
+                        except (TypeError, ValueError):
+                            continue
+                    if notional_value == 0.0:
+                        continue
+                    symbol_totals[symbol] = symbol_totals.get(symbol, 0.0) + notional_value
+                    total_abs_notional += notional_value
+                    portfolio_asset_totals[symbol] = portfolio_asset_totals.get(symbol, 0.0) + notional_value
+
+            asset_breakdown: Dict[str, float] = {}
+            top_asset = None
+            top_value = 0.0
+            if total_abs_notional > 0:
+                for symbol, value in symbol_totals.items():
+                    pct = value / total_abs_notional
+                    asset_breakdown[symbol] = pct
+                    if value > top_value:
+                        top_asset = symbol
+                        top_value = value
+            asset_concentration = top_value / total_abs_notional if total_abs_notional > 0 else 0.0
+            concentration["asset_concentration_pct"] = asset_concentration
+            concentration["top_asset"] = top_asset
+            if asset_breakdown:
+                concentration["asset_breakdown"] = asset_breakdown
+
+            scores: Dict[str, Any]
+            if isinstance(metadata.get("scores"), Mapping):
+                scores = dict(metadata["scores"])
+            else:
+                scores = {}
+            rating = metadata.get("counterparty_rating")
+            if rating and "counterparty_rating" not in scores:
+                scores["counterparty_rating"] = rating
+            scores["venue_concentration_pct"] = ratio
+            scores["asset_concentration_pct"] = asset_concentration
+            metadata["scores"] = scores
+
+            limits_raw = metadata.get("exposure_limits")
+            exposure_limits: Dict[str, float] = {}
+            if isinstance(limits_raw, Mapping):
+                for key, value in limits_raw.items():
+                    try:
+                        exposure_limits[str(key)] = float(value)
+                    except (TypeError, ValueError):
+                        logger.debug(
+                            "Ignored non-numeric exposure limit %s=%r for account %s",
+                            key,
+                            value,
+                            account_config.name,
+                        )
+                metadata["exposure_limits"] = exposure_limits
+
+            breaches: Dict[str, Dict[str, Any]] = {}
+            for metric, limit_value in exposure_limits.items():
+                try:
+                    limit_float = float(limit_value)
+                except (TypeError, ValueError):
+                    continue
+                current_value: Optional[float]
+                if metric == "venue_concentration_pct":
+                    current_value = ratio
+                elif metric == "asset_concentration_pct":
+                    current_value = asset_concentration
+                else:
+                    current_value = concentration.get(metric) if isinstance(concentration, Mapping) else None
+                if current_value is None:
+                    continue
+                breaches[metric] = {
+                    "breached": current_value > limit_float,
+                    "value": current_value,
+                    "limit": limit_float,
+                }
+            if breaches:
+                metadata["limit_breaches"] = breaches
+            else:
+                metadata.pop("limit_breaches", None)
+
+            metadata["concentration"] = concentration
+            payload["metadata"] = metadata
+
         generated_at_dt = datetime.now(timezone.utc)
         snapshot = {
             "generated_at": generated_at_dt.isoformat(),
@@ -230,8 +363,21 @@ class RealtimeDataFetcher:
         if account_messages:
             snapshot["account_messages"] = account_messages
         self._last_account_balances = account_balances
-        portfolio_balance = sum(account_balances.values())
         self._last_portfolio_balance = portfolio_balance
+        if venue_concentration or portfolio_asset_totals:
+            total_asset_notional = sum(portfolio_asset_totals.values())
+            asset_ratios = {}
+            if total_asset_notional > 0:
+                asset_ratios = {
+                    symbol: value / total_asset_notional
+                    for symbol, value in sorted(
+                        portfolio_asset_totals.items(), key=lambda item: item[1], reverse=True
+                    )
+                }
+            snapshot["concentration"] = {
+                "venues": venue_concentration,
+                "assets": asset_ratios,
+            }
         stop_loss_state = self._update_portfolio_stop_loss_state(portfolio_balance)
         if stop_loss_state:
             snapshot["portfolio_stop_loss"] = stop_loss_state

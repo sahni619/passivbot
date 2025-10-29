@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+
 from dataclasses import dataclass, field
 from typing import Dict, Mapping, Optional, Sequence
 
@@ -72,6 +73,7 @@ class Account:
     positions: Sequence[Position]
     orders: Sequence[Order] = ()
     daily_realized_pnl: float = 0.0
+    metadata: Optional[Mapping[str, Any]] = None
 
     def total_abs_notional(self) -> float:
         return sum(abs(p.notional) for p in self.positions)
