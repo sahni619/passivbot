@@ -160,6 +160,8 @@ class AccountConfig:
     enabled: bool = True
     debug_api_payloads: bool = False
     use_custom_endpoints: Optional[bool] = None
+    counterparty_rating: Optional[str] = None
+    exposure_limits: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass()
@@ -414,6 +416,29 @@ def _parse_email_settings(settings: Any) -> Optional[EmailSettings]:
     )
 
 
+def _parse_exposure_limits(value: Any) -> Dict[str, float]:
+    """Normalise per-account exposure limits from configuration payloads."""
+
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "Account 'exposure_limits' must be provided as an object mapping metric names to numeric limits."
+        )
+
+    limits: Dict[str, float] = {}
+    for raw_key, raw_value in value.items():
+        if raw_value in (None, ""):
+            continue
+        try:
+            limits[str(raw_key)] = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Exposure limit '{raw_key}' must be a numeric value."
+            ) from exc
+    return limits
+
+
 def _parse_grafana_config(settings: Any) -> Optional[GrafanaConfig]:
     """Return Grafana embedding settings from ``settings``."""
 
@@ -567,6 +592,16 @@ def _parse_accounts(
                 ) from exc
             use_custom_endpoints_pref = account_pref
 
+        rating_raw = raw.get("counterparty_rating")
+        rating = str(rating_raw).strip() if rating_raw not in (None, "") else None
+
+        try:
+            exposure_limits = _parse_exposure_limits(raw.get("exposure_limits"))
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(
+                f"Account '{raw.get('name')}' has invalid exposure limit configuration: {exc}"
+            ) from exc
+
         account = AccountConfig(
             name=str(raw.get("name", exchange)),
             exchange=str(exchange),
@@ -578,6 +613,8 @@ def _parse_accounts(
             enabled=bool(raw.get("enabled", True)),
             debug_api_payloads=debug_api_payloads,
             use_custom_endpoints=use_custom_endpoints_pref,
+            counterparty_rating=rating,
+            exposure_limits=exposure_limits,
         )
         accounts.append(account)
         if debug_api_payloads:

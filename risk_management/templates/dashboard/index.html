@@ -372,6 +372,61 @@
                 <span class="value {% if account.unrealized_pnl >= 0 %}gain{% else %}loss{% endif %}">{{ account.unrealized_pnl|currency }}</span>
               </div>
             </div>
+            {% set risk_scores = account.scores if account.scores is defined else {} %}
+            {% set concentration = account.concentration if account.concentration is defined else {} %}
+            {% set exposure_limits = account.exposure_limits if account.exposure_limits is defined else {} %}
+            {% set limit_breaches = account.limit_breaches if account.limit_breaches is defined else {} %}
+            {% set counterparty_rating = risk_scores.counterparty_rating if risk_scores and risk_scores.counterparty_rating is defined else (account.counterparty_rating if account.counterparty_rating is defined else None) %}
+            {% if counterparty_rating or concentration or limit_breaches %}
+              <div class="metrics risk-metrics">
+                {% if counterparty_rating %}
+                  <div class="metric">
+                    <span class="label">Counterparty rating</span>
+                    <span class="value">{{ counterparty_rating }}</span>
+                  </div>
+                {% endif %}
+                {% set venue_value = concentration.get('venue_concentration_pct') if concentration else None %}
+                {% set venue_breach = limit_breaches.get('venue_concentration_pct') if limit_breaches else None %}
+                {% set venue_limit = venue_breach.limit if venue_breach and venue_breach.limit is not none else (exposure_limits.get('venue_concentration_pct') if exposure_limits else None) %}
+                {% if venue_value is not none %}
+                  <div class="metric">
+                    <span class="label">Venue concentration</span>
+                    <span class="value {% if venue_breach and venue_breach.breached %}loss{% endif %}">{{ venue_value|pct }}</span>
+                    <span class="subvalue {% if venue_breach and venue_breach.breached %}loss{% else %}gain{% endif %}">
+                      {% if venue_limit is not none %}
+                        Limit {{ venue_limit|pct }}
+                        {% if venue_breach %} · {{ 'Breached' if venue_breach.breached else 'Within limit' }}{% endif %}
+                      {% elif venue_breach %}
+                        {{ 'Breached' if venue_breach.breached else 'Within limit' }}
+                      {% else %}
+                        No limit configured
+                      {% endif %}
+                    </span>
+                  </div>
+                {% endif %}
+                {% set asset_value = concentration.get('asset_concentration_pct') if concentration else None %}
+                {% set asset_breach = limit_breaches.get('asset_concentration_pct') if limit_breaches else None %}
+                {% set asset_limit = asset_breach.limit if asset_breach and asset_breach.limit is not none else (exposure_limits.get('asset_concentration_pct') if exposure_limits else None) %}
+                {% set top_asset = concentration.get('top_asset') if concentration else None %}
+                {% if asset_value is not none %}
+                  <div class="metric">
+                    <span class="label">Asset concentration</span>
+                    <span class="value {% if asset_breach and asset_breach.breached %}loss{% endif %}">{{ asset_value|pct }}</span>
+                    <span class="subvalue {% if asset_breach and asset_breach.breached %}loss{% else %}gain{% endif %}">
+                      {% if top_asset %}Top {{ top_asset }}{% endif %}
+                      {% if asset_limit is not none %}
+                        {% if top_asset %} · {% endif %}Limit {{ asset_limit|pct }}
+                        {% if asset_breach %} · {{ 'Breached' if asset_breach.breached else 'Within limit' }}{% endif %}
+                      {% elif asset_breach %}
+                        {% if top_asset %} · {% endif %}{{ 'Breached' if asset_breach.breached else 'Within limit' }}
+                      {% elif not top_asset %}
+                        No limit configured
+                      {% endif %}
+                    </span>
+                  </div>
+                {% endif %}
+              </div>
+            {% endif %}
             {% set account_performance = account.performance if account.performance is defined else None %}
             {% if account_performance %}
               <div class="metrics" style="margin-top: 1.5rem;">
@@ -2182,11 +2237,11 @@
             : showEmptyPositions
               ? '<p style="color: var(--muted);">No open positions.</p>'
               : "";
-          const ordersTable = orders.length > 0
-            ? `
-                <h3 style="margin-top: 1.5rem;">Open orders</h3>
-                <div class="table-wrapper" style="overflow-x: auto;">
-                  <table>
+            const ordersTable = orders.length > 0
+              ? `
+                  <h3 style="margin-top: 1.5rem;">Open orders</h3>
+                  <div class="table-wrapper" style="overflow-x: auto;">
+                    <table>
                     <thead>
                       <tr>
                         <th>ID</th>
@@ -2209,16 +2264,95 @@
                 </div>
               `
             : showEmptyOrders
-              ? `
-                <h3 style="margin-top: 1.5rem;">Open orders</h3>
-                <p style="color: var(--muted);">No open orders.</p>
-              `
+                ? `
+                  <h3 style="margin-top: 1.5rem;">Open orders</h3>
+                  <p style="color: var(--muted);">No open orders.</p>
+                `
+                : "";
+
+            const scores = account.scores && typeof account.scores === "object" ? account.scores : {};
+            const concentration = account.concentration && typeof account.concentration === "object" ? account.concentration : {};
+            const exposureLimits = account.exposure_limits && typeof account.exposure_limits === "object" ? account.exposure_limits : {};
+            const limitBreaches = account.limit_breaches && typeof account.limit_breaches === "object" ? account.limit_breaches : {};
+            const counterpartyRating = (scores && scores.counterparty_rating) || account.counterparty_rating || null;
+
+            const formatLimitSummary = (limit, breach, fallback) => {
+              if (limit !== null && limit !== undefined && Number.isFinite(Number(limit))) {
+                const summary = [`Limit ${formatPct(Number(limit))}`];
+                if (breach) {
+                  summary.push(breach.breached ? "Breached" : "Within limit");
+                }
+                return summary.join(" · ");
+              }
+              if (breach) {
+                return breach.breached ? "Breached" : "Within limit";
+              }
+              return fallback;
+            };
+
+            const riskMetrics = [];
+            if (counterpartyRating) {
+              riskMetrics.push(`
+                <div class="metric">
+                  <span class="label">Counterparty rating</span>
+                  <span class="value">${counterpartyRating}</span>
+                </div>
+              `);
+            }
+
+            const venueValue = concentration && concentration.venue_concentration_pct;
+            if (venueValue !== null && venueValue !== undefined && Number.isFinite(Number(venueValue))) {
+              const venueBreach = limitBreaches.venue_concentration_pct || null;
+              const venueLimit = venueBreach && venueBreach.limit !== undefined && venueBreach.limit !== null
+                ? venueBreach.limit
+                : exposureLimits.venue_concentration_pct;
+              const venueClass = venueBreach && venueBreach.breached ? "loss" : "";
+              const venueSubClass = venueClass || "gain";
+              const venueSummary = formatLimitSummary(venueLimit, venueBreach, "No limit configured");
+              riskMetrics.push(`
+                <div class="metric">
+                  <span class="label">Venue concentration</span>
+                  <span class="value ${venueClass}">${formatPct(Number(venueValue))}</span>
+                  <span class="subvalue ${venueSubClass}">${venueSummary}</span>
+                </div>
+              `);
+            }
+
+            const assetValue = concentration && concentration.asset_concentration_pct;
+            if (assetValue !== null && assetValue !== undefined && Number.isFinite(Number(assetValue))) {
+              const assetBreach = limitBreaches.asset_concentration_pct || null;
+              const assetLimit = assetBreach && assetBreach.limit !== undefined && assetBreach.limit !== null
+                ? assetBreach.limit
+                : exposureLimits.asset_concentration_pct;
+              const assetClass = assetBreach && assetBreach.breached ? "loss" : "";
+              const assetSubClass = assetClass || "gain";
+              const topAsset = concentration.top_asset || null;
+              const assetSummary = formatLimitSummary(assetLimit, assetBreach, topAsset ? "" : "No limit configured");
+              const parts = [];
+              if (topAsset) {
+                parts.push(`Top ${topAsset}`);
+              }
+              if (assetSummary) {
+                parts.push(assetSummary);
+              }
+              const assetDetail = parts.length ? parts.join(" · ") : "No limit configured";
+              riskMetrics.push(`
+                <div class="metric">
+                  <span class="label">Asset concentration</span>
+                  <span class="value ${assetClass}">${formatPct(Number(assetValue))}</span>
+                  <span class="subvalue ${assetSubClass}">${assetDetail}</span>
+                </div>
+              `);
+            }
+
+            const riskMetricsBlock = riskMetrics.length
+              ? `<div class="metrics risk-metrics">${riskMetrics.join("")}</div>`
               : "";
 
-          const accountPerformance = account.performance || null;
-          let performanceBlock = "";
-          if (accountPerformance) {
-            const daily = accountPerformance.daily;
+            const accountPerformance = account.performance || null;
+            let performanceBlock = "";
+            if (accountPerformance) {
+              const daily = accountPerformance.daily;
             const dailyClass = daily !== null && daily !== undefined ? (Number(daily) >= 0 ? "gain" : "loss") : "";
             const dailyValue = daily !== null && daily !== undefined ? formatCurrency(daily) : "-";
             const dailySince = accountPerformance.since?.daily ? `Since ${accountPerformance.since.daily}` : "&nbsp;";
@@ -2312,6 +2446,7 @@
                   <span class="value ${Number(account.unrealized_pnl) >= 0 ? "gain" : "loss"}">${formatCurrency(account.unrealized_pnl)}</span>
                 </div>
               </div>
+              ${riskMetricsBlock}
               ${performanceBlock}
               ${stopLossBlock}
               ${accountMetricsTable}

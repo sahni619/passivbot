@@ -91,6 +91,10 @@ def build_presentable_snapshot(
     payload["accounts"] = accounts_page
     payload["accounts_meta"] = meta
 
+    concentration_raw = snapshot.get("concentration") if isinstance(snapshot, Mapping) else None
+    if isinstance(concentration_raw, Mapping):
+        payload["concentration"] = _normalise_concentration(concentration_raw)
+
     return payload
 
 
@@ -336,6 +340,16 @@ def _build_account_view(
     performance_state = None
     if isinstance(account_performance, Mapping):
         performance_state = _normalise_performance(account_performance.get(account.name))
+    metadata = dict(account.metadata) if isinstance(account.metadata, Mapping) else {}
+    scores = metadata.get("scores") if isinstance(metadata.get("scores"), Mapping) else {}
+    concentration = metadata.get("concentration") if isinstance(metadata.get("concentration"), Mapping) else {}
+    exposure_limits = metadata.get("exposure_limits") if isinstance(metadata.get("exposure_limits"), Mapping) else {}
+    limit_breaches = metadata.get("limit_breaches") if isinstance(metadata.get("limit_breaches"), Mapping) else {}
+    rating = None
+    if scores and scores.get("counterparty_rating"):
+        rating = scores.get("counterparty_rating")
+    elif metadata.get("counterparty_rating"):
+        rating = metadata.get("counterparty_rating")
     return {
         "name": account.name,
         "balance": account.balance,
@@ -358,6 +372,12 @@ def _build_account_view(
         "funding_rates": funding_rates,
         "stop_loss": stop_loss_state,
         "performance": performance_state,
+        "metadata": metadata or None,
+        "counterparty_rating": rating,
+        "scores": dict(scores) if scores else {},
+        "concentration": dict(concentration) if concentration else {},
+        "exposure_limits": dict(exposure_limits) if exposure_limits else {},
+        "limit_breaches": dict(limit_breaches) if limit_breaches else {},
     }
 
 
@@ -478,6 +498,40 @@ def _normalise_performance(data: Any) -> Dict[str, Any]:
     if reference_balances:
         summary["reference_balances"] = reference_balances
     return summary
+
+
+def _normalise_concentration(data: Mapping[str, Any]) -> Dict[str, Any]:
+    venues_raw = data.get("venues") if isinstance(data, Mapping) else None
+    venues: Dict[str, float] = {}
+    if isinstance(venues_raw, Mapping):
+        venue_entries: List[tuple[str, float]] = []
+        for name, value in venues_raw.items():
+            try:
+                venue_entries.append((str(name), float(value)))
+            except (TypeError, ValueError):
+                continue
+        venue_entries.sort(key=lambda item: item[1], reverse=True)
+        venues = dict(venue_entries)
+
+    assets_raw = data.get("assets") if isinstance(data, Mapping) else None
+    assets: Dict[str, float] = {}
+    top_asset = None
+    if isinstance(assets_raw, Mapping):
+        asset_entries: List[tuple[str, float]] = []
+        for symbol, value in assets_raw.items():
+            try:
+                asset_entries.append((str(symbol), float(value)))
+            except (TypeError, ValueError):
+                continue
+        asset_entries.sort(key=lambda item: item[1], reverse=True)
+        assets = dict(asset_entries)
+        if asset_entries:
+            top_asset = asset_entries[0][0]
+
+    payload: Dict[str, Any] = {"venues": venues, "assets": assets}
+    if top_asset is not None:
+        payload["top_asset"] = top_asset
+    return payload
 
 
 def _to_optional_float(value: Any) -> Optional[float]:

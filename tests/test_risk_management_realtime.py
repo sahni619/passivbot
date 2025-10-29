@@ -78,8 +78,22 @@ class FailingAccountClient:
 def test_realtime_fetcher_combines_accounts() -> None:
     config = RealtimeConfig(
         accounts=[
-            AccountConfig(name="Demo A", exchange="binance", credentials={}),
-            AccountConfig(name="Demo B", exchange="okx", credentials={}),
+            AccountConfig(
+                name="Demo A",
+                exchange="binance",
+                credentials={},
+                counterparty_rating="Tier 1",
+                exposure_limits={
+                    "venue_concentration_pct": 0.6,
+                    "asset_concentration_pct": 0.5,
+                },
+            ),
+            AccountConfig(
+                name="Demo B",
+                exchange="okx",
+                credentials={},
+                exposure_limits={"venue_concentration_pct": 0.6},
+            ),
         ],
         alert_thresholds={
             "wallet_exposure_pct": 0.5,
@@ -113,10 +127,27 @@ def test_realtime_fetcher_combines_accounts() -> None:
 
     assert snapshot["accounts"][0]["name"] == "Demo A"
     assert snapshot["accounts"][0]["positions"][0]["symbol"] == "BTCUSDT"
+    account_metadata = snapshot["accounts"][0].get("metadata", {})
+    assert account_metadata.get("counterparty_rating") == "Tier 1"
+    breaches = account_metadata.get("limit_breaches", {})
+    assert breaches.get("venue_concentration_pct", {}).get("breached") is True
+    assert breaches.get("asset_concentration_pct", {}).get("breached") is True
+    concentration = snapshot.get("concentration", {})
+    assert concentration.get("venues", {}).get("Demo A") == pytest.approx(2 / 3)
+    assert concentration.get("assets", {}).get("BTCUSDT") == pytest.approx(1.0)
 
     view = build_presentable_snapshot(snapshot)
     assert view["accounts"][0]["positions"][0]["symbol"] == "BTCUSDT"
     assert view["alerts"] == []
+    assert view["accounts"][0]["counterparty_rating"] == "Tier 1"
+    assert (
+        view["accounts"][0]["limit_breaches"]["venue_concentration_pct"]["breached"]
+        is True
+    )
+    assert (
+        view["accounts"][0]["limit_breaches"]["asset_concentration_pct"]["breached"]
+        is True
+    )
 
     dashboard = build_dashboard(snapshot)
     assert "Demo A" in dashboard

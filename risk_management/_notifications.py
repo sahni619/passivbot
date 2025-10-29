@@ -19,6 +19,12 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+LIMIT_LABELS = {
+    "venue_concentration_pct": "venue concentration",
+    "asset_concentration_pct": "asset concentration",
+}
+
+
 class NotificationCoordinator:
     """Coordinate email and telegram notifications for realtime snapshots."""
 
@@ -109,6 +115,40 @@ class NotificationCoordinator:
         except Exception as exc:  # pragma: no cover - snapshot parsing errors are logged for diagnostics
             logger.debug("Skipping email alert dispatch due to parsing error: %s", exc, exc_info=True)
             return
+        limit_alerts: list[str] = []
+        accounts_payload = snapshot.get("accounts", [])
+        for account_entry in accounts_payload or []:
+            if not isinstance(account_entry, Mapping):
+                continue
+            name = str(account_entry.get("name", "unknown"))
+            metadata = account_entry.get("metadata") if isinstance(account_entry.get("metadata"), Mapping) else {}
+            breaches = metadata.get("limit_breaches") if isinstance(metadata, Mapping) else None
+            if not isinstance(breaches, Mapping):
+                breaches = account_entry.get("limit_breaches") if isinstance(account_entry.get("limit_breaches"), Mapping) else None
+            if not isinstance(breaches, Mapping):
+                continue
+            for metric, breach in breaches.items():
+                if not isinstance(breach, Mapping) or not breach.get("breached"):
+                    continue
+                value = breach.get("value")
+                limit = breach.get("limit")
+                try:
+                    value_float = float(value)
+                except (TypeError, ValueError):
+                    continue
+                limit_float: Optional[float] = None
+                if limit is not None:
+                    try:
+                        limit_float = float(limit)
+                    except (TypeError, ValueError):
+                        limit_float = None
+                label = LIMIT_LABELS.get(metric, metric.replace("_", " "))
+                if limit_float is not None:
+                    message = f"{name}: {label} {value_float:.2%} exceeds limit {limit_float:.2%}"
+                else:
+                    message = f"{name}: {label} {value_float:.2%} exceeds limit"
+                limit_alerts.append(message)
+        alerts.extend(limit_alerts)
         alerts_set = set(alerts)
         new_alerts = [alert for alert in alerts if alert not in self._active_alerts]
         self._active_alerts = alerts_set
