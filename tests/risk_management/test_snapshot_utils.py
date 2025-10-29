@@ -139,3 +139,42 @@ def test_portfolio_daily_realized_aggregates_account_values() -> None:
     assert view["portfolio"]["daily_realized_pnl"] == pytest.approx(125.25)
     realised_values = [account["daily_realized_pnl"] for account in view["accounts"]]
     assert realised_values == [pytest.approx(150.75), pytest.approx(-25.5)]
+
+
+def test_snapshot_utils_includes_policies() -> None:
+    snapshot = {
+        "generated_at": "2024-03-02T00:00:00+00:00",
+        "accounts": [
+            {"name": "Alpha", "balance": 50_000, "positions": []},
+        ],
+        "alert_thresholds": {},
+        "notification_channels": [],
+        "policies": {
+            "evaluations": [
+                {
+                    "name": "Balance floor",
+                    "metric": "account.Alpha.balance",
+                    "operator": "<",
+                    "threshold": 50_000,
+                    "value": 45_000,
+                    "triggered": True,
+                    "actions": [
+                        {"type": "notify", "status": "triggered", "message": "Balance low"},
+                    ],
+                }
+            ],
+            "active": [
+                {"name": "Balance floor", "value": 45_000, "threshold": 50_000, "operator": "<"}
+            ],
+            "pending_actions": [
+                {"policy": "Balance floor", "message": "Confirm trading continuation"}
+            ],
+        },
+    }
+
+    view = build_presentable_snapshot(snapshot)
+
+    policies = view.get("policies")
+    assert isinstance(policies, dict)
+    assert policies["evaluations"][0]["name"] == "Balance floor"
+    assert policies["pending_actions"][0]["policy"] == "Balance floor"

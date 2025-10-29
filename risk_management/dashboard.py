@@ -44,6 +44,21 @@ def _format_price(value: Optional[float]) -> str:
     return f"{value:,.2f}"
 
 
+def _format_simple_number(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:,.4f}"
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_position(raw: Dict[str, Any]) -> Position:
     required = [
         "symbol",
@@ -230,12 +245,37 @@ def evaluate_alerts(accounts: Sequence[Account], thresholds: AlertThresholds) ->
     return alerts
 
 
+def _normalise_policy_summary(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return None
+    summary: Dict[str, Any] = {}
+    evaluations_raw = payload.get("evaluations", [])
+    evaluations: List[Dict[str, Any]] = []
+    if isinstance(evaluations_raw, Iterable):
+        for entry in evaluations_raw:
+            if isinstance(entry, Mapping):
+                evaluations.append(dict(entry))
+    summary["evaluations"] = evaluations
+
+    for key in ("active", "pending_actions", "manual_overrides"):
+        values_raw = payload.get(key)
+        items: List[Dict[str, Any]] = []
+        if isinstance(values_raw, Iterable):
+            for entry in values_raw:
+                if isinstance(entry, Mapping):
+                    items.append(dict(entry))
+        if items:
+            summary[key] = items
+    return summary
+
+
 def render_dashboard(
     generated_at: datetime,
     accounts: Sequence[Account],
     alerts: Sequence[str],
     notifications: Sequence[str],
     account_messages: Optional[Mapping[str, str]] = None,
+    policy_summary: Optional[Mapping[str, Any]] = None,
 ) -> str:
     lines: List[str] = []
     lines.append("=" * 80)
@@ -290,6 +330,80 @@ def render_dashboard(
         lines.append("No active alerts. All monitored metrics are within thresholds.")
     lines.append("")
 
+    lines.append("Policies")
+    lines.append("-" * 80)
+    evaluations = (
+        list(policy_summary.get("evaluations", []))
+        if isinstance(policy_summary, Mapping)
+        else []
+    )
+    if not evaluations:
+        lines.append("No automated risk policies are configured.")
+    else:
+        for evaluation in evaluations:
+            name = str(evaluation.get("name", "Unnamed policy"))
+            status_bits: List[str] = []
+            if evaluation.get("triggered"):
+                status_bits.append("ACTIVE")
+            else:
+                status_bits.append("idle")
+            if evaluation.get("cooldown_active"):
+                status_bits.append("cooldown")
+            if evaluation.get("override_active"):
+                status_bits.append("override")
+            status = ", ".join(status_bits)
+            lines.append(f"• {name} [{status}]")
+            description = evaluation.get("description")
+            if description:
+                lines.append(f"    {description}")
+            metric = evaluation.get("metric")
+            operator = evaluation.get("operator")
+            threshold_value = _format_simple_number(
+                _safe_float(evaluation.get("threshold"))
+            )
+            current_value = _format_simple_number(
+                _safe_float(evaluation.get("value"))
+            )
+            lines.append(
+                f"    Metric: {metric} {operator} {threshold_value} | current {current_value}"
+            )
+            actions = evaluation.get("actions", [])
+            if isinstance(actions, Iterable):
+                for action in actions:
+                    if not isinstance(action, Mapping):
+                        continue
+                    action_type = action.get("type", "action")
+                    action_status = action.get("status", "idle")
+                    action_message = action.get("message")
+                    suffix = f" – {action_message}" if action_message else ""
+                    lines.append(
+                        f"    - {action_type} [{action_status}]{suffix}"
+                    )
+            manual_override = evaluation.get("manual_override")
+            if isinstance(manual_override, Mapping) and manual_override.get("allowed"):
+                state = "active" if manual_override.get("active") else "available"
+                lines.append(f"    Manual override {state}")
+                instructions = manual_override.get("instructions")
+                if instructions:
+                    lines.append(f"      {instructions}")
+    lines.append("")
+
+    pending_actions = (
+        list(policy_summary.get("pending_actions", []))
+        if isinstance(policy_summary, Mapping)
+        else []
+    )
+    if pending_actions:
+        lines.append("Pending policy actions")
+        lines.append("-" * 80)
+        for pending in pending_actions:
+            if not isinstance(pending, Mapping):
+                continue
+            policy_name = pending.get("policy", "Unknown policy")
+            message = pending.get("message") or "Awaiting operator confirmation"
+            lines.append(f"• {policy_name}: {message}")
+        lines.append("")
+
     if notifications:
         lines.append("Notification channels")
         lines.append("-" * 80)
@@ -311,7 +425,17 @@ def build_dashboard(snapshot: Dict[str, Any]) -> str:
     generated_at, accounts, thresholds, notifications = parse_snapshot(snapshot)
     alerts = evaluate_alerts(accounts, thresholds)
     account_messages = snapshot.get("account_messages", {}) if isinstance(snapshot, Mapping) else {}
-    return render_dashboard(generated_at, accounts, alerts, notifications, account_messages=account_messages)
+    policy_summary = None
+    if isinstance(snapshot, Mapping):
+        policy_summary = _normalise_policy_summary(snapshot.get("policies"))
+    return render_dashboard(
+        generated_at,
+        accounts,
+        alerts,
+        notifications,
+        account_messages=account_messages,
+        policy_summary=policy_summary,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

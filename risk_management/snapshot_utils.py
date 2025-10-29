@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from .dashboard import evaluate_alerts, parse_snapshot
+from .dashboard import (
+    evaluate_alerts,
+    parse_snapshot,
+    _normalise_policy_summary as _dashboard_normalise_policy_summary,
+)
 from .domain.models import Account, AlertThresholds, Order, Position
 
 
@@ -77,6 +81,15 @@ def build_presentable_snapshot(
     account_stop_loss_view = _normalise_account_stop_losses(account_stop_losses)
     if account_stop_loss_view:
         payload["account_stop_losses"] = account_stop_loss_view
+
+    policy_summary_raw = snapshot.get("policies") if isinstance(snapshot, Mapping) else None
+    policies = (
+        _dashboard_normalise_policy_summary(policy_summary_raw)
+        if policy_summary_raw is not None
+        else None
+    )
+    if policies and policies.get("evaluations"):
+        payload["policies"] = policies
 
     (accounts_page, meta) = _slice_accounts(
         account_views["visible"],

@@ -34,6 +34,7 @@ from ._parsing import (
 from .account_clients import AccountClientProtocol, CCXTAccountClient
 from .configuration import CustomEndpointSettings, RealtimeConfig
 from .performance import PerformanceTracker
+from .policies import PolicyEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,11 @@ class RealtimeDataFetcher:
                     "Debug API payload logging enabled for account %s", account.name
                 )
         self._notifications = NotificationCoordinator(config)
+        self._policy_evaluator: Optional[PolicyEvaluator]
+        if config.policies:
+            self._policy_evaluator = PolicyEvaluator(config.policies)
+        else:
+            self._policy_evaluator = None
         self._portfolio_stop_loss: Optional[Dict[str, Any]] = None
         self._last_portfolio_balance: Optional[float] = None
         self._account_stop_losses: Dict[str, Dict[str, Any]] = {}
@@ -235,8 +241,16 @@ class RealtimeDataFetcher:
         )
         if performance_summary:
             snapshot["performance"] = performance_summary
+        policy_result = None
+        if self._policy_evaluator is not None:
+            policy_result = self._policy_evaluator.evaluate(snapshot)
+            payload = policy_result.to_payload()
+            if payload["evaluations"]:
+                snapshot["policies"] = payload
         self._notifications.send_daily_snapshot(snapshot, portfolio_balance)
         self._notifications.dispatch_alerts(snapshot)
+        if policy_result is not None:
+            self._notifications.handle_policy_evaluations(policy_result)
         return snapshot
 
     async def close(self) -> None:
