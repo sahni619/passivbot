@@ -894,6 +894,7 @@ def create_app(
         response_class=JSONResponse,
     )
     async def api_position_kill_switch(
+        request: Request,
         account_name: str,
         symbol: str,
         service: RiskDashboardService = Depends(get_service),
