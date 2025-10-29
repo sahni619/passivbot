@@ -22,6 +22,18 @@ from typing import (
 )
 
 
+from .audit import (
+    AuditSettings,
+    AuditS3Settings,
+    AuditSyslogSettings,
+    DEFAULT_REDACT_FIELDS,
+    get_audit_logger,
+)
+
+from .domain.models import Scenario, ScenarioShock
+
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,6 +229,51 @@ class GrafanaConfig:
 
 
 @dataclass()
+class PolicyTriggerConfig:
+    """Trigger definition describing when a policy should activate."""
+
+    type: str
+    metric: str
+    operator: str
+    value: float
+    cooldown_seconds: Optional[int] = None
+    lookback_seconds: Optional[int] = None
+
+
+@dataclass()
+class PolicyActionConfig:
+    """Action executed when a policy fires."""
+
+    type: str
+    message: Optional[str] = None
+    channels: List[str] = field(default_factory=list)
+    severity: str = "info"
+    requires_confirmation: bool = False
+    confirmation_key: Optional[str] = None
+    subject: Optional[str] = None
+
+
+@dataclass()
+class ManualOverrideConfig:
+    """Describe how a policy can be manually overridden."""
+
+    allowed: bool = False
+    instructions: Optional[str] = None
+    expires_after_seconds: Optional[int] = None
+
+
+@dataclass()
+class PolicyConfig:
+    """Structured policy definition used by the realtime evaluator."""
+
+    name: str
+    trigger: PolicyTriggerConfig
+    actions: List[PolicyActionConfig] = field(default_factory=list)
+    description: Optional[str] = None
+    manual_override: Optional[ManualOverrideConfig] = None
+
+
+@dataclass()
 class RealtimeConfig:
     """Top level realtime configuration."""
 
@@ -225,6 +282,7 @@ class RealtimeConfig:
     notification_channels: List[str] = field(default_factory=list)
     auth: Optional[AuthConfig] = None
     account_messages: Dict[str, str] = field(default_factory=dict)
+    scenarios: List[Scenario] = field(default_factory=list)
     custom_endpoints: Optional[CustomEndpointSettings] = None
     email: Optional[EmailSettings] = None
     config_root: Optional[Path] = None
@@ -232,6 +290,11 @@ class RealtimeConfig:
     reports_dir: Optional[Path] = None
     grafana: Optional[GrafanaConfig] = None
     liquidity: LiquiditySettings = field(default_factory=LiquiditySettings)
+
+    policies: List[PolicyConfig] = field(default_factory=list)
+
+    audit: Optional[AuditSettings] = None
+
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -573,6 +636,247 @@ def _parse_grafana_config(settings: Any) -> Optional[GrafanaConfig]:
     )
 
 
+def _parse_policy_trigger(
+    payload: Mapping[str, Any], policy_name: str
+) -> PolicyTriggerConfig:
+    if not isinstance(payload, Mapping):
+        raise TypeError(
+            f"Policy '{policy_name}' trigger must be provided as an object."
+        )
+
+    trigger_type_raw = payload.get("type", "metric_threshold")
+    trigger_type = str(trigger_type_raw).strip() or "metric_threshold"
+
+    metric_raw = payload.get("metric")
+    if metric_raw in (None, ""):
+        raise ValueError(f"Policy '{policy_name}' trigger requires a 'metric'.")
+    metric = str(metric_raw).strip()
+
+    operator_raw = payload.get("operator", ">=")
+    operator = str(operator_raw).strip()
+    operator_aliases = {
+        ">": ">",
+        "gt": ">",
+        ">=": ">=",
+        "gte": ">=",
+        "<": "<",
+        "lt": "<",
+        "<=": "<=",
+        "lte": "<=",
+        "==": "==",
+        "=": "==",
+        "eq": "==",
+        "!=": "!=",
+        "<>": "!=",
+        "ne": "!=",
+    }
+    operator_normalised = operator_aliases.get(operator.lower(), operator)
+
+    value_raw = payload.get("value", payload.get("threshold"))
+    if value_raw in (None, ""):
+        raise ValueError(f"Policy '{policy_name}' trigger requires a numeric 'value'.")
+    try:
+        value = float(value_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Policy '{policy_name}' trigger 'value' must be a number."
+        ) from exc
+
+    cooldown_raw = payload.get("cooldown_seconds")
+    cooldown: Optional[int] = None
+    if cooldown_raw not in (None, ""):
+        try:
+            cooldown = int(cooldown_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Policy '{policy_name}' trigger 'cooldown_seconds' must be an integer."
+            ) from exc
+        if cooldown < 0:
+            raise ValueError(
+                f"Policy '{policy_name}' trigger 'cooldown_seconds' must be >= 0."
+            )
+
+    lookback_raw = payload.get("lookback_seconds")
+    lookback: Optional[int] = None
+    if lookback_raw not in (None, ""):
+        try:
+            lookback = int(lookback_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Policy '{policy_name}' trigger 'lookback_seconds' must be an integer."
+            ) from exc
+        if lookback <= 0:
+            raise ValueError(
+                f"Policy '{policy_name}' trigger 'lookback_seconds' must be greater than zero."
+            )
+
+    return PolicyTriggerConfig(
+        type=trigger_type,
+        metric=metric,
+        operator=operator_normalised,
+        value=float(value),
+        cooldown_seconds=cooldown,
+        lookback_seconds=lookback,
+    )
+
+
+def _parse_policy_actions(
+    payload: Any, policy_name: str
+) -> List[PolicyActionConfig]:
+    if payload in (None, []):
+        return []
+    if isinstance(payload, Mapping) or isinstance(payload, (str, bytes)):
+        raise TypeError(
+            f"Policy '{policy_name}' actions must be provided as an array of objects."
+        )
+
+    actions: List[PolicyActionConfig] = []
+    for raw in payload:
+        if not isinstance(raw, Mapping):
+            raise TypeError(
+                f"Policy '{policy_name}' action entries must be objects with action configuration fields."
+            )
+        action_type_raw = raw.get("type", "log")
+        action_type = str(action_type_raw).strip().lower() or "log"
+
+        message_raw = raw.get("message")
+        message = str(message_raw) if message_raw not in (None, "") else None
+
+        channels_raw = raw.get("channels", [])
+        channels: List[str] = []
+        if isinstance(channels_raw, str):
+            if channels_raw.strip():
+                channels = [channels_raw.strip()]
+        elif isinstance(channels_raw, Iterable):
+            for channel in channels_raw:
+                if channel in (None, ""):
+                    continue
+                channels.append(str(channel).strip())
+        elif channels_raw not in (None,):
+            raise TypeError(
+                f"Policy '{policy_name}' action 'channels' must be an array of strings."
+            )
+
+        severity_raw = raw.get("severity", "info")
+        severity = str(severity_raw).strip().lower() or "info"
+
+        confirmation_raw = raw.get("requires_confirmation")
+        requires_confirmation = _coerce_bool(
+            confirmation_raw,
+            default=action_type == "require_confirmation",
+        )
+
+        confirmation_key_raw = raw.get("confirmation_key")
+        confirmation_key = (
+            str(confirmation_key_raw).strip()
+            if confirmation_key_raw not in (None, "")
+            else None
+        )
+
+        subject_raw = raw.get("subject")
+        subject = str(subject_raw).strip() if subject_raw not in (None, "") else None
+
+        actions.append(
+            PolicyActionConfig(
+                type=action_type,
+                message=message,
+                channels=channels,
+                severity=severity,
+                requires_confirmation=requires_confirmation,
+                confirmation_key=confirmation_key,
+                subject=subject,
+            )
+        )
+
+    return actions
+
+
+def _parse_policy_override(settings: Any, policy_name: str) -> Optional[ManualOverrideConfig]:
+    if settings in (None, False, {}):
+        return None
+    if not isinstance(settings, Mapping):
+        raise TypeError(
+            f"Policy '{policy_name}' manual_override must be provided as an object."
+        )
+
+    allowed = _coerce_bool(settings.get("allowed"), False)
+    instructions_raw = settings.get("instructions")
+    instructions = (
+        str(instructions_raw).strip() if instructions_raw not in (None, "") else None
+    )
+
+    expires_raw = settings.get("expires_after_seconds")
+    expires: Optional[int] = None
+    if expires_raw not in (None, ""):
+        try:
+            expires = int(expires_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Policy '{policy_name}' manual_override 'expires_after_seconds' must be an integer."
+            ) from exc
+        if expires <= 0:
+            raise ValueError(
+                f"Policy '{policy_name}' manual_override 'expires_after_seconds' must be greater than zero."
+            )
+
+    if not allowed and instructions is None and expires is None:
+        return None
+
+    return ManualOverrideConfig(
+        allowed=allowed,
+        instructions=instructions,
+        expires_after_seconds=expires,
+    )
+
+
+def _parse_policies(payload: Any) -> List[PolicyConfig]:
+    if payload in (None, []):
+        return []
+    if isinstance(payload, Mapping) or isinstance(payload, (str, bytes)):
+        raise TypeError(
+            "Realtime configuration 'policies' must be an array of policy objects."
+        )
+
+    policies: List[PolicyConfig] = []
+    seen_names: Set[str] = set()
+    for index, entry in enumerate(payload):
+        if not isinstance(entry, Mapping):
+            raise TypeError(
+                "Realtime configuration policy entries must be objects with policy fields."
+            )
+
+        name_raw = entry.get("name") or f"Policy {index + 1}"
+        name = str(name_raw).strip() or f"Policy {index + 1}"
+        if name in seen_names:
+            raise ValueError(f"Duplicate policy name '{name}' encountered in configuration.")
+        seen_names.add(name)
+
+        description_raw = entry.get("description")
+        description = (
+            str(description_raw).strip() if description_raw not in (None, "") else None
+        )
+
+        trigger_raw = entry.get("trigger")
+        if not isinstance(trigger_raw, Mapping):
+            raise TypeError(f"Policy '{name}' must include a trigger object.")
+        trigger = _parse_policy_trigger(trigger_raw, name)
+
+        actions = _parse_policy_actions(entry.get("actions"), name)
+        manual_override = _parse_policy_override(entry.get("manual_override"), name)
+
+        policies.append(
+            PolicyConfig(
+                name=name,
+                description=description,
+                trigger=trigger,
+                actions=actions,
+                manual_override=manual_override,
+            )
+        )
+
+    return policies
+
+
 def _parse_accounts(
     accounts_raw: Iterable[Mapping[str, Any]],
     api_keys: Optional[Mapping[str, Mapping[str, Any]]],
@@ -715,6 +1019,175 @@ def _parse_auth(auth_raw: Optional[Mapping[str, Any]]) -> Optional[AuthConfig]:
     )
 
 
+def _parse_audit_settings(
+    audit_raw: Optional[Mapping[str, Any]],
+    *,
+    base_dir: Path,
+) -> Optional[AuditSettings]:
+    if not audit_raw:
+        return None
+    mapping = _ensure_mapping(audit_raw, description="Realtime configuration 'audit'")
+    enabled = _coerce_bool(mapping.get("enabled"), True)
+    log_path_raw = mapping.get("log_path")
+    if not log_path_raw:
+        raise ValueError("Audit configuration requires a 'log_path'.")
+    log_path = _resolve_path_relative_to(base_dir, log_path_raw)
+
+    redact_fields_raw = mapping.get("redact_fields")
+    redact_fields: Sequence[str]
+    if redact_fields_raw is None:
+        redact_fields = DEFAULT_REDACT_FIELDS
+    else:
+        if isinstance(redact_fields_raw, (str, bytes)):
+            raise TypeError("Audit 'redact_fields' must be an iterable of field names.")
+        if not isinstance(redact_fields_raw, Iterable):
+            raise TypeError("Audit 'redact_fields' must be an iterable of field names.")
+        processed: list[str] = []
+        for field in redact_fields_raw:
+            if field is None:
+                continue
+            field_str = str(field).strip()
+            if field_str:
+                processed.append(field_str)
+        redact_fields = tuple(processed) if processed else DEFAULT_REDACT_FIELDS
+
+    s3_settings: Optional[AuditS3Settings] = None
+    s3_raw = mapping.get("s3")
+    if s3_raw:
+        s3_mapping = _ensure_mapping(s3_raw, description="Realtime configuration 'audit.s3'")
+        bucket = s3_mapping.get("bucket")
+        if not bucket:
+            raise ValueError("Audit 's3' configuration requires a 'bucket'.")
+        prefix = str(s3_mapping.get("prefix", ""))
+        region_raw = s3_mapping.get("region_name")
+        profile_raw = s3_mapping.get("profile_name")
+        s3_settings = AuditS3Settings(
+            bucket=str(bucket),
+            prefix=prefix,
+            region_name=str(region_raw) if region_raw else None,
+            profile_name=str(profile_raw) if profile_raw else None,
+        )
+
+    syslog_settings: Optional[AuditSyslogSettings] = None
+    syslog_raw = mapping.get("syslog")
+    if syslog_raw:
+        syslog_mapping = _ensure_mapping(
+            syslog_raw, description="Realtime configuration 'audit.syslog'"
+        )
+        address = str(syslog_mapping.get("address", "localhost"))
+        port_raw = syslog_mapping.get("port", 514)
+        try:
+            port = int(port_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Audit 'syslog.port' must be an integer") from exc
+        facility = str(syslog_mapping.get("facility", "user"))
+        syslog_settings = AuditSyslogSettings(address=address, port=port, facility=facility)
+
+    return AuditSettings(
+        log_path=log_path,
+        enabled=enabled,
+        redact_fields=redact_fields,
+        s3=s3_settings,
+        syslog=syslog_settings,
+    )
+
+def _parse_scenarios(payload: Any) -> List[Scenario]:
+    if not payload:
+        return []
+
+    if isinstance(payload, Mapping):
+        iterable = payload.values()
+    elif isinstance(payload, Iterable) and not isinstance(payload, (str, bytes)):
+        iterable = payload
+    else:
+        raise TypeError(
+            "Realtime configuration 'scenarios' must be an iterable of scenario definitions.",
+        )
+
+    scenarios: List[Scenario] = []
+    for raw in iterable:
+        if not isinstance(raw, Mapping):
+            raise TypeError("Scenario definitions must be JSON objects.")
+        scenario_id = raw.get("id")
+        name = raw.get("name") or scenario_id
+        if not name:
+            raise ValueError("Scenario definitions must include a 'name' or 'id'.")
+        description_raw = raw.get("description")
+        description = (
+            str(description_raw).strip()
+            if isinstance(description_raw, str) and description_raw.strip()
+            else None
+        )
+        shocks_raw = raw.get("shocks")
+        shocks = _parse_shock_definitions(shocks_raw, str(name))
+        scenarios.append(
+            Scenario(
+                id=str(scenario_id) if scenario_id else None,
+                name=str(name),
+                description=description,
+                shocks=tuple(shocks),
+            )
+        )
+    return scenarios
+
+
+def _parse_shock_definitions(payload: Any, scenario_name: str) -> List[ScenarioShock]:
+    if not payload:
+        raise ValueError(f"Scenario '{scenario_name}' must include at least one shock definition.")
+
+    shocks: List[ScenarioShock] = []
+
+    if isinstance(payload, Mapping):
+        items = payload.items()
+        for symbol, value in items:
+            pct = _coerce_float(value, description=f"Scenario '{scenario_name}' shock for '{symbol}'")
+            shocks.append(ScenarioShock(symbol=str(symbol), price_pct=pct))
+    elif isinstance(payload, Iterable) and not isinstance(payload, (str, bytes)):
+        for raw in payload:
+            if not isinstance(raw, Mapping):
+                raise TypeError(
+                    f"Scenario '{scenario_name}' shock entries must be JSON objects.",
+                )
+            symbol = raw.get("symbol") or raw.get("pair") or raw.get("ticker")
+            if not symbol:
+                raise ValueError(
+                    f"Scenario '{scenario_name}' shock entries must include a 'symbol'.",
+                )
+            pct_raw = (
+                raw.get("price_pct")
+                if raw.get("price_pct") is not None
+                else raw.get("pct")
+                if raw.get("pct") is not None
+                else raw.get("percent")
+            )
+            pct = _coerce_float(
+                pct_raw,
+                description=f"Scenario '{scenario_name}' shock for '{symbol}'",
+            )
+            shocks.append(ScenarioShock(symbol=str(symbol), price_pct=pct))
+    else:
+        raise TypeError(
+            f"Scenario '{scenario_name}' shocks must be provided as a mapping or list of definitions.",
+        )
+
+    if not shocks:
+        raise ValueError(
+            f"Scenario '{scenario_name}' must include at least one shock definition.",
+        )
+
+    return shocks
+
+
+def _coerce_float(value: Any, *, description: str) -> float:
+    if value is None:
+        raise ValueError(f"{description} must be a number.")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{description} must be a number.") from exc
+
+
+
 def load_realtime_config(path: Path | str) -> RealtimeConfig:
     """Load a realtime configuration file.
 
@@ -808,6 +1281,7 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
     custom_endpoints = _parse_custom_endpoints(config.get("custom_endpoints"))
     email_settings = _parse_email_settings(config.get("email"))
     grafana_settings = _parse_grafana_config(config.get("grafana"))
+    policies = _parse_policies(config.get("policies"))
     reports_dir_value = config.get("reports_dir")
     reports_dir: Optional[Path] = None
     if reports_dir_value:
@@ -832,6 +1306,26 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
                 continue
             account_messages[str(name)] = str(message)
 
+
+    audit_settings = _parse_audit_settings(config.get("audit"), base_dir=path.parent)
+    audit_logger = get_audit_logger(audit_settings)
+    if audit_logger:
+        try:
+            audit_logger.log(
+                action="config.load",
+                actor="system",
+                details={
+                    "path": str(path),
+                    "accounts": [account.name for account in accounts],
+                    "notification_channels": list(notification_channels),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning("Failed to emit configuration audit entry: %s", exc)
+
+    scenarios = _parse_scenarios(config.get("scenarios"))
+
+
     return RealtimeConfig(
         accounts=accounts,
         alert_thresholds=alert_thresholds,
@@ -844,5 +1338,15 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         reports_dir=reports_dir,
         grafana=grafana_settings,
         account_messages=account_messages,
+
         liquidity=liquidity_defaults,
+
+
+        policies=policies,
+
+        audit=audit_settings,
+
+        scenarios=scenarios,
+
+
     )
