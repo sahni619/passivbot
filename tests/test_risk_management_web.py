@@ -1,5 +1,6 @@
 import hmac
 import inspect
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx
 from fastapi.testclient import TestClient
 
+from risk_management.audit import AuditSettings, reset_audit_registry
 from risk_management.configuration import AccountConfig, RealtimeConfig
 from risk_management.web import AuthManager, RiskDashboardService, create_app
 
@@ -309,9 +311,7 @@ def create_test_app(
     *,
     kill_switch_responses: Optional[List[dict]] = None,
     performance_repository: Optional[Any] = None,
-) -> tuple[TestClient, StubFetcher]:
-    fetcher = StubFetcher(snapshot, kill_switch_responses=kill_switch_responses)
-    ) -> tuple[TestClient, StubRiskService]:
+) -> tuple[TestClient, StubRiskService]:
     fetcher = StubRiskService(snapshot, kill_switch_responses=kill_switch_responses)
     service = RiskDashboardService(fetcher)  # type: ignore[arg-type]
     config = RealtimeConfig(accounts=[AccountConfig(name="Demo", exchange="binance", credentials={})])
@@ -1090,3 +1090,59 @@ def test_account_performance_endpoint_handles_errors(
             params={"start": "invalid"},
         )
         assert invalid.status_code == 400
+
+def test_audit_endpoints_require_configuration(auth_manager: AuthManager) -> None:
+    reset_audit_registry()
+    snapshot = {"accounts": []}
+    service = RiskDashboardService(StubRiskService(snapshot))  # type: ignore[arg-type]
+    config = RealtimeConfig(accounts=[AccountConfig(name="Demo", exchange="binance", credentials={})])
+    app = create_app(config, service=service, auth_manager=auth_manager)
+    client = TestClient(app)
+
+    login_response = client.post("/login", data={"username": "admin", "password": "admin123"})
+    assert login_response.status_code in {302, 303, 307}
+
+    response = client.get("/api/audit")
+    assert response.status_code == 404
+
+
+def test_audit_endpoints_return_filtered_data(auth_manager: AuthManager, tmp_path: Path) -> None:
+    reset_audit_registry()
+    snapshot = {"accounts": []}
+    log_path = tmp_path / "audit.log"
+    audit_settings = AuditSettings(log_path=log_path)
+    service = RiskDashboardService(StubRiskService(snapshot))  # type: ignore[arg-type]
+    config = RealtimeConfig(
+        accounts=[AccountConfig(name="Demo", exchange="binance", credentials={})],
+        audit=audit_settings,
+    )
+    app = create_app(config, service=service, auth_manager=auth_manager)
+    client = TestClient(app)
+
+    login_response = client.post("/login", data={"username": "admin", "password": "admin123"})
+    assert login_response.status_code in {302, 303, 307}
+
+    audit_logger = app.state.audit_logger
+    assert audit_logger is not None
+    audit_logger.log("custom.event", "admin", {"value": 1})
+    audit_logger.log("custom.event", "guest", {"value": 2})
+    audit_logger.log("other.event", "admin", {"value": 3})
+
+    api_response = client.get("/api/audit", params={"action": "custom.event", "actor": "admin"})
+    assert api_response.status_code == 200
+    payload = api_response.json()
+    assert payload["filters"]["action"] == "custom.event"
+    assert payload["filters"]["actor"] == "admin"
+    assert len(payload["entries"]) == 1
+    assert payload["entries"][0]["actor"] == "admin"
+
+    html_response = client.get("/audit", params={"action": "custom.event"})
+    assert html_response.status_code == 200
+    assert "Audit trail" in html_response.text
+
+    download_response = client.get("/audit/download", params={"actor": "admin"})
+    assert download_response.status_code == 200
+    lines = [line for line in download_response.text.splitlines() if line]
+    assert lines
+    first_entry = json.loads(lines[0])
+    assert first_entry["actor"].lower() == "admin"

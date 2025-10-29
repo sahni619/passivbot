@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timezone
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+from .audit import AuditLogWriter
 from .configuration import RealtimeConfig
 from .dashboard import evaluate_alerts, parse_snapshot
 from .email_notifications import EmailAlertSender
@@ -22,7 +23,12 @@ logger = logging.getLogger(__name__)
 class NotificationCoordinator:
     """Coordinate email and telegram notifications for realtime snapshots."""
 
-    def __init__(self, config: RealtimeConfig) -> None:
+    def __init__(
+        self,
+        config: RealtimeConfig,
+        *,
+        audit_logger: Optional[AuditLogWriter] = None,
+    ) -> None:
         self._email_sender = EmailAlertSender(config.email) if config.email else None
         self._email_recipients = self._extract_email_recipients(config.notification_channels)
         self._telegram_targets = self._extract_telegram_targets(config.notification_channels)
@@ -30,6 +36,15 @@ class NotificationCoordinator:
         self._active_alerts: set[str] = set()
         self._daily_snapshot_tz = ZoneInfo("America/New_York")
         self._daily_snapshot_sent_date: Optional[date] = None
+        self._audit = audit_logger
+
+    def _emit_audit(self, action: str, details: Mapping[str, Any]) -> None:
+        if not self._audit:
+            return
+        try:
+            self._audit.log(action=action, actor="system", details=dict(details))
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning("Failed to emit notification audit entry: %s", exc)
 
     @staticmethod
     def _extract_email_recipients(channels: Sequence[Any]) -> list[str]:
@@ -99,6 +114,13 @@ class NotificationCoordinator:
         subject = "Daily portfolio balance snapshot"
         self._email_sender.send(subject, body, self._email_recipients)
         self._daily_snapshot_sent_date = current_date
+        self._emit_audit(
+            "notification.email.daily_snapshot",
+            {
+                "subject": subject,
+                "recipient_count": len(self._email_recipients),
+            },
+        )
 
     def dispatch_alerts(self, snapshot: Mapping[str, Any]) -> None:
         if not (self._email_sender or self._telegram_notifier):
@@ -126,10 +148,25 @@ class NotificationCoordinator:
         subject = "Risk alert: exposure threshold breached"
         if self._email_sender and self._email_recipients:
             self._email_sender.send(subject, body, self._email_recipients)
+            self._emit_audit(
+                "notification.email.alert",
+                {
+                    "subject": subject,
+                    "alert_count": len(new_alerts),
+                    "recipient_count": len(self._email_recipients),
+                },
+            )
         if self._telegram_notifier and self._telegram_targets:
             message = f"Exposure alert at {timestamp}\n" + "\n".join(new_alerts)
             for token, chat_id in self._telegram_targets:
                 self._telegram_notifier.send(token, chat_id, message)
+            self._emit_audit(
+                "notification.telegram.alert",
+                {
+                    "alert_count": len(new_alerts),
+                    "destination_count": len(self._telegram_targets),
+                },
+            )
 
     @property
     def email_sender(self) -> Optional[EmailAlertSender]:

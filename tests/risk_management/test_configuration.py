@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from risk_management.audit import reset_audit_registry
 from risk_management.configuration import (  # noqa: E402
     _ensure_debug_logging_enabled,
     _merge_credentials,
@@ -497,3 +498,22 @@ def test_load_realtime_config_discovers_api_keys_file(tmp_path: Path) -> None:
 
     assert config.accounts[0].credentials["apiKey"] == "auto"
 
+
+def test_load_realtime_config_parses_audit_settings(tmp_path: Path) -> None:
+    reset_audit_registry()
+    payload = _base_payload()
+    payload["audit"] = {
+        "log_path": "logs/audit.log",
+        "redact_fields": ["token", "password"],
+        "syslog": {"address": "127.0.0.1", "port": 1514, "facility": "local0"},
+    }
+    config_path = _write_config(tmp_path, payload)
+
+    config = load_realtime_config(config_path)
+
+    assert config.audit is not None
+    expected_path = (config_path.parent / "logs" / "audit.log").resolve()
+    assert config.audit.log_path == expected_path
+    assert tuple(config.audit.redact_fields) == ("token", "password")
+    assert config.audit.syslog is not None
+    assert config.audit.syslog.port == 1514

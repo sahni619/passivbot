@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% block title %}Audit Trail · Risk Management Dashboard{% endblock %}
+
+{% block header_controls %}
+  <a class="button" id="audit-download" data-base-url="{{ request.url_for('audit_download') }}" href="{{ download_url }}">Download log</a>
+{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <header class="panel__header">
+      <h2>Audit trail</h2>
+    </header>
+    <form method="get" class="form form--inline">
+      <label>
+        <span>Action</span>
+        <input type="text" name="action" value="{{ filters.action }}" placeholder="e.g. kill_switch.global" />
+      </label>
+      <label>
+        <span>User</span>
+        <input type="text" name="actor" value="{{ filters.actor }}" placeholder="dashboard user" />
+      </label>
+      <label>
+        <span>Limit</span>
+        <input type="number" name="limit" min="1" max="5000" value="{{ filters.limit or '' }}" />
+      </label>
+      <button type="submit" class="button">Apply</button>
+    </form>
+    <div class="table-wrapper">
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">Timestamp</th>
+            <th scope="col">User</th>
+            <th scope="col">Action</th>
+            <th scope="col">Details</th>
+            <th scope="col">Hash</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if entries %}
+            {% for entry in entries %}
+              <tr>
+                <td data-label="Timestamp">{{ entry.timestamp }}</td>
+                <td data-label="User">{{ entry.actor }}</td>
+                <td data-label="Action">{{ entry.action }}</td>
+                <td data-label="Details"><pre class="audit-details">{{ entry.details | tojson(indent=2) }}</pre></td>
+                <td data-label="Hash"><code>{{ entry.hash }}</code></td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr>
+              <td colspan="5" class="empty">No audit entries available.</td>
+            </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script>
+    (function () {
+      const downloadLink = document.getElementById('audit-download');
+      if (!downloadLink) {
+        return;
+      }
+      const form = document.querySelector('form');
+      const updateLink = () => {
+        const params = new URLSearchParams(new FormData(form));
+        const baseUrl = downloadLink.dataset.baseUrl || downloadLink.href;
+        const query = params.toString();
+        downloadLink.href = query ? `${baseUrl}?${query}` : baseUrl;
+      };
+      form.addEventListener('change', updateLink);
+      form.addEventListener('submit', updateLink);
+      updateLink();
+    })();
+  </script>
+{% endblock %}

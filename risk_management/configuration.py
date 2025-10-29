@@ -21,6 +21,14 @@ from typing import (
     Set,
 )
 
+from .audit import (
+    AuditSettings,
+    AuditS3Settings,
+    AuditSyslogSettings,
+    DEFAULT_REDACT_FIELDS,
+    get_audit_logger,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +228,7 @@ class RealtimeConfig:
     debug_api_payloads: bool = False
     reports_dir: Optional[Path] = None
     grafana: Optional[GrafanaConfig] = None
+    audit: Optional[AuditSettings] = None
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -626,6 +635,79 @@ def _parse_auth(auth_raw: Optional[Mapping[str, Any]]) -> Optional[AuthConfig]:
     )
 
 
+def _parse_audit_settings(
+    audit_raw: Optional[Mapping[str, Any]],
+    *,
+    base_dir: Path,
+) -> Optional[AuditSettings]:
+    if not audit_raw:
+        return None
+    mapping = _ensure_mapping(audit_raw, description="Realtime configuration 'audit'")
+    enabled = _coerce_bool(mapping.get("enabled"), True)
+    log_path_raw = mapping.get("log_path")
+    if not log_path_raw:
+        raise ValueError("Audit configuration requires a 'log_path'.")
+    log_path = _resolve_path_relative_to(base_dir, log_path_raw)
+
+    redact_fields_raw = mapping.get("redact_fields")
+    redact_fields: Sequence[str]
+    if redact_fields_raw is None:
+        redact_fields = DEFAULT_REDACT_FIELDS
+    else:
+        if isinstance(redact_fields_raw, (str, bytes)):
+            raise TypeError("Audit 'redact_fields' must be an iterable of field names.")
+        if not isinstance(redact_fields_raw, Iterable):
+            raise TypeError("Audit 'redact_fields' must be an iterable of field names.")
+        processed: list[str] = []
+        for field in redact_fields_raw:
+            if field is None:
+                continue
+            field_str = str(field).strip()
+            if field_str:
+                processed.append(field_str)
+        redact_fields = tuple(processed) if processed else DEFAULT_REDACT_FIELDS
+
+    s3_settings: Optional[AuditS3Settings] = None
+    s3_raw = mapping.get("s3")
+    if s3_raw:
+        s3_mapping = _ensure_mapping(s3_raw, description="Realtime configuration 'audit.s3'")
+        bucket = s3_mapping.get("bucket")
+        if not bucket:
+            raise ValueError("Audit 's3' configuration requires a 'bucket'.")
+        prefix = str(s3_mapping.get("prefix", ""))
+        region_raw = s3_mapping.get("region_name")
+        profile_raw = s3_mapping.get("profile_name")
+        s3_settings = AuditS3Settings(
+            bucket=str(bucket),
+            prefix=prefix,
+            region_name=str(region_raw) if region_raw else None,
+            profile_name=str(profile_raw) if profile_raw else None,
+        )
+
+    syslog_settings: Optional[AuditSyslogSettings] = None
+    syslog_raw = mapping.get("syslog")
+    if syslog_raw:
+        syslog_mapping = _ensure_mapping(
+            syslog_raw, description="Realtime configuration 'audit.syslog'"
+        )
+        address = str(syslog_mapping.get("address", "localhost"))
+        port_raw = syslog_mapping.get("port", 514)
+        try:
+            port = int(port_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Audit 'syslog.port' must be an integer") from exc
+        facility = str(syslog_mapping.get("facility", "user"))
+        syslog_settings = AuditSyslogSettings(address=address, port=port, facility=facility)
+
+    return AuditSettings(
+        log_path=log_path,
+        enabled=enabled,
+        redact_fields=redact_fields,
+        s3=s3_settings,
+        syslog=syslog_settings,
+    )
+
+
 def load_realtime_config(path: Path | str) -> RealtimeConfig:
     """Load a realtime configuration file.
 
@@ -733,6 +815,22 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
                 continue
             account_messages[str(name)] = str(message)
 
+    audit_settings = _parse_audit_settings(config.get("audit"), base_dir=path.parent)
+    audit_logger = get_audit_logger(audit_settings)
+    if audit_logger:
+        try:
+            audit_logger.log(
+                action="config.load",
+                actor="system",
+                details={
+                    "path": str(path),
+                    "accounts": [account.name for account in accounts],
+                    "notification_channels": list(notification_channels),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning("Failed to emit configuration audit entry: %s", exc)
+
     return RealtimeConfig(
         accounts=accounts,
         alert_thresholds=alert_thresholds,
@@ -745,4 +843,5 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         reports_dir=reports_dir,
         grafana=grafana_settings,
         account_messages=account_messages,
+        audit=audit_settings,
     )
