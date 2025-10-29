@@ -57,6 +57,24 @@
     "max_drawdown_pct": 0.25,
     "loss_threshold_pct": -0.08
   },
+  "scenarios": [
+    {
+      "id": "btc_minus_10",
+      "name": "BTC -10%",
+      "description": "Bitcoin sells off by ten percent.",
+      "shocks": [
+        {"symbol": "BTCUSDT", "price_pct": -0.10}
+      ]
+    },
+    {
+      "id": "eth_minus_15",
+      "name": "ETH -15%",
+      "description": "Ethereum retraces sharply.",
+      "shocks": [
+        {"symbol": "ETHUSDT", "price_pct": -0.15}
+      ]
+    }
+  ],
   "email": {
     "host": "smtppro.zoho.in",
     "port": 587,

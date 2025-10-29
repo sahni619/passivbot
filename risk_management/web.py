@@ -27,6 +27,7 @@ from urllib.parse import quote, urlencode, urljoin
 
 from .audit import AuditLogWriter, AuditSettings, get_audit_logger, read_audit_entries
 from .configuration import RealtimeConfig
+from .domain.models import Scenario
 from .services.risk_service import RiskService, RiskServiceProtocol
 from .reporting import ReportManager
 from .services import PerformanceRepository
@@ -39,6 +40,7 @@ from .snapshot_utils import (
     MAX_ACCOUNTS_PAGE_SIZE,
     build_presentable_snapshot,
 )
+from .stress import scenario_results_to_dict, simulate_scenarios
 
 
 class AuthManager:
@@ -301,6 +303,7 @@ def create_app(
     if performance_repository is None:
         performance_repository = PerformanceRepository(Path(reports_dir))
     app.state.performance_repository = performance_repository
+
     audit_logger = get_audit_logger(config.audit)
     app.state.audit_logger = audit_logger
     app.state.audit_settings = config.audit
@@ -350,6 +353,9 @@ def create_app(
         elif default_limit is not None:
             limit_value = default_limit
         return action_filter, actor_filter, limit_value
+
+    app.state.scenarios = list(config.scenarios)
+
 
     def resolve_grafana_context() -> dict[str, Any]:
         grafana_cfg = config.grafana
@@ -473,6 +479,11 @@ def create_app(
             sort_key=DEFAULT_ACCOUNT_SORT_KEY,
             sort_order=DEFAULT_ACCOUNT_SORT_ORDER,
         )
+        configured_scenarios: Sequence[Scenario] = request.app.state.scenarios
+        scenario_results = simulate_scenarios(snapshot, configured_scenarios)
+        view_model["scenarios"] = (
+            scenario_results_to_dict(scenario_results) if scenario_results else []
+        )
         grafana_context: dict[str, Any] = request.app.state.grafana_context
         return templates.TemplateResponse(
             "dashboard/index.html",
@@ -513,6 +524,11 @@ def create_app(
             page_size=page_size_param,
             sort_key=sort_param,
             sort_order=sort_order_param,
+        )
+        configured_scenarios: Sequence[Scenario] = request.app.state.scenarios
+        scenario_results = simulate_scenarios(snapshot, configured_scenarios)
+        view_model["scenarios"] = (
+            scenario_results_to_dict(scenario_results) if scenario_results else []
         )
         return JSONResponse(view_model)
 
