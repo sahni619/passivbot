@@ -1380,20 +1380,28 @@ class CCXTAccountClient(AccountClientProtocol):
                 params["positionIdx"] = position_idx
 
             if self._normalized_exchange == "okx":
+
                 info = position.get("info") if isinstance(position.get("info"), Mapping) else None
+
 
                 okx_pos_side = None
                 raw_okx_side = position.get("posSide")
                 if isinstance(raw_okx_side, str) and raw_okx_side.strip():
                     okx_pos_side = raw_okx_side.strip().lower()
+
                 if okx_pos_side is None and isinstance(info, Mapping):
                     info_side = info.get("posSide")
+
+                if okx_pos_side is None and isinstance(position.get("info"), Mapping):
+                    info_side = position["info"].get("posSide")
+
                     if isinstance(info_side, str) and info_side.strip():
                         okx_pos_side = info_side.strip().lower()
                 if okx_pos_side is None and position_side:
                     okx_pos_side = position_side.lower()
                 if okx_pos_side in {"long", "short", "net"} and "posSide" not in params:
                     params["posSide"] = okx_pos_side
+
 
                 okx_td_mode: Optional[str] = None
                 for key in ("tdMode", "tradeMode", "marginMode", "mgnMode"):
@@ -1409,6 +1417,7 @@ class CCXTAccountClient(AccountClientProtocol):
                             break
                 if okx_td_mode:
                     params.setdefault("tdMode", okx_td_mode)
+
 
             if side_explicit:
                 params.pop("reduceOnly", None)
