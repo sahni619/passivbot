@@ -224,6 +224,128 @@
       opacity: 0.5;
       cursor: not-allowed;
     }
+    .metric .delta {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+
+    .metric.performance-metric {
+      gap: 0.3rem;
+    }
+
+    .metric.performance-metric .subvalue {
+      margin-top: 0.1rem;
+    }
+
+    .chart-card {
+      margin-top: 1.5rem;
+      background: rgba(15, 23, 42, 0.6);
+      border-radius: 0.75rem;
+      padding: 1rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      border: 1px solid rgba(148, 163, 184, 0.15);
+    }
+
+    .chart-card[data-loading="true"] {
+      opacity: 0.75;
+    }
+
+    .chart-card--error {
+      border-color: rgba(248, 113, 113, 0.35);
+    }
+
+    .chart-card__header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .chart-card__summary {
+      margin: 0;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .chart-card__summary span + span {
+      margin-left: 0.35rem;
+    }
+
+    .chart-card__figure {
+      position: relative;
+      width: 100%;
+    }
+
+    .chart-card__figure svg {
+      width: 100%;
+      height: 220px;
+      display: block;
+    }
+
+    .chart-card__empty {
+      margin: 0;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    .chart-card--empty .chart-card__figure svg {
+      display: none;
+    }
+
+    .chart-card--has-data .chart-card__empty {
+      display: none;
+    }
+
+    .chart-card__details {
+      border-top: 1px solid rgba(148, 163, 184, 0.12);
+      padding-top: 0.75rem;
+    }
+
+    .chart-card__details summary {
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .chart-card__details .table-wrapper {
+      margin-top: 0.75rem;
+      max-height: none;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    @media (max-width: 1024px) {
+      .chart-card__figure svg {
+        height: 200px;
+      }
+    }
+
+    @media (max-width: 768px) {
+      main {
+        padding: 1.5rem 1rem;
+      }
+
+      .chart-card {
+        padding: 1rem;
+      }
+
+      .chart-card__figure svg {
+        height: 180px;
+      }
+    }
   </style>
 {% endblock %}
 
@@ -238,6 +360,35 @@
     </form>
   </div>
 {% endblock %}
+
+{% macro performance_metric(label, value, reference, since) %}
+  {% set has_value = value is not none %}
+  {% set value_class = 'gain' if has_value and value >= 0 else ('loss' if has_value else '') %}
+  {% if has_value %}
+    {% set formatted_value = value|currency %}
+    {% if value > 0 %}{% set formatted_value = '+' ~ formatted_value %}{% endif %}
+  {% else %}
+    {% set formatted_value = '-' %}
+  {% endif %}
+  {% if has_value and reference is not none and reference != 0 %}
+    {% set pct_change = value / reference %}
+  {% else %}
+    {% set pct_change = none %}
+  {% endif %}
+  {% set pct_class = 'gain' if pct_change is not none and pct_change >= 0 else ('loss' if pct_change is not none else '') %}
+  {% if pct_change is not none %}
+    {% set pct_text = '%+.2f%%' % (pct_change * 100) %}
+  {% else %}
+    {% set pct_text = '-' %}
+  {% endif %}
+  <div class="metric performance-metric">
+    <span class="label">{{ label }}</span>
+    <span class="value {{ value_class }}">{{ formatted_value }}</span>
+    <span class="delta {{ pct_class }}">{{ pct_text }}</span>
+    <span class="subvalue">{% if since %}Since {{ since }}{% else %}&nbsp;{% endif %}</span>
+  </div>
+{% endmacro %}
+{% from _self import performance_metric %}
 
 {% block content %}
   <nav class="view-nav" role="tablist" aria-label="Dashboard sections">
@@ -322,34 +473,54 @@
           </div>
         </div>
         {% set portfolio_performance = snapshot.portfolio.performance if snapshot.portfolio.performance is defined else None %}
+        {% set portfolio_references = portfolio_performance.reference_balances if portfolio_performance and portfolio_performance.reference_balances is defined else {} %}
+        {% set portfolio_since = portfolio_performance.since if portfolio_performance and portfolio_performance.since is defined else {} %}
         {% if portfolio_performance %}
-          <div class="metrics" style="margin-top: 1.5rem;">
-            {% set daily = portfolio_performance.daily %}
-            {% set daily_class = 'gain' if daily is not none and daily >= 0 else ('loss' if daily is not none else '') %}
-            <div class="metric">
-              <span class="label">Daily PnL (4pm)</span>
-              <span class="value {{ daily_class }}">{% if daily is not none %}{{ daily|currency }}{% else %}-{% endif %}</span>
-              {% set daily_since = portfolio_performance.since.daily if portfolio_performance.since is defined and portfolio_performance.since %}
-              <span class="subvalue">{% if daily_since %}Since {{ daily_since }}{% else %}&nbsp;{% endif %}</span>
-            </div>
-            {% set weekly = portfolio_performance.weekly %}
-            {% set weekly_class = 'gain' if weekly is not none and weekly >= 0 else ('loss' if weekly is not none else '') %}
-            <div class="metric">
-              <span class="label">Weekly PnL</span>
-              <span class="value {{ weekly_class }}">{% if weekly is not none %}{{ weekly|currency }}{% else %}-{% endif %}</span>
-              {% set weekly_since = portfolio_performance.since.weekly if portfolio_performance.since is defined and portfolio_performance.since %}
-              <span class="subvalue">{% if weekly_since %}Since {{ weekly_since }}{% else %}&nbsp;{% endif %}</span>
-            </div>
-            {% set monthly = portfolio_performance.monthly %}
-            {% set monthly_class = 'gain' if monthly is not none and monthly >= 0 else ('loss' if monthly is not none else '') %}
-            <div class="metric">
-              <span class="label">Monthly PnL</span>
-              <span class="value {{ monthly_class }}">{% if monthly is not none %}{{ monthly|currency }}{% else %}-{% endif %}</span>
-              {% set monthly_since = portfolio_performance.since.monthly if portfolio_performance.since is defined and portfolio_performance.since %}
-              <span class="subvalue">{% if monthly_since %}Since {{ monthly_since }}{% else %}&nbsp;{% endif %}</span>
-            </div>
+          <div class="metrics metrics--performance" style="margin-top: 1.5rem;">
+            {{ performance_metric('Daily PnL (4pm)', portfolio_performance.daily, portfolio_references.daily if portfolio_references else none, portfolio_since.daily if portfolio_since else none) }}
+            {{ performance_metric('Weekly PnL', portfolio_performance.weekly, portfolio_references.weekly if portfolio_references else none, portfolio_since.weekly if portfolio_since else none) }}
+            {{ performance_metric('Monthly PnL', portfolio_performance.monthly, portfolio_references.monthly if portfolio_references else none, portfolio_since.monthly if portfolio_since else none) }}
           </div>
         {% endif %}
+        <div
+          class="chart-card chart-card--empty"
+          data-performance-chart="portfolio"
+          data-chart-scope="portfolio"
+          data-chart-title="Portfolio balance history"
+        >
+          <div class="chart-card__header">
+            <h3 id="portfolio-balance-title" style="margin: 0;">Balance trend</h3>
+            <p class="chart-card__summary" data-chart-summary aria-live="polite"></p>
+          </div>
+          <figure class="chart-card__figure">
+            <svg
+              role="img"
+              aria-labelledby="portfolio-balance-title portfolio-balance-description"
+              data-chart-svg
+              preserveAspectRatio="none"
+            ></svg>
+            <figcaption id="portfolio-balance-description" class="sr-only" data-chart-description>
+              Daily portfolio balance history.
+            </figcaption>
+            <p class="chart-card__empty" data-chart-empty>No performance history available yet.</p>
+          </figure>
+          <details class="chart-card__details" data-chart-details>
+            <summary>View balance history table</summary>
+            <div class="table-wrapper">
+              <table class="compact">
+                <thead>
+                  <tr>
+                    <th scope="col">Date</th>
+                    <th scope="col">Balance</th>
+                    <th scope="col">Δ</th>
+                    <th scope="col">Δ%</th>
+                  </tr>
+                </thead>
+                <tbody data-chart-table-body></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
         {% set portfolio_vol = snapshot.portfolio.volatility if snapshot.portfolio.volatility is defined else {} %}
         {% set portfolio_funding = snapshot.portfolio.funding_rates if snapshot.portfolio.funding_rates is defined else {} %}
         {% if portfolio_vol or portfolio_funding %}
@@ -576,34 +747,56 @@
               </div>
             </div>
             {% set account_performance = account.performance if account.performance is defined else None %}
+            {% set account_references = account_performance.reference_balances if account_performance and account_performance.reference_balances is defined else {} %}
+            {% set account_since = account_performance.since if account_performance and account_performance.since is defined else {} %}
             {% if account_performance %}
-              <div class="metrics" style="margin-top: 1.5rem;">
-                {% set daily = account_performance.daily %}
-                {% set daily_class = 'gain' if daily is not none and daily >= 0 else ('loss' if daily is not none else '') %}
-                <div class="metric">
-                  <span class="label">Daily PnL (4pm)</span>
-                  <span class="value {{ daily_class }}">{% if daily is not none %}{{ daily|currency }}{% else %}-{% endif %}</span>
-                  {% set daily_since = account_performance.since.daily if account_performance.since is defined and account_performance.since %}
-                  <span class="subvalue">{% if daily_since %}Since {{ daily_since }}{% else %}&nbsp;{% endif %}</span>
-                </div>
-                {% set weekly = account_performance.weekly %}
-                {% set weekly_class = 'gain' if weekly is not none and weekly >= 0 else ('loss' if weekly is not none else '') %}
-                <div class="metric">
-                  <span class="label">Weekly PnL</span>
-                  <span class="value {{ weekly_class }}">{% if weekly is not none %}{{ weekly|currency }}{% else %}-{% endif %}</span>
-                  {% set weekly_since = account_performance.since.weekly if account_performance.since is defined and account_performance.since %}
-                  <span class="subvalue">{% if weekly_since %}Since {{ weekly_since }}{% else %}&nbsp;{% endif %}</span>
-                </div>
-                {% set monthly = account_performance.monthly %}
-                {% set monthly_class = 'gain' if monthly is not none and monthly >= 0 else ('loss' if monthly is not none else '') %}
-                <div class="metric">
-                  <span class="label">Monthly PnL</span>
-                  <span class="value {{ monthly_class }}">{% if monthly is not none %}{{ monthly|currency }}{% else %}-{% endif %}</span>
-                  {% set monthly_since = account_performance.since.monthly if account_performance.since is defined and account_performance.since %}
-                  <span class="subvalue">{% if monthly_since %}Since {{ monthly_since }}{% else %}&nbsp;{% endif %}</span>
-                </div>
+              <div class="metrics metrics--performance" style="margin-top: 1.5rem;">
+                {{ performance_metric('Daily PnL (4pm)', account_performance.daily, account_references.daily if account_references else none, account_since.daily if account_since else none) }}
+                {{ performance_metric('Weekly PnL', account_performance.weekly, account_references.weekly if account_references else none, account_since.weekly if account_since else none) }}
+                {{ performance_metric('Monthly PnL', account_performance.monthly, account_references.monthly if account_references else none, account_since.monthly if account_since else none) }}
               </div>
             {% endif %}
+            {% set chart_id = 'account-balance-' ~ loop.index %}
+            <div
+              class="chart-card chart-card--empty"
+              data-performance-chart="account"
+              data-account-name="{{ account.name|e }}"
+              data-chart-scope="account"
+              data-chart-title="{{ account.name|e }} balance history"
+            >
+              <div class="chart-card__header">
+                <h3 id="{{ chart_id }}-title" style="margin: 0;">Balance trend</h3>
+                <p class="chart-card__summary" data-chart-summary aria-live="polite"></p>
+              </div>
+              <figure class="chart-card__figure">
+                <svg
+                  role="img"
+                  aria-labelledby="{{ chart_id }}-title {{ chart_id }}-description"
+                  data-chart-svg
+                  preserveAspectRatio="none"
+                ></svg>
+                <figcaption id="{{ chart_id }}-description" class="sr-only" data-chart-description>
+                  Balance history for {{ account.name|e }}.
+                </figcaption>
+                <p class="chart-card__empty" data-chart-empty>No performance history available yet.</p>
+              </figure>
+              <details class="chart-card__details" data-chart-details>
+                <summary>View balance history table</summary>
+                <div class="table-wrapper">
+                  <table class="compact">
+                    <thead>
+                      <tr>
+                        <th scope="col">Date</th>
+                        <th scope="col">Balance</th>
+                        <th scope="col">Δ</th>
+                        <th scope="col">Δ%</th>
+                      </tr>
+                    </thead>
+                    <tbody data-chart-table-body></tbody>
+                  </table>
+                </div>
+              </details>
+            </div>
             {% if account.stop_loss %}
               {% set sl = account.stop_loss %}
               <div class="status" style="margin-top: 1rem;">
@@ -1100,6 +1293,60 @@
       return `${number.toFixed(2)}%`;
     };
 
+    const formatCurrencyDelta = (value) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) {
+        return "-";
+      }
+      const formatted = formatCurrency(number);
+      if (number > 0 && !formatted.startsWith("+")) {
+        return `+${formatted}`;
+      }
+      if (Math.abs(number) < 1e-9) {
+        return formatCurrency(0);
+      }
+      return formatted;
+    };
+
+    const formatSignedPct = (value) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) {
+        return "-";
+      }
+      if (Math.abs(number) < 1e-9) {
+        return "0.00%";
+      }
+      const percent = (number * 100).toFixed(2);
+      return number > 0 ? `+${percent}%` : `${percent}%`;
+    };
+
+    const computePctChange = (pnl, reference) => {
+      const pnlNumber = Number(pnl);
+      const referenceNumber = Number(reference);
+      if (!Number.isFinite(pnlNumber) || !Number.isFinite(referenceNumber) || referenceNumber === 0) {
+        return null;
+      }
+      return pnlNumber / referenceNumber;
+    };
+
+    const escapeHtml = (value) => {
+      if (value === null || value === undefined) {
+        return "";
+      }
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    };
+
+    let chartIdCounter = 0;
+    const createChartId = (prefix = "chart") => {
+      chartIdCounter += 1;
+      return `${prefix}-${chartIdCounter}`;
+    };
+
     const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
 
     const formatMetricValue = (value) => (isFiniteNumber(value) ? formatPct(value) : "-");
@@ -1123,6 +1370,591 @@
         <button type="button" disabled>Next</button>
       </div>
     `;
+
+    const renderPerformanceMetricBlock = (label, value, reference, since) => {
+      const pctChange = computePctChange(value, reference);
+      const valueNumber = Number(value);
+      const hasValue = Number.isFinite(valueNumber);
+      const valueClass = hasValue ? (valueNumber >= 0 ? "gain" : "loss") : "";
+      const pctClass = pctChange === null ? "" : pctChange >= 0 ? "gain" : "loss";
+      const valueText = hasValue ? formatCurrencyDelta(valueNumber) : "-";
+      const pctText = pctChange === null ? "-" : formatSignedPct(pctChange);
+      const sinceText = since ? `Since ${escapeHtml(since)}` : "&nbsp;";
+      return `
+        <div class="metric performance-metric">
+          <span class="label">${escapeHtml(label)}</span>
+          <span class="value ${valueClass}">${escapeHtml(valueText)}</span>
+          <span class="delta ${pctClass}">${escapeHtml(pctText)}</span>
+          <span class="subvalue">${sinceText}</span>
+        </div>
+      `;
+    };
+
+    const renderPerformanceMetrics = (performance) => {
+      if (!performance) {
+        return "";
+      }
+      const references = performance.reference_balances || {};
+      const since = performance.since || {};
+      const blocks = [
+        renderPerformanceMetricBlock(
+          "Daily PnL (4pm)",
+          performance.daily,
+          references?.daily,
+          since?.daily,
+        ),
+        renderPerformanceMetricBlock(
+          "Weekly PnL",
+          performance.weekly,
+          references?.weekly,
+          since?.weekly,
+        ),
+        renderPerformanceMetricBlock(
+          "Monthly PnL",
+          performance.monthly,
+          references?.monthly,
+          since?.monthly,
+        ),
+      ];
+      const content = blocks.filter(Boolean).join("");
+      if (!content.trim()) {
+        return "";
+      }
+      return `
+        <div class="metrics metrics--performance" style="margin-top: 1.5rem;">
+          ${content}
+        </div>
+      `;
+    };
+
+    const renderPerformanceChartShell = (scope, { accountName = "", chartId, description } = {}) => {
+      const isAccount = scope === "account";
+      const resolvedId = chartId || createChartId(`chart-${scope}`);
+      const titleText = isAccount
+        ? `${accountName} balance history`
+        : "Portfolio balance history";
+      const descriptionText = description
+        || (isAccount
+          ? `Balance history for ${accountName}.`
+          : "Daily portfolio balance history.");
+      const attributes = [
+        "class=\"chart-card chart-card--empty\"",
+        `data-performance-chart="${scope}"`,
+        `data-chart-scope="${scope}"`,
+        `data-chart-title="${escapeHtml(titleText)}"`,
+      ];
+      if (isAccount) {
+        attributes.push(`data-account-name="${escapeHtml(accountName)}"`);
+      }
+      return `
+        <div ${attributes.join(" ")}>
+          <div class="chart-card__header">
+            <h3 id="${resolvedId}-title" style="margin: 0;">Balance trend</h3>
+            <p class="chart-card__summary" data-chart-summary aria-live="polite"></p>
+          </div>
+          <figure class="chart-card__figure">
+            <svg
+              role="img"
+              aria-labelledby="${resolvedId}-title ${resolvedId}-description"
+              data-chart-svg
+              preserveAspectRatio="none"
+            ></svg>
+            <figcaption id="${resolvedId}-description" class="sr-only" data-chart-description>
+              ${escapeHtml(descriptionText)}
+            </figcaption>
+            <p class="chart-card__empty" data-chart-empty>No performance history available yet.</p>
+          </figure>
+          <details class="chart-card__details" data-chart-details>
+            <summary>View balance history table</summary>
+            <div class="table-wrapper">
+              <table class="compact">
+                <thead>
+                  <tr>
+                    <th scope="col">Date</th>
+                    <th scope="col">Balance</th>
+                    <th scope="col">Δ</th>
+                    <th scope="col">Δ%</th>
+                  </tr>
+                </thead>
+                <tbody data-chart-table-body></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      `;
+    };
+
+    const performanceCharts = (() => {
+      const SVG_NS = "http://www.w3.org/2000/svg";
+      const CHART_CACHE_TTL = 60_000;
+      const cache = new Map();
+      const pending = new Map();
+
+      const getKey = (scope, identifier) => (scope === "portfolio" ? "__portfolio__" : `account::${identifier}`);
+
+      const normaliseHistory = (history) => {
+        if (!Array.isArray(history)) {
+          return [];
+        }
+        return history
+          .map((entry) => {
+            const balance = Number(entry?.balance);
+            if (!Number.isFinite(balance)) {
+              return null;
+            }
+            const date = entry?.date ? String(entry.date) : null;
+            const timestamp = entry?.timestamp ? String(entry.timestamp) : null;
+            if (!date && !timestamp) {
+              return null;
+            }
+            return { date, timestamp, balance };
+          })
+          .filter(Boolean)
+          .sort((a, b) => {
+            const aValue = a.timestamp || a.date || "";
+            const bValue = b.timestamp || b.date || "";
+            const aTime = Date.parse(aValue);
+            const bTime = Date.parse(bValue);
+            if (!Number.isNaN(aTime) && !Number.isNaN(bTime)) {
+              return aTime - bTime;
+            }
+            return aValue.localeCompare(bValue);
+          });
+      };
+
+      const enrichHistory = (history) => history.map((entry, index) => {
+        const previous = index > 0 ? history[index - 1] : null;
+        let delta = null;
+        let pct = null;
+        if (previous) {
+          delta = entry.balance - previous.balance;
+          if (previous.balance !== 0) {
+            pct = delta / previous.balance;
+          }
+        }
+        return { ...entry, delta, pct };
+      });
+
+      const createSvgElement = (name, attributes = {}) => {
+        const element = document.createElementNS(SVG_NS, name);
+        Object.entries(attributes).forEach(([key, value]) => {
+          if (value !== undefined && value !== null && value !== "") {
+            element.setAttribute(key, value);
+          }
+        });
+        return element;
+      };
+
+      const formatHistoryDate = (entry, { short = false } = {}) => {
+        if (!entry) {
+          return "-";
+        }
+        const value = entry.timestamp || entry.date;
+        if (!value) {
+          return entry.date || "-";
+        }
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) {
+          return entry.date || value;
+        }
+        if (entry.timestamp) {
+          if (short) {
+            return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+          }
+          return parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+        }
+        if (short) {
+          return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+        }
+        return parsed.toLocaleDateString(undefined, { dateStyle: "medium" });
+      };
+
+      const getPayload = (scope, identifier) => {
+        const key = getKey(scope, identifier);
+        const cached = cache.get(key);
+        if (cached && Date.now() - cached.timestamp < CHART_CACHE_TTL) {
+          return Promise.resolve(cached.payload);
+        }
+        if (pending.has(key)) {
+          return pending.get(key);
+        }
+        const url = scope === "portfolio"
+          ? "/api/performance/portfolio"
+          : `/api/performance/accounts/${encodeURIComponent(identifier)}`;
+        const request = fetch(url, { credentials: "include" })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(`Performance request failed (${response.status})`);
+            }
+            return response.json();
+          })
+          .then((payload) => {
+            cache.set(key, { payload, timestamp: Date.now() });
+            return payload;
+          })
+          .finally(() => {
+            pending.delete(key);
+          });
+        pending.set(key, request);
+        return request;
+      };
+
+      const setState = (container, loading) => {
+        if (!container) {
+          return;
+        }
+        if (loading) {
+          container.setAttribute("data-loading", "true");
+          container.setAttribute("aria-busy", "true");
+        } else {
+          container.removeAttribute("data-loading");
+          container.removeAttribute("aria-busy");
+        }
+      };
+
+      const showError = (container, message) => {
+        if (!container) {
+          return;
+        }
+        container.classList.remove("chart-card--has-data");
+        container.classList.add("chart-card--empty", "chart-card--error");
+        const svg = container.querySelector("[data-chart-svg]");
+        if (svg) {
+          svg.replaceChildren();
+          svg.setAttribute("aria-hidden", "true");
+        }
+        const emptyEl = container.querySelector("[data-chart-empty]");
+        if (emptyEl) {
+          emptyEl.textContent = message;
+          emptyEl.hidden = false;
+        }
+        const summaryEl = container.querySelector("[data-chart-summary]");
+        if (summaryEl) {
+          summaryEl.textContent = message;
+          summaryEl.classList.remove("gain", "loss");
+        }
+        const tableBody = container.querySelector("[data-chart-table-body]");
+        if (tableBody) {
+          tableBody.innerHTML = `<tr><td colspan="4">${escapeHtml(message)}</td></tr>`;
+        }
+      };
+
+      const renderLineChart = (svg, history) => {
+        if (!svg) {
+          return;
+        }
+        svg.replaceChildren();
+        const width = 640;
+        const height = 220;
+        const padding = { top: 20, right: 18, bottom: 32, left: 60 };
+        const chartWidth = width - padding.left - padding.right;
+        const chartHeight = height - padding.top - padding.bottom;
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.setAttribute("aria-hidden", "false");
+
+        const timestamps = history.map((entry, index) => {
+          const raw = entry.timestamp || entry.date;
+          const parsed = raw ? Date.parse(raw) : NaN;
+          if (Number.isNaN(parsed)) {
+            return history.length === 1 ? index : null;
+          }
+          return parsed;
+        });
+        const validTimes = timestamps.filter((value) => value !== null);
+        const minTime = validTimes.length ? Math.min(...validTimes) : 0;
+        const maxTime = validTimes.length ? Math.max(...validTimes) : minTime + history.length;
+        const balances = history.map((entry) => entry.balance);
+        const minBalance = Math.min(...balances);
+        const maxBalance = Math.max(...balances);
+        const paddingY = (maxBalance - minBalance) * 0.1 || Math.abs(maxBalance || 1) * 0.1;
+        const yMin = minBalance - paddingY;
+        const yMax = maxBalance + paddingY;
+        const xRange = maxTime - minTime || 1;
+        const yRange = yMax - yMin || 1;
+
+        const points = history.map((entry, index) => {
+          const raw = entry.timestamp || entry.date;
+          const parsed = raw ? Date.parse(raw) : NaN;
+          const ratioX = Number.isNaN(parsed)
+            ? (history.length === 1 ? 0.5 : index / Math.max(history.length - 1, 1))
+            : (parsed - minTime) / xRange;
+          const clampedRatioX = Math.max(0, Math.min(1, ratioX));
+          const ratioY = (entry.balance - yMin) / yRange;
+          const x = padding.left + clampedRatioX * chartWidth;
+          const y = padding.top + (1 - Math.max(0, Math.min(1, ratioY))) * chartHeight;
+          return { x, y };
+        });
+
+        const gridGroup = createSvgElement("g", { stroke: "rgba(148, 163, 184, 0.2)", "stroke-width": "1" });
+        const labelGroup = createSvgElement("g", { fill: "var(--muted)", "font-size": "10" });
+
+        const ySteps = 4;
+        for (let i = 0; i <= ySteps; i += 1) {
+          const ratio = i / ySteps;
+          const y = padding.top + ratio * chartHeight;
+          const value = yMax - ratio * (yMax - yMin);
+          const line = createSvgElement("line", {
+            x1: padding.left,
+            x2: padding.left + chartWidth,
+            y1: y,
+            y2: y,
+            "stroke-dasharray": "4 4",
+          });
+          gridGroup.appendChild(line);
+          const label = createSvgElement("text", {
+            x: padding.left - 8,
+            y: y + 4,
+            "text-anchor": "end",
+          });
+          label.textContent = formatCurrency(value);
+          labelGroup.appendChild(label);
+        }
+
+        const axis = createSvgElement("line", {
+          x1: padding.left,
+          x2: padding.left + chartWidth,
+          y1: padding.top + chartHeight,
+          y2: padding.top + chartHeight,
+          stroke: "rgba(148, 163, 184, 0.3)",
+        });
+        gridGroup.appendChild(axis);
+        svg.appendChild(gridGroup);
+
+        const pathData = points
+          .map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+          .join(" ");
+        const areaPath = `${pathData} L${points[points.length - 1].x.toFixed(2)} ${padding.top + chartHeight} L${points[0].x.toFixed(2)} ${padding.top + chartHeight} Z`;
+        const area = createSvgElement("path", {
+          d: areaPath,
+          fill: "rgba(56, 189, 248, 0.15)",
+        });
+        svg.appendChild(area);
+
+        const line = createSvgElement("path", {
+          d: pathData,
+          fill: "none",
+          stroke: "var(--accent)",
+          "stroke-width": "2.5",
+          "stroke-linecap": "round",
+          "stroke-linejoin": "round",
+        });
+        svg.appendChild(line);
+
+        const finalPoint = points[points.length - 1];
+        const marker = createSvgElement("circle", {
+          cx: finalPoint.x,
+          cy: finalPoint.y,
+          r: 4,
+          fill: "var(--accent)",
+          stroke: "#0f172a",
+          "stroke-width": 1.5,
+        });
+        svg.appendChild(marker);
+
+        const xLabels = [];
+        if (history.length >= 1) {
+          xLabels.push({ entry: history[0], point: points[0], anchor: "start" });
+        }
+        if (history.length >= 3) {
+          const middleIndex = Math.floor(history.length / 2);
+          xLabels.push({ entry: history[middleIndex], point: points[middleIndex], anchor: "middle" });
+        }
+        if (history.length >= 2) {
+          xLabels.push({ entry: history[history.length - 1], point: points[points.length - 1], anchor: "end" });
+        }
+        xLabels.forEach(({ entry, point, anchor }) => {
+          const label = createSvgElement("text", {
+            x: point.x,
+            y: padding.top + chartHeight + 20,
+            "text-anchor": anchor,
+          });
+          label.textContent = formatHistoryDate(entry, { short: true });
+          labelGroup.appendChild(label);
+        });
+        svg.appendChild(labelGroup);
+      };
+
+      const renderTable = (tableBody, history) => {
+        if (!tableBody) {
+          return;
+        }
+        if (!history.length) {
+          tableBody.innerHTML = '<tr><td colspan="4">No history available.</td></tr>';
+          return;
+        }
+        const rows = history
+          .map((entry) => {
+            const deltaClass = entry.delta === null ? "" : entry.delta >= 0 ? "gain" : "loss";
+            const pctClass = entry.pct === null ? "" : entry.pct >= 0 ? "gain" : "loss";
+            const deltaText = entry.delta === null ? "-" : formatCurrencyDelta(entry.delta);
+            const pctText = entry.pct === null ? "-" : formatSignedPct(entry.pct);
+            return `
+              <tr>
+                <td>${escapeHtml(formatHistoryDate(entry))}</td>
+                <td>${escapeHtml(formatCurrency(entry.balance))}</td>
+                <td class="${deltaClass}">${escapeHtml(deltaText)}</td>
+                <td class="${pctClass}">${escapeHtml(pctText)}</td>
+              </tr>
+            `;
+          })
+          .join("");
+        tableBody.innerHTML = rows;
+      };
+
+      const renderSummary = (summaryEl, history) => {
+        if (!summaryEl) {
+          return;
+        }
+        summaryEl.classList.remove("gain", "loss");
+        if (!history.length) {
+          summaryEl.textContent = "No performance data yet.";
+          return;
+        }
+        const latest = history[history.length - 1];
+        const latestText = formatCurrency(latest.balance);
+        if (latest.delta === null) {
+          summaryEl.textContent = `${latestText} latest`;
+          return;
+        }
+        const deltaClass = latest.delta >= 0 ? "gain" : "loss";
+        const deltaText = formatCurrencyDelta(latest.delta);
+        summaryEl.innerHTML = `
+          <span>${escapeHtml(latestText)}</span>
+          <span class="${deltaClass}">${escapeHtml(deltaText)}${latest.pct === null ? "" : ` (${escapeHtml(formatSignedPct(latest.pct))})`}</span>
+        `;
+        summaryEl.classList.add(deltaClass);
+      };
+
+      const updateDescription = (descriptionEl, payload, history) => {
+        if (!descriptionEl) {
+          return;
+        }
+        if (!history.length) {
+          descriptionEl.textContent = payload?.scope === "account"
+            ? `No balance history available for ${payload?.account || "this account"}.`
+            : "No portfolio balance history available yet.";
+          return;
+        }
+        const first = history[0];
+        const last = history[history.length - 1];
+        const startLabel = formatHistoryDate(first);
+        const endLabel = formatHistoryDate(last);
+        if (payload?.scope === "account") {
+          const name = payload?.account || "this account";
+          descriptionEl.textContent = `Balance history for ${name} from ${startLabel} to ${endLabel}.`;
+        } else {
+          descriptionEl.textContent = `Portfolio balance history from ${startLabel} to ${endLabel}.`;
+        }
+      };
+
+      const renderChart = (container, scope, identifier, payload) => {
+        if (!container) {
+          return;
+        }
+        container.classList.remove("chart-card--error");
+        const svg = container.querySelector("[data-chart-svg]");
+        const emptyEl = container.querySelector("[data-chart-empty]");
+        const tableBody = container.querySelector("[data-chart-table-body]");
+        const summaryEl = container.querySelector("[data-chart-summary]");
+        const descriptionEl = container.querySelector("[data-chart-description]");
+        const detailsEl = container.querySelector("[data-chart-details]");
+
+        const history = enrichHistory(normaliseHistory(payload?.history));
+
+        if (!history.length) {
+          container.classList.add("chart-card--empty");
+          container.classList.remove("chart-card--has-data");
+          if (svg) {
+            svg.replaceChildren();
+            svg.setAttribute("aria-hidden", "true");
+          }
+          if (emptyEl) {
+            emptyEl.hidden = false;
+            emptyEl.textContent = "No performance history available yet.";
+          }
+          if (tableBody) {
+            tableBody.innerHTML = '<tr><td colspan="4">No history available.</td></tr>';
+          }
+          if (summaryEl) {
+            summaryEl.textContent = "No performance data yet.";
+            summaryEl.classList.remove("gain", "loss");
+          }
+          updateDescription(descriptionEl, payload, history);
+          if (detailsEl) {
+            detailsEl.open = false;
+          }
+          return;
+        }
+
+        container.classList.add("chart-card--has-data");
+        container.classList.remove("chart-card--empty");
+        if (emptyEl) {
+          emptyEl.hidden = true;
+        }
+        renderLineChart(svg, history);
+        renderTable(tableBody, history);
+        renderSummary(summaryEl, history);
+        updateDescription(descriptionEl, payload, history);
+        if (detailsEl) {
+          detailsEl.hidden = false;
+        }
+      };
+
+      const refreshPortfolio = async () => {
+        const container = document.querySelector('[data-performance-chart="portfolio"]');
+        if (!container) {
+          return;
+        }
+        setState(container, true);
+        try {
+          const payload = await getPayload("portfolio", "__portfolio__");
+          renderChart(container, "portfolio", "__portfolio__", payload);
+        } catch (error) {
+          console.error("Failed to load portfolio performance", error);
+          showError(container, "Failed to load performance history.");
+        } finally {
+          setState(container, false);
+        }
+      };
+
+      const refreshAccounts = async (accounts) => {
+        if (!Array.isArray(accounts) || !accounts.length) {
+          return;
+        }
+        const containers = new Map();
+        document.querySelectorAll('[data-performance-chart="account"]').forEach((node) => {
+          if (node instanceof HTMLElement) {
+            const name = node.dataset.accountName;
+            if (name) {
+              containers.set(name, node);
+            }
+          }
+        });
+        const tasks = accounts
+          .map((account) => {
+            const container = containers.get(account.name);
+            if (!container) {
+              return null;
+            }
+            setState(container, true);
+            return getPayload("account", account.name)
+              .then((payload) => {
+                renderChart(container, "account", account.name, payload);
+              })
+              .catch((error) => {
+                console.error(`Failed to load performance for ${account.name}`, error);
+                showError(container, "Failed to load performance history.");
+              })
+              .finally(() => {
+                setState(container, false);
+              });
+          })
+          .filter(Boolean);
+        await Promise.allSettled(tasks);
+      };
+
+      return { refreshPortfolio, refreshAccounts };
+    })();
 
     const updateAccountsSummary = (meta, visibleCount) => {
       if (!accountsSummaryEl) {
@@ -1194,6 +2026,11 @@
           isFiniteNumber(portfolio.volatility?.[window]) ||
           isFiniteNumber(portfolio.funding_rates?.[window]),
       );
+      const performanceMetrics = renderPerformanceMetrics(portfolio.performance || null);
+      const chartBlock = renderPerformanceChartShell("portfolio", {
+        chartId: "portfolio-balance",
+        description: "Daily portfolio balance history.",
+      });
       const metricsTable = hasPortfolioMetrics
         ? `
           <div class="table-wrapper" style="margin-top: 1.5rem;">
@@ -1274,9 +2111,12 @@
             <span class="subvalue ${Number(portfolio.net_exposure_pct) >= 0 ? "gain" : "loss"}">${formatPct(portfolio.net_exposure_pct)}</span>
           </div>
         </div>
+        ${performanceMetrics}
+        ${chartBlock}
         ${metricsTable}
         ${exposuresTable}
       `;
+      performanceCharts.refreshPortfolio();
     };
 
     const renderAccounts = (snapshot) => {
@@ -1491,40 +2331,11 @@
               : "";
 
           const accountPerformance = account.performance || null;
-          let performanceBlock = "";
-          if (accountPerformance) {
-            const daily = accountPerformance.daily;
-            const dailyClass = daily !== null && daily !== undefined ? (Number(daily) >= 0 ? "gain" : "loss") : "";
-            const dailyValue = daily !== null && daily !== undefined ? formatCurrency(daily) : "-";
-            const dailySince = accountPerformance.since?.daily ? `Since ${accountPerformance.since.daily}` : "&nbsp;";
-            const weekly = accountPerformance.weekly;
-            const weeklyClass = weekly !== null && weekly !== undefined ? (Number(weekly) >= 0 ? "gain" : "loss") : "";
-            const weeklyValue = weekly !== null && weekly !== undefined ? formatCurrency(weekly) : "-";
-            const weeklySince = accountPerformance.since?.weekly ? `Since ${accountPerformance.since.weekly}` : "&nbsp;";
-            const monthly = accountPerformance.monthly;
-            const monthlyClass = monthly !== null && monthly !== undefined ? (Number(monthly) >= 0 ? "gain" : "loss") : "";
-            const monthlyValue = monthly !== null && monthly !== undefined ? formatCurrency(monthly) : "-";
-            const monthlySince = accountPerformance.since?.monthly ? `Since ${accountPerformance.since.monthly}` : "&nbsp;";
-            performanceBlock = `
-              <div class="metrics" style="margin-top: 1.5rem;">
-                <div class="metric">
-                  <span class="label">Daily PnL (4pm)</span>
-                  <span class="value ${dailyClass}">${dailyValue}</span>
-                  <span class="subvalue">${dailySince}</span>
-                </div>
-                <div class="metric">
-                  <span class="label">Weekly PnL</span>
-                  <span class="value ${weeklyClass}">${weeklyValue}</span>
-                  <span class="subvalue">${weeklySince}</span>
-                </div>
-                <div class="metric">
-                  <span class="label">Monthly PnL</span>
-                  <span class="value ${monthlyClass}">${monthlyValue}</span>
-                  <span class="subvalue">${monthlySince}</span>
-                </div>
-              </div>
-            `;
-          }
+          const performanceMetricsBlock = renderPerformanceMetrics(accountPerformance);
+          const chartBlock = renderPerformanceChartShell("account", {
+            accountName: account.name,
+            description: `Balance history for ${account.name}.`,
+          });
 
           const stopLoss = account.stop_loss;
           let stopLossBlock = "";
@@ -1582,17 +2393,18 @@
                   <span class="value ${Number(account.net_exposure_notional) >= 0 ? "gain" : "loss"}">${formatCurrency(account.net_exposure_notional)}</span>
                   <span class="subvalue ${Number(account.net_exposure) >= 0 ? "gain" : "loss"}">${formatPct(account.net_exposure)}</span>
                 </div>
-                <div class="metric">
-                  <span class="label">Unrealized PnL</span>
-                  <span class="value ${Number(account.unrealized_pnl) >= 0 ? "gain" : "loss"}">${formatCurrency(account.unrealized_pnl)}</span>
-                </div>
+              <div class="metric">
+                <span class="label">Unrealized PnL</span>
+                <span class="value ${Number(account.unrealized_pnl) >= 0 ? "gain" : "loss"}">${formatCurrency(account.unrealized_pnl)}</span>
               </div>
-              ${performanceBlock}
-              ${stopLossBlock}
-              ${accountMetricsTable}
-              ${exposuresTable}
-              <div class="report-actions" style="margin: 1.5rem 0;">
-                <button type="button" class="button secondary" data-generate-report="${account.name}">Generate report</button>
+            </div>
+            ${performanceMetricsBlock}
+            ${chartBlock}
+            ${stopLossBlock}
+            ${accountMetricsTable}
+            ${exposuresTable}
+            <div class="report-actions" style="margin: 1.5rem 0;">
+              <button type="button" class="button secondary" data-generate-report="${account.name}">Generate report</button>
                 <div class="status-message" data-report-status="${account.name}" hidden></div>
               </div>
               ${positionsTable}
@@ -1601,6 +2413,8 @@
           `;
         })
         .join("");
+
+      performanceCharts.refreshAccounts(accountsData);
 
       const meta = snapshot.accounts_meta || {};
       lastAccountsMeta = meta;

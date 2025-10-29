@@ -54,6 +54,7 @@ class StubFetcher:
         *,
         kill_switch_responses: Optional[List[dict]] = None,
         order_types: Optional[Sequence[str]] = None,
+        performance_history: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.snapshot = snapshot
         self.closed = False
@@ -67,6 +68,17 @@ class StubFetcher:
         self.account_stop_losses: Dict[str, Dict[str, Any]] = {}
         self.cancel_all_orders_calls: List[Tuple[str, Optional[str]]] = []
         self.close_all_positions_calls: List[Tuple[str, Optional[str]]] = []
+        history = performance_history or {}
+        portfolio_history = history.get("portfolio", []) if isinstance(history, Mapping) else []
+        accounts_history = history.get("accounts", {}) if isinstance(history, Mapping) else {}
+        self.performance_history: Dict[str, Any] = {
+            "portfolio": [dict(item) for item in portfolio_history if isinstance(item, Mapping)],
+            "accounts": {
+                str(name): [dict(entry) for entry in entries if isinstance(entry, Mapping)]
+                for name, entries in accounts_history.items()
+                if isinstance(entries, Sequence)
+            },
+        }
 
 
     async def fetch_snapshot(self) -> dict:
@@ -177,6 +189,48 @@ class StubFetcher:
         self.close_all_positions_calls.append((account_name, symbol))
         return {"closed_positions": [], "failed_position_closures": []}
 
+    def get_performance_history(self, account_name: Optional[str] = None) -> Dict[str, Any]:
+        def _build_payload(scope: str, entries: Sequence[Mapping[str, Any]], account: Optional[str] = None) -> Dict[str, Any]:
+            normalised: List[Dict[str, Any]] = []
+            for entry in entries:
+                date_value = entry.get("date")
+                if date_value is None:
+                    continue
+                try:
+                    balance = float(entry.get("balance", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                normalised.append(
+                    {
+                        "date": str(date_value),
+                        "balance": balance,
+                        "timestamp": entry.get("timestamp"),
+                    }
+                )
+            normalised.sort(key=lambda item: item["date"])
+            payload: Dict[str, Any] = {
+                "scope": scope,
+                "history": normalised,
+                "count": len(normalised),
+            }
+            if normalised:
+                payload["latest_balance"] = normalised[-1]["balance"]
+                payload["range"] = {
+                    "from": normalised[0]["date"],
+                    "to": normalised[-1]["date"],
+                }
+            if account is not None:
+                payload["account"] = account
+            return payload
+
+        if account_name is None:
+            portfolio_entries = self.performance_history.get("portfolio", [])
+            return _build_payload("portfolio", portfolio_entries)
+
+        accounts = self.performance_history.get("accounts", {})
+        account_entries = accounts.get(str(account_name), []) if isinstance(accounts, Mapping) else []
+        return _build_payload("account", account_entries, str(account_name))
+
 
 @pytest.fixture
 def sample_snapshot() -> dict:
@@ -241,8 +295,13 @@ def create_test_app(
     auth_manager: AuthManager,
     *,
     kill_switch_responses: Optional[List[dict]] = None,
+    performance_history: Optional[Mapping[str, Any]] = None,
 ) -> tuple[TestClient, StubFetcher]:
-    fetcher = StubFetcher(snapshot, kill_switch_responses=kill_switch_responses)
+    fetcher = StubFetcher(
+        snapshot,
+        kill_switch_responses=kill_switch_responses,
+        performance_history=performance_history,
+    )
     service = RiskDashboardService(fetcher)  # type: ignore[arg-type]
     config = RealtimeConfig(accounts=[AccountConfig(name="Demo", exchange="binance", credentials={})])
     app = create_app(config, service=service, auth_manager=auth_manager)
@@ -387,6 +446,53 @@ def test_kill_switch_endpoint(sample_snapshot: dict, auth_manager: AuthManager) 
         assert payload["success"] is True
         assert payload["results"] == kill_response
         assert fetcher.kill_requests[-1] == ("Demo Account", None)
+
+
+def test_performance_history_endpoints(sample_snapshot: dict, auth_manager: AuthManager) -> None:
+    history = {
+        "portfolio": [
+            {"date": "2024-03-01", "balance": 10_000.0, "timestamp": "2024-03-01T20:05:00Z"},
+            {"date": "2024-03-02", "balance": 10_750.0, "timestamp": "2024-03-02T20:05:00Z"},
+        ],
+        "accounts": {
+            "Demo Account": [
+                {"date": "2024-03-01", "balance": 5_000.0, "timestamp": "2024-03-01T20:05:00Z"},
+                {"date": "2024-03-02", "balance": 5_400.0, "timestamp": "2024-03-02T20:05:00Z"},
+            ]
+        },
+    }
+    client, _ = create_test_app(
+        sample_snapshot,
+        auth_manager,
+        performance_history=history,
+    )
+    with client:
+        login_response = client.post(
+            "/login",
+            data={"username": "admin", "password": "admin123"},
+            allow_redirects=False,
+        )
+        assert login_response.status_code in {302, 303, 307}
+
+        portfolio_response = client.get("/api/performance/portfolio")
+        assert portfolio_response.status_code == 200
+        portfolio_payload = portfolio_response.json()
+        assert portfolio_payload["scope"] == "portfolio"
+        assert portfolio_payload["count"] == 2
+        assert portfolio_payload["history"][0]["date"] == "2024-03-01"
+
+        account_response = client.get("/api/performance/accounts/Demo%20Account")
+        assert account_response.status_code == 200
+        account_payload = account_response.json()
+        assert account_payload["account"] == "Demo Account"
+        assert account_payload["count"] == 2
+        assert account_payload["history"][-1]["balance"] == 5_400.0
+
+        missing_account_response = client.get("/api/performance/accounts/Unknown")
+        assert missing_account_response.status_code == 200
+        missing_payload = missing_account_response.json()
+        assert missing_payload["history"] == []
+        assert missing_payload["count"] == 0
 
 
 def test_trading_panel_page(sample_snapshot: dict, auth_manager: AuthManager) -> None:

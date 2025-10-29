@@ -74,6 +74,27 @@ class PerformanceTracker:
     # ------------------------------------------------------------------
     # internal helpers
 
+    def get_history(self, account_name: Optional[str] = None) -> Dict[str, object]:
+        """Return persisted balance history for the requested scope."""
+
+        with self._lock:
+            data = self._load()
+
+        if account_name is None:
+            entries = self._normalise_history_entries(data.get("portfolio"))
+            return self._build_history_payload("portfolio", entries)
+
+        accounts = data.get("accounts")
+        history: Iterable[Mapping[str, object]]
+        if isinstance(accounts, Mapping):
+            history = accounts.get(str(account_name), [])
+        else:
+            history = []
+        entries = self._normalise_history_entries(history)
+        payload = self._build_history_payload("account", entries)
+        payload["account"] = str(account_name)
+        return payload
+
     def _normalise_timestamp(self, value: Optional[datetime]) -> datetime:
         if value is None:
             value = datetime.now(timezone.utc)
@@ -250,4 +271,40 @@ class PerformanceTracker:
                 if candidate is None or entry_date > date.fromisoformat(str(candidate["date"])):
                     candidate = entry
         return candidate
+
+    def _normalise_history_entries(
+        self, history: Optional[Iterable[Mapping[str, object]]]
+    ) -> list[dict[str, object]]:
+        if history is None:
+            return []
+        normalised: list[dict[str, object]] = []
+        for entry in history:
+            if not isinstance(entry, Mapping):
+                continue
+            date_value = entry.get("date")
+            balance_value = entry.get("balance")
+            if date_value is None:
+                continue
+            try:
+                balance = float(balance_value)
+            except (TypeError, ValueError):
+                continue
+            normalised.append(
+                {
+                    "date": str(date_value),
+                    "balance": balance,
+                    "timestamp": entry.get("timestamp"),
+                }
+            )
+        normalised.sort(key=lambda item: item["date"])
+        return normalised
+
+    def _build_history_payload(
+        self, scope: str, entries: list[dict[str, object]]
+    ) -> Dict[str, object]:
+        payload: Dict[str, object] = {"scope": scope, "history": entries, "count": len(entries)}
+        if entries:
+            payload["latest_balance"] = entries[-1]["balance"]
+            payload["range"] = {"from": entries[0]["date"], "to": entries[-1]["date"]}
+        return payload
 

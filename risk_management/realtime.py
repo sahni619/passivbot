@@ -312,6 +312,9 @@ class RealtimeDataFetcher:
         self._portfolio_stop_loss = state
         return dict(state)
 
+    def get_performance_history(self, account_name: Optional[str] = None) -> Dict[str, object]:
+        return self._performance_tracker.get_history(account_name=account_name)
+
     async def clear_portfolio_stop_loss(self) -> None:
         self._portfolio_stop_loss = None
 

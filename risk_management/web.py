@@ -144,6 +144,9 @@ class RiskDashboardService:
     ) -> Mapping[str, Any]:
         return await self._fetcher.close_all_positions(account_name, symbol)
 
+    def get_performance_history(self, account_name: Optional[str] = None) -> Dict[str, object]:
+        return self._fetcher.get_performance_history(account_name)
+
 
 def _parse_positive_int(value: Optional[str], name: str, *, maximum: Optional[int] = None) -> Optional[int]:
     if value is None or value == "":
@@ -474,6 +477,23 @@ def create_app(
             sort_order=sort_order_param,
         )
         return JSONResponse(view_model)
+
+    @app.get("/api/performance/portfolio", response_class=JSONResponse)
+    async def api_performance_portfolio(
+        service: RiskDashboardService = Depends(get_service),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        payload = service.get_performance_history()
+        return JSONResponse(payload)
+
+    @app.get("/api/performance/accounts/{account_name}", response_class=JSONResponse)
+    async def api_performance_account(
+        account_name: str,
+        service: RiskDashboardService = Depends(get_service),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        payload = service.get_performance_history(account_name)
+        return JSONResponse(payload)
 
     @app.get(
         "/api/trading/accounts/{account_name}/order-types",

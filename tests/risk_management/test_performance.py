@@ -51,3 +51,35 @@ def test_performance_tracker_handles_missing_history(tmp_path: Path) -> None:
     )
     assert summary["portfolio"]["daily"] is None
     assert summary["accounts"]["Demo"]["weekly"] is None
+
+
+def test_performance_tracker_exposes_history(tmp_path: Path) -> None:
+    tracker = PerformanceTracker(tmp_path)
+
+    tracker.record(
+        generated_at=datetime(2024, 3, 1, 21, 0, tzinfo=timezone.utc),
+        portfolio_balance=10_000.0,
+        account_balances={"Alpha": 6_000.0, "Beta": 4_000.0},
+    )
+    tracker.record(
+        generated_at=datetime(2024, 3, 2, 21, 0, tzinfo=timezone.utc),
+        portfolio_balance=10_800.0,
+        account_balances={"Alpha": 6_500.0, "Beta": 4_300.0},
+    )
+
+    portfolio_history = tracker.get_history()
+    assert portfolio_history["scope"] == "portfolio"
+    assert portfolio_history["count"] == 2
+    assert portfolio_history["history"][0]["date"] == "2024-03-01"
+    assert portfolio_history["history"][-1]["balance"] == pytest.approx(10_800.0)
+    assert portfolio_history["range"] == {"from": "2024-03-01", "to": "2024-03-02"}
+
+    alpha_history = tracker.get_history("Alpha")
+    assert alpha_history["account"] == "Alpha"
+    assert alpha_history["count"] == 2
+    assert alpha_history["history"][0]["balance"] == pytest.approx(6_000.0)
+
+    missing_history = tracker.get_history("Gamma")
+    assert missing_history["account"] == "Gamma"
+    assert missing_history["history"] == []
+    assert missing_history["count"] == 0
