@@ -261,6 +261,19 @@
             <button type="button" class="chip" data-hide-empty="orders">Hide empty orders</button>
           </div>
         </div>
+        <div class="accounts-controls__row accounts-controls__row--filters">
+          <div
+            class="active-filters"
+            data-active-filters
+            role="status"
+            aria-live="polite"
+          >
+            <span class="active-filters__empty">No filters applied.</span>
+          </div>
+          <button type="button" class="button ghost" data-accounts-reset>
+            Reset filters
+          </button>
+        </div>
         <div class="accounts-sort" role="group" aria-label="Sort accounts">
           <button type="button" class="accounts-sort__button" data-sort-key="name">
             Account
@@ -606,10 +619,54 @@
           </section>
         {% endfor %}
       </div>
-      <div class="pagination" data-accounts-pagination>
-        <button type="button" data-page="prev" {% if not accounts_meta.has_previous %}disabled{% endif %}>Previous</button>
-        <span>Page {{ current_page }} of {{ total_pages }}</span>
-        <button type="button" data-page="next" {% if not accounts_meta.has_next %}disabled{% endif %}>Next</button>
+      {% set total_pages_display = total_pages if total_pages > 0 else 1 %}
+      <div class="pagination" data-accounts-pagination aria-live="polite">
+        <button
+          type="button"
+          data-page="first"
+          {% if current_page == 1 %}disabled{% endif %}
+          aria-label="Go to first page"
+        >
+          First
+        </button>
+        <button
+          type="button"
+          data-page="prev"
+          {% if not accounts_meta.has_previous %}disabled{% endif %}
+          aria-label="Go to previous page"
+        >
+          Previous
+        </button>
+        <label class="pagination__label">
+          <span class="visually-hidden">Current page</span>
+          <input
+            type="number"
+            class="pagination__input"
+            data-page-input
+            min="1"
+            value="{{ current_page }}"
+            max="{{ total_pages_display }}"
+          />
+        </label>
+        <span class="pagination__details">
+          of <span data-total-pages>{{ total_pages_display }}</span>
+        </span>
+        <button
+          type="button"
+          data-page="next"
+          {% if not accounts_meta.has_next %}disabled{% endif %}
+          aria-label="Go to next page"
+        >
+          Next
+        </button>
+        <button
+          type="button"
+          data-page="last"
+          {% if current_page == total_pages_display %}disabled{% endif %}
+          aria-label="Go to last page"
+        >
+          Last
+        </button>
       </div>
     </div>
 
@@ -867,7 +924,15 @@
       unrealized: "Unrealized PnL",
       daily_realized: "Daily realised PnL",
     };
-    const DEFAULT_ACCOUNTS_STATE = {
+    const EXPOSURE_LABELS = {
+      any: "All accounts",
+      gross: "With gross exposure",
+      net_long: "Net long",
+      net_short: "Net short",
+      flat: "Flat",
+    };
+
+    const createDefaultAccountsState = () => ({
       search: "",
       exposure: "any",
       hideEmpty: {
@@ -879,12 +944,13 @@
       sortOrder: DEFAULT_SORT_ORDER,
       page: 1,
       pageSize: 25,
-    };
+    });
+    const DEFAULT_ACCOUNTS_STATE = createDefaultAccountsState();
 
     const loadPersistedState = () => {
       const baseState = {
         activePage: DEFAULT_PAGE,
-        accounts: { ...DEFAULT_ACCOUNTS_STATE },
+        accounts: { ...createDefaultAccountsState() },
       };
       try {
         const stored = window.localStorage.getItem(STORAGE_KEY);
@@ -906,14 +972,19 @@
         if (parsed && typeof parsed === "object") {
           const activePage = typeof parsed.activePage === "string" ? parsed.activePage : baseState.activePage;
           const accountsState = parsed.accounts && typeof parsed.accounts === "object" ? parsed.accounts : {};
+          const defaults = createDefaultAccountsState();
+          const parsedHideEmpty =
+            accountsState.hideEmpty && typeof accountsState.hideEmpty === "object"
+              ? accountsState.hideEmpty
+              : {};
           return {
             activePage,
             accounts: {
-              ...DEFAULT_ACCOUNTS_STATE,
+              ...defaults,
               ...accountsState,
               hideEmpty: {
-                ...DEFAULT_ACCOUNTS_STATE.hideEmpty,
-                ...(accountsState.hideEmpty || {}),
+                ...defaults.hideEmpty,
+                ...parsedHideEmpty,
               },
             },
           };
@@ -947,6 +1018,26 @@
     const sortButtons = accountsControlsElement
       ? Array.from(accountsControlsElement.querySelectorAll("[data-sort-key]"))
       : [];
+    const activeFiltersContainer = accountsControlsElement
+      ? accountsControlsElement.querySelector("[data-active-filters]")
+      : null;
+    const resetFiltersButton = accountsControlsElement
+      ? accountsControlsElement.querySelector("[data-accounts-reset]")
+      : null;
+
+    const escapeHtml = (value) => {
+      if (typeof value !== "string") {
+        return "";
+      }
+      const replacements = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+      return value.replace(/[&<>"']/g, (char) => replacements[char] || char);
+    };
 
     const persistState = () => {
       try {
@@ -1019,6 +1110,75 @@
       });
     };
 
+    const renderActiveFilters = () => {
+      if (!activeFiltersContainer) {
+        return;
+      }
+      const accountsState = state.accounts || {};
+      const filters = [];
+
+      if (accountsState.search) {
+        const searchLabel = accountsState.search.trim();
+        if (searchLabel) {
+          filters.push({ type: "search", label: `Search: "${searchLabel}"` });
+        }
+      }
+
+      if (accountsState.exposure && accountsState.exposure !== "any") {
+        const exposureLabel = EXPOSURE_LABELS[accountsState.exposure] || accountsState.exposure;
+        filters.push({ type: "exposure", label: `Exposure: ${exposureLabel}` });
+      }
+
+      const hideEmptyState = accountsState.hideEmpty || {};
+      const hideEmptyLabels = {
+        exposures: "Hide empty exposures",
+        positions: "Hide empty positions",
+        orders: "Hide empty orders",
+      };
+      Object.entries(hideEmptyState).forEach(([key, enabled]) => {
+        if (!enabled) {
+          return;
+        }
+        const label = hideEmptyLabels[key] || `Hide empty ${key}`;
+        filters.push({ type: "hideEmpty", label, value: key });
+      });
+
+      const sortKey = accountsState.sortKey || DEFAULT_SORT_KEY;
+      const sortOrder = (accountsState.sortOrder || DEFAULT_SORT_ORDER).toLowerCase();
+      if (sortKey !== DEFAULT_SORT_KEY || sortOrder !== DEFAULT_SORT_ORDER) {
+        const sortLabel = SORT_LABELS[sortKey] || SORT_LABELS[DEFAULT_SORT_KEY];
+        const directionLabel = sortOrder === "asc" ? "ascending" : "descending";
+        filters.push({ type: "sort", label: `Sort: ${sortLabel} (${directionLabel})` });
+      }
+
+      const pageSize = Number(accountsState.pageSize || DEFAULT_ACCOUNTS_STATE.pageSize);
+      if (pageSize !== DEFAULT_ACCOUNTS_STATE.pageSize) {
+        filters.push({ type: "pageSize", label: `Page size: ${pageSize}` });
+      }
+
+      if (filters.length === 0) {
+        activeFiltersContainer.innerHTML = '<span class="active-filters__empty">No filters applied.</span>';
+        activeFiltersContainer.dataset.hasFilters = "false";
+        return;
+      }
+
+      const chipsHtml = filters
+        .map((filter) => {
+          const label = escapeHtml(filter.label);
+          const keyAttr = filter.value ? ` data-filter-key="${filter.value}"` : "";
+          return `
+            <button type="button" class="chip active-filters__chip" data-clear-filter="${filter.type}"${keyAttr}>
+              ${label}
+              <span aria-hidden="true">×</span>
+              <span class="visually-hidden">Remove filter</span>
+            </button>
+          `.trim();
+        })
+        .join("");
+      activeFiltersContainer.innerHTML = chipsHtml;
+      activeFiltersContainer.dataset.hasFilters = "true";
+    };
+
     const applyAccountsControlsFromState = () => {
       if (searchInput && searchInput.value !== state.accounts.search) {
         searchInput.value = state.accounts.search;
@@ -1037,8 +1197,8 @@
       }
       updateHideEmptyChips();
       updateSortButtons();
+      renderActiveFilters();
     };
-
     applyAccountsControlsFromState();
 
     const formatCurrency = (value) => {
@@ -1712,12 +1872,19 @@
       }
       const page = Number(meta?.page ?? state.accounts.page ?? 1);
       const pages = Math.max(1, Number(meta?.pages ?? 1));
-      const hasPrev = Boolean(meta?.has_previous ?? page > 1);
-      const hasNext = Boolean(meta?.has_next ?? page < pages);
+      const hasPrev = page > 1;
+      const hasNext = page < pages;
+      const maxAttr = pages > 0 ? pages : 1;
       paginationContainer.innerHTML = `
-        <button type="button" data-page="prev"${hasPrev ? "" : " disabled"}>Previous</button>
-        <span>Page ${page} of ${pages}</span>
-        <button type="button" data-page="next"${hasNext ? "" : " disabled"}>Next</button>
+        <button type="button" data-page="first" aria-label="Go to first page"${page <= 1 ? " disabled" : ""}>First</button>
+        <button type="button" data-page="prev" aria-label="Go to previous page"${hasPrev ? "" : " disabled"}>Previous</button>
+        <label class="pagination__label">
+          <span class="visually-hidden">Current page</span>
+          <input type="number" class="pagination__input" data-page-input min="1" max="${maxAttr}" value="${page}" />
+        </label>
+        <span class="pagination__details">of <span data-total-pages>${maxAttr}</span></span>
+        <button type="button" data-page="next" aria-label="Go to next page"${hasNext ? "" : " disabled"}>Next</button>
+        <button type="button" data-page="last" aria-label="Go to last page"${page >= pages ? " disabled" : ""}>Last</button>
       `;
     };
 
@@ -2443,6 +2610,7 @@
         searchDebounceHandle = window.setTimeout(() => {
           state.accounts.search = value.trim();
           state.accounts.page = 1;
+          renderActiveFilters();
           persistState();
           requestSnapshot();
         }, 250);
@@ -2453,6 +2621,7 @@
       exposureSelect.addEventListener("change", () => {
         state.accounts.exposure = exposureSelect.value || "any";
         state.accounts.page = 1;
+        renderActiveFilters();
         persistState();
         requestSnapshot();
       });
@@ -2466,6 +2635,7 @@
         }
         state.accounts.pageSize = parsed;
         state.accounts.page = 1;
+        renderActiveFilters();
         persistState();
         requestSnapshot();
       });
@@ -2481,6 +2651,7 @@
         state.accounts.hideEmpty[key] = !current;
         persistState();
         updateHideEmptyChips();
+        renderActiveFilters();
         if (latestSnapshot) {
           renderAccounts(latestSnapshot);
         }
@@ -2501,10 +2672,74 @@
         }
         state.accounts.page = 1;
         updateSortButtons();
+        renderActiveFilters();
         persistState();
         requestSnapshot();
       });
     });
+
+    if (resetFiltersButton) {
+      resetFiltersButton.addEventListener("click", () => {
+        const defaults = createDefaultAccountsState();
+        state.accounts = {
+          ...defaults,
+          hideEmpty: { ...defaults.hideEmpty },
+        };
+        persistState();
+        applyAccountsControlsFromState();
+        requestSnapshot();
+      });
+    }
+
+    if (activeFiltersContainer) {
+      activeFiltersContainer.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-clear-filter]");
+        if (!button) {
+          return;
+        }
+        const type = button.getAttribute("data-clear-filter");
+        const key = button.getAttribute("data-filter-key");
+        if (!type) {
+          return;
+        }
+        let needsImmediateRender = false;
+        if (type === "search") {
+          state.accounts.search = "";
+          if (searchInput) {
+            searchInput.value = "";
+          }
+        } else if (type === "exposure") {
+          state.accounts.exposure = "any";
+          if (exposureSelect) {
+            exposureSelect.value = "any";
+          }
+        } else if (type === "hideEmpty" && key) {
+          if (state.accounts.hideEmpty) {
+            state.accounts.hideEmpty[key] = false;
+            needsImmediateRender = true;
+          }
+        } else if (type === "sort") {
+          state.accounts.sortKey = DEFAULT_SORT_KEY;
+          state.accounts.sortOrder = DEFAULT_SORT_ORDER;
+        } else if (type === "pageSize") {
+          state.accounts.pageSize = DEFAULT_ACCOUNTS_STATE.pageSize;
+          if (pageSizeSelect) {
+            pageSizeSelect.value = String(DEFAULT_ACCOUNTS_STATE.pageSize);
+          }
+        } else {
+          return;
+        }
+        state.accounts.page = 1;
+        persistState();
+        updateHideEmptyChips();
+        updateSortButtons();
+        renderActiveFilters();
+        if (needsImmediateRender && latestSnapshot) {
+          renderAccounts(latestSnapshot);
+        }
+        requestSnapshot();
+      });
+    }
 
     if (paginationContainer) {
       paginationContainer.addEventListener("click", (event) => {
@@ -2519,15 +2754,59 @@
         const meta = lastAccountsMeta || {};
         const currentPage = Number(state.accounts.page || meta.page || 1);
         const totalPages = Math.max(1, Number(meta.pages || currentPage));
-        if (direction === "prev" && currentPage > 1) {
-          state.accounts.page = currentPage - 1;
-        } else if (direction === "next" && currentPage < totalPages) {
-          state.accounts.page = currentPage + 1;
+        let nextPage = currentPage;
+        if (direction === "first") {
+          nextPage = 1;
+        } else if (direction === "prev") {
+          nextPage = Math.max(1, currentPage - 1);
         } else if (direction === "next") {
-          state.accounts.page = currentPage + 1;
+          nextPage = Math.min(totalPages, currentPage + 1);
+        } else if (direction === "last") {
+          nextPage = totalPages;
         }
+        if (nextPage === currentPage) {
+          return;
+        }
+        state.accounts.page = nextPage;
         persistState();
         requestSnapshot();
+      });
+
+      paginationContainer.addEventListener("change", (event) => {
+        const input = event.target.closest("[data-page-input]");
+        if (!input) {
+          return;
+        }
+        const meta = lastAccountsMeta || {};
+        const totalPages = Math.max(1, Number(meta.pages || state.accounts.page || 1));
+        let targetPage = Number.parseInt(input.value, 10);
+        if (!Number.isFinite(targetPage) || targetPage <= 0) {
+          targetPage = 1;
+        }
+        if (targetPage > totalPages) {
+          targetPage = totalPages;
+        }
+        if (Number(input.value) !== targetPage) {
+          input.value = String(targetPage);
+        }
+        if (targetPage === Number(state.accounts.page || 1)) {
+          return;
+        }
+        state.accounts.page = targetPage;
+        persistState();
+        requestSnapshot();
+      });
+
+      paginationContainer.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") {
+          return;
+        }
+        const input = event.target.closest("[data-page-input]");
+        if (!input) {
+          return;
+        }
+        event.preventDefault();
+        input.dispatchEvent(new Event("change", { bubbles: true }));
       });
     }
 

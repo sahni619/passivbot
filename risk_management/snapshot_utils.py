@@ -241,7 +241,13 @@ def _build_portfolio_view(
     total_balance = sum(account.balance for account in accounts)
     gross_notional = sum(account.total_abs_notional() for account in accounts)
     net_notional = sum(account.net_notional() for account in accounts)
-    daily_realized = sum(account.total_daily_realized() for account in accounts)
+    def _account_daily_realized(account: Account) -> float:
+        value = account.daily_realized_pnl
+        if value is None:
+            return account.total_daily_realized()
+        return float(value)
+
+    daily_realized = sum(_account_daily_realized(account) for account in accounts)
 
     symbol_data: Dict[str, Dict[str, Any]] = {}
     portfolio_volatility: Dict[str, float] = {}
@@ -339,7 +345,11 @@ def _build_account_view(
         "net_exposure": account.net_exposure_pct(),
         "net_exposure_notional": account.net_notional(),
         "unrealized_pnl": account.total_unrealized(),
-        "daily_realized_pnl": account.daily_realized_pnl or account.total_daily_realized(),
+        "daily_realized_pnl": (
+            account.total_daily_realized()
+            if account.daily_realized_pnl is None
+            else account.daily_realized_pnl
+        ),
         "positions": positions,
         "symbol_exposures": symbol_exposures,
         "orders": orders,
