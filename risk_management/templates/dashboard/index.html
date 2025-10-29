@@ -497,6 +497,10 @@
                       <th>Max DD</th>
                       <th>TP</th>
                       <th>SL</th>
+                      <th>Depth coverage</th>
+                      <th>Est. slippage</th>
+                      <th>Avg exit</th>
+                      <th>Liquidity warnings</th>
                       <th>Vol 4h</th>
                       <th>Vol 24h</th>
                       <th>Vol 3d</th>
@@ -525,6 +529,10 @@
                         <td>{% if position.max_drawdown_pct is not none %}{{ position.max_drawdown_pct|pct }}{% else %}-{% endif %}</td>
                         <td>{% if position.take_profit_price is not none %}{{ position.take_profit_price|currency }}{% else %}-{% endif %}</td>
                         <td>{% if position.stop_loss_price is not none %}{{ position.stop_loss_price|currency }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_coverage_pct is not none %}{{ position.liquidity_coverage_pct|pct }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_slippage_pct is not none %}{{ position.liquidity_slippage_pct|pct }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_average_price is not none %}{{ position.liquidity_average_price|currency }}{% else %}-{% endif %}</td>
+                        <td>{% if position.liquidity_warnings %}{{ position.liquidity_warnings|join(', ') }}{% else %}-{% endif %}</td>
                         <td>{% if position_vol and position_vol.get("4h") is not none %}{{ position_vol.get("4h")|pct }}{% else %}-{% endif %}</td>
                         <td>{% if position_vol and position_vol.get("24h") is not none %}{{ position_vol.get("24h")|pct }}{% else %}-{% endif %}</td>
                         <td>{% if position_vol and position_vol.get("3d") is not none %}{{ position_vol.get("3d")|pct }}{% else %}-{% endif %}</td>
@@ -802,6 +810,10 @@
                 <th>Max DD</th>
                 <th>TP</th>
                 <th>SL</th>
+                <th>Depth coverage</th>
+                <th>Est. slippage</th>
+                <th>Avg exit</th>
+                <th>Liquidity warnings</th>
                 <th>Actions</th>
               </tr>
             </thead>
@@ -1347,6 +1359,10 @@
                 <td>${maxDrawdown}</td>
                 <td>${takeProfit}</td>
                 <td>${stopLossPrice}</td>
+                <td>${position.liquidity_coverage_pct !== null && position.liquidity_coverage_pct !== undefined ? formatPct(position.liquidity_coverage_pct) : "-"}</td>
+                <td>${position.liquidity_slippage_pct !== null && position.liquidity_slippage_pct !== undefined ? formatPct(position.liquidity_slippage_pct) : "-"}</td>
+                <td>${position.liquidity_average_price !== null && position.liquidity_average_price !== undefined ? formatCurrency(position.liquidity_average_price) : "-"}</td>
+                <td>${Array.isArray(position.liquidity_warnings) && position.liquidity_warnings.length > 0 ? position.liquidity_warnings.join(", ") : "-"}</td>
                 <td>
                   <div class="actions-column">
                     <button type="button" class="button danger small" data-close-position data-symbol="${position.symbol}">Close</button>
@@ -2085,6 +2101,10 @@
                   <td>${maxDd}</td>
                   <td>${formatPrice(position.take_profit_price)}</td>
                   <td>${formatPrice(position.stop_loss_price)}</td>
+                  <td>${position.liquidity_coverage_pct !== null && position.liquidity_coverage_pct !== undefined ? formatPct(position.liquidity_coverage_pct) : "-"}</td>
+                  <td>${position.liquidity_slippage_pct !== null && position.liquidity_slippage_pct !== undefined ? formatPct(position.liquidity_slippage_pct) : "-"}</td>
+                  <td>${position.liquidity_average_price !== null && position.liquidity_average_price !== undefined ? formatCurrency(position.liquidity_average_price) : "-"}</td>
+                  <td>${Array.isArray(position.liquidity_warnings) && position.liquidity_warnings.length > 0 ? position.liquidity_warnings.join(", ") : "-"}</td>
                   ${METRIC_WINDOWS.map((window) => `<td>${formatMetricValue(volatility?.[window])}</td>`).join("")}
                   ${METRIC_WINDOWS.map((window) => `<td>${formatMetricValue(funding?.[window])}</td>`).join("")}
                   <td>
@@ -2169,6 +2189,10 @@
                         <th>Max DD</th>
                         <th>TP</th>
                         <th>SL</th>
+                        <th>Depth coverage</th>
+                        <th>Est. slippage</th>
+                        <th>Avg exit</th>
+                        <th>Liquidity warnings</th>
                         ${METRIC_WINDOWS.map((window) => `<th>Vol ${window}</th>`).join("")}
                         ${METRIC_WINDOWS.map((window) => `<th>Fund ${window}</th>`).join("")}
                         <th>Actions</th>

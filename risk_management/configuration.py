@@ -6,7 +6,7 @@ import importlib
 import importlib.util
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import (
@@ -147,6 +147,16 @@ class CustomEndpointSettings:
 
 
 @dataclass()
+class LiquiditySettings:
+    """Controls order-book collection and liquidity analytics."""
+
+    fetch_order_book: bool = True
+    depth: int = 25
+    fallback_mode: str = "ticker"
+    slippage_warning_pct: float = 0.02
+
+
+@dataclass()
 class AccountConfig:
     """Configuration for a single exchange account."""
 
@@ -160,6 +170,7 @@ class AccountConfig:
     enabled: bool = True
     debug_api_payloads: bool = False
     use_custom_endpoints: Optional[bool] = None
+    liquidity: LiquiditySettings = field(default_factory=LiquiditySettings)
 
 
 @dataclass()
@@ -220,6 +231,7 @@ class RealtimeConfig:
     debug_api_payloads: bool = False
     reports_dir: Optional[Path] = None
     grafana: Optional[GrafanaConfig] = None
+    liquidity: LiquiditySettings = field(default_factory=LiquiditySettings)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -254,6 +266,74 @@ def _resolve_path_relative_to(base: Path, candidate: Any) -> Path:
     else:
         path = path.resolve()
     return path
+
+
+def _parse_liquidity_settings(
+    payload: Any,
+    *,
+    defaults: Optional[LiquiditySettings] = None,
+    description: str = "Liquidity settings",
+) -> LiquiditySettings:
+    """Return merged :class:`LiquiditySettings` applying overrides from ``payload``."""
+
+    settings = replace(defaults) if defaults is not None else LiquiditySettings()
+    if payload is None:
+        return settings
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{description} must be provided as an object")
+
+    fetch_order_book = _coerce_bool(
+        payload.get("fetch_order_book"), settings.fetch_order_book
+    )
+    settings.fetch_order_book = fetch_order_book
+
+    depth_raw = payload.get("depth")
+    if depth_raw is not None:
+        try:
+            depth = int(depth_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{description} depth must be a positive integer") from exc
+        if depth <= 0:
+            raise ValueError(f"{description} depth must be greater than zero")
+        settings.depth = depth
+
+    fallback_raw = payload.get("fallback_mode")
+    if fallback_raw is None:
+        fallback_raw = payload.get("fallback")
+    if fallback_raw is not None:
+        fallback_normalised = str(fallback_raw).strip().lower()
+        fallback_aliases = {
+            "ticker": "ticker",
+            "tickers": "ticker",
+            "book": "ticker",
+            "order_book": "ticker",
+            "mark": "mark",
+            "mark_price": "mark",
+            "none": "none",
+            "off": "none",
+            "disabled": "none",
+        }
+        if fallback_normalised not in fallback_aliases:
+            raise ValueError(
+                f"{description} fallback must be one of: ticker, mark, none"
+            )
+        settings.fallback_mode = fallback_aliases[fallback_normalised]
+
+    warning_raw = payload.get("slippage_warning_pct")
+    if warning_raw is not None:
+        try:
+            warning_value = float(warning_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{description} slippage_warning_pct must be a numeric value"
+            ) from exc
+        if warning_value <= 0:
+            raise ValueError(
+                f"{description} slippage_warning_pct must be greater than zero"
+            )
+        settings.slippage_warning_pct = warning_value
+
+    return settings
 
 
 def _normalise_credentials(data: Mapping[str, Any]) -> Dict[str, Any]:
@@ -497,6 +577,8 @@ def _parse_accounts(
     accounts_raw: Iterable[Mapping[str, Any]],
     api_keys: Optional[Mapping[str, Mapping[str, Any]]],
     debug_api_payloads_default: bool = False,
+    *,
+    liquidity_defaults: Optional[LiquiditySettings] = None,
 ) -> List[AccountConfig]:
     accounts: List[AccountConfig] = []
     debug_requested = False
@@ -567,6 +649,12 @@ def _parse_accounts(
                 ) from exc
             use_custom_endpoints_pref = account_pref
 
+        liquidity_settings = _parse_liquidity_settings(
+            raw.get("liquidity"),
+            defaults=liquidity_defaults,
+            description=f"Account '{raw.get('name', exchange)}' liquidity settings",
+        )
+
         account = AccountConfig(
             name=str(raw.get("name", exchange)),
             exchange=str(exchange),
@@ -578,6 +666,7 @@ def _parse_accounts(
             enabled=bool(raw.get("enabled", True)),
             debug_api_payloads=debug_api_payloads,
             use_custom_endpoints=use_custom_endpoints_pref,
+            liquidity=liquidity_settings,
         )
         accounts.append(account)
         if debug_api_payloads:
@@ -698,7 +787,17 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
     if debug_api_payloads_default:
         _ensure_debug_logging_enabled()
 
-    accounts = _parse_accounts(accounts_raw, api_keys, debug_api_payloads_default)
+    liquidity_defaults = _parse_liquidity_settings(
+        config.get("liquidity"),
+        description="Realtime liquidity settings",
+    )
+
+    accounts = _parse_accounts(
+        accounts_raw,
+        api_keys,
+        debug_api_payloads_default,
+        liquidity_defaults=liquidity_defaults,
+    )
     alert_thresholds = {
         str(k): float(v) for k, v in config.get("alert_thresholds", {}).items()
     }
@@ -745,4 +844,5 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         reports_dir=reports_dir,
         grafana=grafana_settings,
         account_messages=account_messages,
+        liquidity=liquidity_defaults,
     )
