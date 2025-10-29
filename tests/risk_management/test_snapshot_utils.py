@@ -5,7 +5,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+
 from risk_management.snapshot_utils import DEFAULT_ACCOUNTS_PAGE_SIZE, build_presentable_snapshot
+
+from risk_management.presentation.snapshot_builder import build_presentable_snapshot
+
 
 
 def test_snapshot_utils_preserves_position_fields() -> None:
