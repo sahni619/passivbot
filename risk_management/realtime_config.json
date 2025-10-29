@@ -1,8 +1,8 @@
 {
-  "api_keys_file": "/root/passivbot/api-keys.json",
+  "api_keys_file": "../api-keys.json",
   "debug_api_payloads": false,
   "custom_endpoints": {
-    "path": "/root/passivbot/configs/custom_endpoints.json",
+    "path": "../configs/custom_endpoints.json",
     "autodiscover": false
   },
   "reports_dir": "../risk_reports",
@@ -120,6 +120,8 @@
         "instructions": "Escalate to exchange coverage before overriding the balance floor.",
         "expires_after_seconds": 7200
       }
+    }
+  ],
 
   "scenarios": [
     {
