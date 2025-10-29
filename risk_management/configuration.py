@@ -18,7 +18,6 @@ from typing import (
     Mapping,
     MutableMapping,
     Optional,
-    Sequence,
     Set,
 )
 
@@ -31,7 +30,7 @@ from .audit import (
     get_audit_logger,
 )
 
-from .core.domain import Scenario, ScenarioShock
+from .domain.models import Scenario, ScenarioShock
 
 
 

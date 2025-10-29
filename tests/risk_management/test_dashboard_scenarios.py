@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from risk_management.presentation.dashboard_rendering import render_dashboard
+from risk_management.dashboard import render_dashboard
 from risk_management.domain.models import (
     Account,
     Position,

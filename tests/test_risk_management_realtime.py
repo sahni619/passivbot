@@ -8,9 +8,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from risk_management.configuration import AccountConfig, RealtimeConfig
-from risk_management.presentation.dashboard_rendering import build_dashboard
+from risk_management.dashboard import build_dashboard
 from risk_management.realtime import RealtimeDataFetcher
-from risk_management.presentation.snapshot_builder import build_presentable_snapshot
+from risk_management.snapshot_utils import build_presentable_snapshot
 
 
 class StubAccountClient:
