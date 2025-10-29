@@ -40,6 +40,10 @@ def test_performance_tracker_records_daily_snapshots(tmp_path: Path) -> None:
     assert daily_change is not None
     assert pytest.approx(daily_change["pnl"]) == 1_200.0
     assert daily_change["since"] == "2024-03-01"
+    references = summary_second["accounts"]["Demo"]["reference_balances"]
+    periods_since = summary_second["accounts"]["Demo"]["since"]
+    assert references["daily"] == pytest.approx(10_000.0)
+    assert periods_since["daily"] == "2024-03-01"
 
 
 def test_performance_tracker_handles_missing_history(tmp_path: Path) -> None:

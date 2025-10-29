@@ -234,6 +234,8 @@ class PerformanceTracker:
             "daily": None,
             "weekly": None,
             "monthly": None,
+            "reference_balances": {},
+            "since": {},
         }
         if not entries:
             return summary
@@ -251,11 +253,14 @@ class PerformanceTracker:
             if reference is None:
                 continue
             reference_balance = float(reference["balance"])
+            pnl = float(current_balance) - reference_balance
             summary[label] = {
-                "pnl": float(current_balance) - reference_balance,
+                "pnl": pnl,
                 "since": reference["date"],
                 "reference_balance": reference_balance,
             }
+            summary["reference_balances"][label] = reference_balance
+            summary["since"][label] = reference["date"]
 
         return summary
 
