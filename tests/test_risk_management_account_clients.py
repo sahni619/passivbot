@@ -12,6 +12,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from risk_management.account_clients import CCXTAccountClient, BaseError
+from risk_management.configuration import LiquiditySettings
 
 
 class StubExchange:
@@ -71,6 +72,36 @@ class StubExchange:
                 "params": params,
             }
         )
+
+
+class StubDepthExchange:
+    def __init__(self) -> None:
+        self.markets = True
+        self._order_book_calls = []
+
+    async def fetch_balance(self, params=None):
+        return {"total": {"USDT": 10_000}}
+
+    async def fetch_positions(self, params=None):
+        return [
+            {
+                "symbol": "BTC/USDT",
+                "contracts": 5,
+                "entryPrice": 950,
+                "markPrice": 1000,
+            }
+        ]
+
+    async def fetch_order_book(self, symbol, limit=None, params=None):
+        self._order_book_calls.append({"symbol": symbol, "limit": limit, "params": params})
+        return {
+            "bids": [[920, 2], [900, 1]],
+            "asks": [[1080, 5]],
+            "timestamp": 1234567890,
+        }
+
+    async def fetch_open_orders(self, symbol=None, params=None):
+        return []
 
 
 def test_kill_switch_falls_back_to_ticker_price(caplog):
@@ -209,3 +240,40 @@ def test_kill_switch_uses_position_idx_from_position_payload():
     assert order["params"]["positionIdx"] == 1
     assert order["params"]["reduceOnly"] is True
     assert "reduceonly" not in order["params"]
+
+
+def test_fetch_includes_liquidity_metrics_for_thin_books():
+    exchange = StubDepthExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    liquidity_settings = LiquiditySettings(
+        fetch_order_book=True,
+        depth=2,
+        fallback_mode="none",
+        slippage_warning_pct=0.01,
+    )
+    client.config = SimpleNamespace(
+        name="Demo",
+        symbols=["BTC/USDT"],
+        settle_currency="USDT",
+        params={"balance": {}, "positions": {}, "orders": {}},
+        liquidity=liquidity_settings,
+    )
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {}
+    client._close_params = {}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+    client._liquidity_settings = liquidity_settings
+
+    summary = asyncio.run(client.fetch())
+
+    assert summary["order_books"], "order book snapshots should be included when available"
+    positions = summary["positions"]
+    assert positions, "positions should be populated"
+    liquidity = positions[0].get("liquidity")
+    assert liquidity, "liquidity metrics should be computed for positions"
+    warnings = liquidity.get("warnings") if isinstance(liquidity, dict) else None
+    assert warnings and "insufficient_depth" in warnings
+    assert "slippage_threshold_exceeded" in warnings

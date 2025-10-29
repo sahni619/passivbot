@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, Sequence
+
 from dataclasses import dataclass, field
 from typing import Dict, Mapping, Optional, Sequence
+
 
 
 @dataclass
@@ -26,6 +31,8 @@ class Position:
     volatility: Optional[Mapping[str, float]] = None
     funding_rates: Optional[Mapping[str, float]] = None
     daily_realized_pnl: float = 0.0
+    liquidity: Optional[Mapping[str, Any]] = None
+    liquidity_warnings: Sequence[str] = ()
 
     def exposure_relative_to(self, balance: float) -> float:
         if balance == 0:

@@ -377,6 +377,29 @@ def _build_account_view(
 def _build_position_view(position: Position, balance: float) -> Dict[str, Any]:
     exposure = position.exposure_relative_to(balance)
     pnl_pct = position.pnl_pct(balance)
+    liquidity = position.liquidity if isinstance(position.liquidity, Mapping) else None
+    liquidity_warnings = list(position.liquidity_warnings) if position.liquidity_warnings else []
+    if liquidity:
+        warnings = liquidity.get("warnings")
+        if isinstance(warnings, Iterable):
+            liquidity_warnings.extend([str(item) for item in warnings if isinstance(item, str)])
+    coverage_pct = None
+    slippage_pct = None
+    average_price = None
+    source = None
+    if liquidity:
+        coverage = liquidity.get("coverage_pct")
+        if isinstance(coverage, (int, float)):
+            coverage_pct = float(coverage)
+        slippage = liquidity.get("slippage_pct")
+        if isinstance(slippage, (int, float)):
+            slippage_pct = float(slippage)
+        avg = liquidity.get("average_price")
+        if isinstance(avg, (int, float)):
+            average_price = float(avg)
+        src = liquidity.get("source")
+        if isinstance(src, str):
+            source = src
     return {
         "symbol": position.symbol,
         "side": position.side,
@@ -396,6 +419,12 @@ def _build_position_view(position: Position, balance: float) -> Dict[str, Any]:
         "daily_realized_pnl": position.daily_realized_pnl,
         "volatility": dict(position.volatility) if position.volatility else {},
         "funding_rates": dict(position.funding_rates) if position.funding_rates else {},
+        "liquidity": dict(liquidity) if isinstance(liquidity, Mapping) else {},
+        "liquidity_warnings": liquidity_warnings,
+        "liquidity_coverage_pct": coverage_pct,
+        "liquidity_slippage_pct": slippage_pct,
+        "liquidity_average_price": average_price,
+        "liquidity_source": source,
     }
 
 

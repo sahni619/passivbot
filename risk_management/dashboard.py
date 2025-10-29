@@ -166,6 +166,48 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
 
     size_raw = raw.get("size")
     signed_notional_raw = raw.get("signed_notional")
+    volatility = (
+        {str(key): float(value) for key, value in raw.get("volatility", {}).items()}
+        if isinstance(raw.get("volatility"), Mapping)
+        else None
+    )
+    funding_rates = (
+        {str(key): float(value) for key, value in raw.get("funding_rates", {}).items()}
+        if isinstance(raw.get("funding_rates"), Mapping)
+        else None
+    )
+    liquidity_raw = raw.get("liquidity") if isinstance(raw.get("liquidity"), Mapping) else None
+    liquidity: Optional[Dict[str, Any]] = None
+    liquidity_warnings: List[str] = []
+    if isinstance(liquidity_raw, Mapping):
+        liquidity = {}
+        for key, value in liquidity_raw.items():
+            if key == "warnings" and isinstance(value, Iterable):
+                liquidity_warnings = [str(item) for item in value if isinstance(item, str)]
+                liquidity["warnings"] = list(liquidity_warnings)
+                continue
+            if key in {
+                "filled_size",
+                "filled_notional",
+                "average_price",
+                "slippage_pct",
+                "unfilled_size",
+                "coverage_pct",
+                "reference_price",
+                "warning_threshold_pct",
+                "timestamp",
+            }:
+                try:
+                    liquidity[key] = float(value) if value is not None else None
+                except (TypeError, ValueError):
+                    liquidity[key] = None
+            else:
+                liquidity[key] = value
+    extra_warnings = raw.get("liquidity_warnings")
+    if isinstance(extra_warnings, Iterable):
+        for warning in extra_warnings:
+            if isinstance(warning, str) and warning not in liquidity_warnings:
+                liquidity_warnings.append(warning)
     return Position(
         symbol=str(raw["symbol"]),
         side=str(raw.get("side", "")),
@@ -204,17 +246,11 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
             if signed_notional_raw not in (None, "")
             else None
         ),
-        volatility=(
-            {str(key): float(value) for key, value in raw.get("volatility", {}).items()}
-            if isinstance(raw.get("volatility"), Mapping)
-            else None
-        ),
-        funding_rates=(
-            {str(key): float(value) for key, value in raw.get("funding_rates", {}).items()}
-            if isinstance(raw.get("funding_rates"), Mapping)
-            else None
-        ),
+        volatility=volatility,
+        funding_rates=funding_rates,
         daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
+        liquidity=liquidity,
+        liquidity_warnings=tuple(liquidity_warnings),
     )
 
 
@@ -334,6 +370,63 @@ def evaluate_alerts(accounts: Sequence[Account], thresholds: AlertThresholds) ->
                 alerts.append(
                     f"{account.name} {position.symbol}: drawdown {position.max_drawdown_pct:.2%} exceeds {thresholds.max_drawdown_pct:.2%}"
                 )
+            liquidity = position.liquidity or {}
+            raw_warnings = list(position.liquidity_warnings)
+            if isinstance(liquidity, Mapping):
+                warning_entries = liquidity.get("warnings")
+                if isinstance(warning_entries, Iterable):
+                    raw_warnings.extend([str(item) for item in warning_entries if isinstance(item, str)])
+            seen: set[str] = set()
+            for warning in raw_warnings:
+                if warning in seen:
+                    continue
+                seen.add(warning)
+                if warning == "depth_unavailable":
+                    alerts.append(
+                        f"{account.name} {position.symbol}: order book depth unavailable; liquidity estimates rely on fallbacks"
+                    )
+                elif warning == "insufficient_depth":
+                    coverage = None
+                    if isinstance(liquidity, Mapping):
+                        coverage = liquidity.get("coverage_pct")
+                        if isinstance(coverage, (int, float)):
+                            coverage = float(coverage)
+                    if isinstance(coverage, float):
+                        alerts.append(
+                            f"{account.name} {position.symbol}: order book covers only {coverage:.0%} of position size"
+                        )
+                    else:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: insufficient order book depth to exit position"
+                        )
+                elif warning == "slippage_threshold_exceeded":
+                    slippage = None
+                    threshold_value = None
+                    if isinstance(liquidity, Mapping):
+                        slippage = liquidity.get("slippage_pct")
+                        threshold_value = liquidity.get("warning_threshold_pct")
+                    slippage_str = None
+                    if isinstance(slippage, (int, float)):
+                        slippage_str = f"{float(slippage):.2%}"
+                    threshold_str = None
+                    if isinstance(threshold_value, (int, float)):
+                        threshold_str = f"{float(threshold_value):.2%}"
+                    if slippage_str and threshold_str:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: estimated slippage {slippage_str} exceeds threshold {threshold_str}"
+                        )
+                    elif slippage_str:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: estimated slippage {slippage_str} exceeds configured threshold"
+                        )
+                    else:
+                        alerts.append(
+                            f"{account.name} {position.symbol}: estimated slippage exceeds configured threshold"
+                        )
+                elif warning == "position_size_undefined":
+                    alerts.append(
+                        f"{account.name} {position.symbol}: unable to determine position size for liquidity analysis"
+                    )
     return alerts
 
 
@@ -413,6 +506,30 @@ def render_dashboard(
                     + f"{_format_pct(position.max_drawdown_pct or 0.0):>10}"
                     + f"{_format_price(position.take_profit_price):>12}{_format_price(position.stop_loss_price):>12}"
                 )
+                liquidity = position.liquidity if isinstance(position.liquidity, Mapping) else None
+                if liquidity:
+                    details: List[str] = []
+                    coverage = liquidity.get("coverage_pct")
+                    if isinstance(coverage, (int, float)):
+                        details.append(f"coverage {float(coverage):.0%}")
+                    slippage = liquidity.get("slippage_pct")
+                    if isinstance(slippage, (int, float)):
+                        details.append(f"slippage {float(slippage):.2%}")
+                    average_price = liquidity.get("average_price")
+                    if isinstance(average_price, (int, float)):
+                        details.append(f"avg {float(average_price):,.2f}")
+                    source = liquidity.get("source")
+                    if isinstance(source, str) and source:
+                        details.append(f"source {source}")
+                    if details:
+                        lines.append("      Liquidity: " + ", ".join(details))
+                    warnings = list(position.liquidity_warnings)
+                    warning_entries = liquidity.get("warnings")
+                    if isinstance(warning_entries, Iterable):
+                        warnings.extend([str(item) for item in warning_entries if isinstance(item, str)])
+                    if warnings:
+                        unique = list(dict.fromkeys(warnings))
+                        lines.append("      Liquidity warnings: " + ", ".join(unique))
         else:
             lines.append("    No open positions.")
         lines.append("")
