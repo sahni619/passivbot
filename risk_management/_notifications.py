@@ -9,10 +9,10 @@ from zoneinfo import ZoneInfo
 
 from .audit import AuditLogWriter
 from .configuration import RealtimeConfig
-from .dashboard import evaluate_alerts, parse_snapshot
+from .core.policies import PolicyActionState, PolicyEvaluationResult
+from .core.snapshots import evaluate_alerts, parse_snapshot
 from .email_notifications import EmailAlertSender
 from .telegram_notifications import TelegramNotifier
-from .policies import PolicyActionState, PolicyEvaluationResult
 
 __all__ = [
     "NotificationCoordinator",
