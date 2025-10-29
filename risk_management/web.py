@@ -27,11 +27,11 @@ from urllib.parse import quote, urlencode, urljoin
 
 from .audit import AuditLogWriter, AuditSettings, get_audit_logger, read_audit_entries
 from .configuration import RealtimeConfig
-from .domain.models import Scenario
+from .core.domain import Scenario
 from .services.risk_service import RiskService, RiskServiceProtocol
 from .reporting import ReportManager
 from .services import PerformanceRepository
-from .snapshot_utils import (
+from .presentation.snapshot_builder import (
     ACCOUNT_SORT_FIELDS,
     DEFAULT_ACCOUNT_SORT_KEY,
     DEFAULT_ACCOUNT_SORT_ORDER,
@@ -894,6 +894,7 @@ def create_app(
         response_class=JSONResponse,
     )
     async def api_position_kill_switch(
+        request: Request,
         account_name: str,
         symbol: str,
         service: RiskDashboardService = Depends(get_service),
