@@ -352,6 +352,7 @@ def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], A
     accounts: List[Account] = []
     accounts_raw = data.get("accounts", [])
 
+
     if isinstance(accounts_raw, Mapping):
         accounts_iterable: Iterable[Any] = accounts_raw.values()
     elif isinstance(accounts_raw, Iterable) and not isinstance(
@@ -367,6 +368,12 @@ def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], A
         accounts_iterable = []
 
     for index, raw_account in enumerate(accounts_iterable):
+
+    if not isinstance(accounts_raw, Iterable):
+        accounts_raw = []
+
+    for index, raw_account in enumerate(accounts_raw):
+
         if not isinstance(raw_account, Mapping):
             logger.warning(
                 "Skipping account at index %s because entry is not a mapping: %r",
