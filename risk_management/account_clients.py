@@ -666,6 +666,7 @@ class CCXTAccountClient(AccountClientProtocol):
             else {}
         )
 
+
         def _merge_time_params(base: Mapping[str, Any], end_ms: int) -> Dict[str, Any]:
             merged = dict(base) if isinstance(base, Mapping) else {}
             end_ms_int = int(end_ms)
@@ -711,7 +712,9 @@ class CCXTAccountClient(AccountClientProtocol):
             currency_code = None
 
         events: List[Dict[str, Any]] = []
+
         seen_keys: set[Tuple[Any, ...]] = set()
+
         for flow_type, method_name, extra_params in (
             ("deposit", "fetch_deposits", deposit_params),
             ("withdrawal", "fetch_withdrawals", withdrawal_params),
@@ -772,6 +775,10 @@ class CCXTAccountClient(AccountClientProtocol):
                         exc_info=self._debug_api_payloads,
                     )
                     continue
+
+                    params=extra_params,
+                )
+
             except NotSupported:
                 continue
             except BaseError as exc:
@@ -800,6 +807,7 @@ class CCXTAccountClient(AccountClientProtocol):
                 if not isinstance(entry, Mapping):
                     continue
                 normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
+
                 if normalised is None:
                     continue
                 key_id = normalised.get("txid") or normalised.get("id")
@@ -816,6 +824,10 @@ class CCXTAccountClient(AccountClientProtocol):
                     continue
                 seen_keys.add(dedupe_key)
                 events.append(normalised)
+
+                if normalised is not None:
+                    events.append(normalised)
+
 
         if not events:
             return []
