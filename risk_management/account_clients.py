@@ -58,7 +58,7 @@ from ._parsing import (
     parse_order as _parse_order,
     parse_position as _parse_position,
 )
-from .realized_pnl import fetch_realized_pnl_history
+from .realized_pnl import fetch_realized_pnl_history  # noqa: F401 (kept for external usage)
 from .liquidity import calculate_position_liquidity, normalise_order_book
 
 try:  # pragma: no cover - passivbot is optional when running tests
@@ -71,6 +71,7 @@ except (ModuleNotFoundError, ImportError):  # pragma: no cover - allow running w
 
 
 logger = logging.getLogger(__name__)
+
 
 class AccountClientProtocol(abc.ABC):
     """Abstract interface for realtime account clients."""
@@ -130,7 +131,6 @@ class AccountClientProtocol(abc.ABC):
 
 def _set_exchange_field(client: Any, key: str, value: Any, aliases: Sequence[str]) -> None:
     """Assign ``value`` to ``key`` on ``client`` and store aliases when possible."""
-
     config = getattr(client, "config", None)
     keys = tuple(dict.fromkeys((key, *aliases)))  # preserve order, drop duplicates
     for attr in keys:
@@ -199,7 +199,6 @@ def _format_header_placeholders(
 
 def _apply_credentials(client: Any, credentials: Mapping[str, Any]) -> None:
     """Populate authentication fields on a ccxt client."""
-
     sensitive_fields = {"apiKey", "secret", "password", "uid", "login", "walletAddress", "privateKey"}
     alias_map = {
         "apiKey": ("api_key", "key"),
@@ -247,7 +246,6 @@ def _apply_credentials(client: Any, credentials: Mapping[str, Any]) -> None:
 
 def _disable_fetch_currencies(client: Any) -> None:
     """Disable ccxt currency lookups that require authenticated endpoints."""
-
     options = getattr(client, "options", None)
     if isinstance(options, MutableMapping):
         # ccxt exchanges often respect ``options['fetchCurrencies']`` when deciding
@@ -266,7 +264,6 @@ def _disable_fetch_currencies(client: Any) -> None:
 
 def _suppress_open_orders_warning(client: Any) -> None:
     """Prevent ccxt from escalating open-order symbol warnings to exceptions."""
-
     options = getattr(client, "options", None)
     if isinstance(options, MutableMapping):
         options["warnOnFetchOpenOrdersWithoutSymbol"] = False
@@ -276,7 +273,6 @@ def _suppress_open_orders_warning(client: Any) -> None:
 
 def _is_symbol_specific_open_orders_warning(error: BaseError) -> bool:
     """Return ``True`` when ``error`` is the ccxt warning about missing symbols."""
-
     message = str(error)
     return (
         "fetchOpenOrders() WARNING" in message
@@ -295,7 +291,6 @@ def _instantiate_ccxt_client(
     custom_endpoint_override: object = _DEFAULT_OVERRIDE_SENTINEL,
 ) -> Any:
     """Instantiate a ccxt async client honoring passivbot customisations when available."""
-
     normalized = normalize_exchange_name(exchange_id)
     rate_limited = bool(credentials.get("enableRateLimit", True))
 
@@ -332,11 +327,11 @@ def _instantiate_ccxt_client(
     _apply_credentials(client, credentials)
     _disable_fetch_currencies(client)
     _suppress_open_orders_warning(client)
-    override: Optional[ResolvedEndpointOverride]
-    if custom_endpoint_override is _DEFAULT_OVERRIDE_SENTINEL:
-        override = resolve_custom_endpoint_override(normalized)
-    else:
-        override = custom_endpoint_override  # type: ignore[assignment]
+    override = (
+        resolve_custom_endpoint_override(normalized)
+        if custom_endpoint_override is _DEFAULT_OVERRIDE_SENTINEL
+        else custom_endpoint_override  # type: ignore[assignment]
+    )
     apply_rest_overrides_to_ccxt(client, override)
     return client
 
@@ -391,7 +386,6 @@ class CCXTAccountClient(AccountClientProtocol):
 
     def _refresh_open_order_preferences(self) -> None:
         """Re-apply exchange options that silence noisy open-order warnings."""
-
         try:
             _suppress_open_orders_warning(self.client)
         except Exception:  # pragma: no cover - defensive
@@ -431,7 +425,6 @@ class CCXTAccountClient(AccountClientProtocol):
         now_ms: Optional[int] = None,
     ) -> Optional[float]:
         """Return realised PnL for supported venues within a configurable window."""
-
         params_cfg_raw = self.config.params.get("realized_pnl")
         params_cfg: Mapping[str, Any]
         if isinstance(params_cfg_raw, Mapping):
@@ -571,7 +564,7 @@ class CCXTAccountClient(AccountClientProtocol):
                         if isinstance(symbol, str) and symbol
                     ]
                 else:
-                    dedup: list[str] = []
+                    dedup: List[str] = []
                     for position in positions:
                         symbol = position.get("symbol")
                         if isinstance(symbol, str) and symbol and symbol not in dedup:
@@ -641,12 +634,9 @@ class CCXTAccountClient(AccountClientProtocol):
 
     async def _fetch_cashflows(self) -> List[Dict[str, Any]]:
         """Return recent deposits and withdrawals when supported by the exchange."""
-
-        if not self._cashflow_params:
-            params_cfg: Mapping[str, Any] = {}
-        else:
-            params_cfg = self._cashflow_params
-
+        params_cfg: Mapping[str, Any] = (
+            self._cashflow_params if self._cashflow_params else {}
+        )
         if params_cfg.get("enabled", True) is False:
             return []
 
@@ -666,10 +656,10 @@ class CCXTAccountClient(AccountClientProtocol):
             else {}
         )
 
-
         def _merge_time_params(
             base: Mapping[str, Any], start_ms: Optional[int], end_ms: int
         ) -> Dict[str, Any]:
+            """Return params with exchange-appropriate time keys merged in."""
             merged = dict(base) if isinstance(base, Mapping) else {}
             end_ms_int = int(end_ms)
             start_ms_int: Optional[int] = None
@@ -678,37 +668,27 @@ class CCXTAccountClient(AccountClientProtocol):
                     start_ms_int = int(start_ms)
                 except (TypeError, ValueError):
                     start_ms_int = None
-            exchange_id = self._normalized_exchange or ""
-            if exchange_id.startswith("binance"):
+
+            exchange_id = (self._normalized_exchange or "").lower()
+            # Binance/Bybit expect startTime/endTime
+            if exchange_id.startswith("binance") or exchange_id.startswith("bybit"):
                 if start_ms_int is not None:
                     merged.setdefault("startTime", start_ms_int)
                 merged.setdefault("endTime", end_ms_int)
-            if exchange_id.startswith("bybit"):
-                if start_ms_int is not None:
-                    merged.setdefault("startTime", start_ms_int)
-                merged.setdefault("endTime", end_ms_int)
+            # OKX expects from/to (ms)
             if exchange_id.startswith("okx"):
                 if start_ms_int is not None:
                     merged.setdefault("from", start_ms_int)
                 merged.setdefault("to", end_ms_int)
+            # Kucoin expects startAt/endAt (seconds)
             if exchange_id.startswith("kucoin"):
                 if start_ms_int is not None:
                     merged.setdefault("startAt", start_ms_int // 1000)
-
-
-        def _merge_time_params(base: Mapping[str, Any], end_ms: int) -> Dict[str, Any]:
-            merged = dict(base) if isinstance(base, Mapping) else {}
-            end_ms_int = int(end_ms)
-            exchange_id = self._normalized_exchange or ""
-            if exchange_id.startswith("binance"):
-                merged.setdefault("endTime", end_ms_int)
-            if exchange_id.startswith("bybit"):
-                merged.setdefault("endTime", end_ms_int)
-            if exchange_id.startswith("okx"):
-                merged.setdefault("to", end_ms_int)
-            if exchange_id.startswith("kucoin"):
-
                 merged.setdefault("endAt", end_ms_int // 1000)
+
+            # Generic helpers some exchanges accept
+            if start_ms_int is not None:
+                merged.setdefault("since", start_ms_int)
             merged.setdefault("until", end_ms_int)
             return merged
 
@@ -742,12 +722,7 @@ class CCXTAccountClient(AccountClientProtocol):
             currency_code = None
 
         events: List[Dict[str, Any]] = []
-
         seen_keys: set[Tuple[Any, ...]] = set()
-
-
-        seen_keys: set[Tuple[Any, ...]] = set()
-
 
         for flow_type, method_name, extra_params in (
             ("deposit", "fetch_deposits", deposit_params),
@@ -757,23 +732,14 @@ class CCXTAccountClient(AccountClientProtocol):
             if fetch_method is None:
                 continue
 
-
-            params_with_end = _merge_time_params(extra_params, since_ms, now_ms)
-
-            params_with_end = _merge_time_params(extra_params, now_ms)
-
+            params_with_range = _merge_time_params(extra_params, since_ms, now_ms)
 
             async def _fetch_chunked() -> List[Mapping[str, Any]]:
                 entries_accum: List[Mapping[str, Any]] = []
                 window_start = since_ms
                 while window_start <= now_ms:
-
                     window_end = min(window_start + chunk_span_ms - 1, now_ms)
                     window_params = _merge_time_params(extra_params, window_start, window_end)
-
-                    window_end = min(window_start + chunk_span_ms, now_ms)
-                    window_params = _merge_time_params(extra_params, window_end)
-
                     try:
                         chunk = await fetch_method(
                             currency_code,
@@ -804,7 +770,7 @@ class CCXTAccountClient(AccountClientProtocol):
                     currency_code,
                     since=since_ms,
                     limit=limit,
-                    params=params_with_end,
+                    params=params_with_range,
                 )
             except BadRequest as exc:
                 if _is_time_range_error(exc):
@@ -818,13 +784,6 @@ class CCXTAccountClient(AccountClientProtocol):
                         exc_info=self._debug_api_payloads,
                     )
                     continue
-
-
-
-                    params=extra_params,
-                )
-
-
             except NotSupported:
                 continue
             except BaseError as exc:
@@ -853,36 +812,35 @@ class CCXTAccountClient(AccountClientProtocol):
                 if not isinstance(entry, Mapping):
                     continue
                 normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
-
-
                 if normalised is None:
                     continue
-                key_id = normalised.get("txid") or normalised.get("id")
-                if key_id:
-                    dedupe_key = (normalised["type"], str(key_id))
-                else:
-                    dedupe_key = (
-                        normalised["type"],
-                        normalised.get("currency"),
-                        float(normalised.get("amount", 0.0)),
-                        int(normalised.get("timestamp_ms", 0)),
-                    )
+                dedupe_key = self._cashflow_dedupe_key(normalised)
                 if dedupe_key in seen_keys:
                     continue
                 seen_keys.add(dedupe_key)
                 events.append(normalised)
-
-
-                if normalised is not None:
-                    events.append(normalised)
-
-
 
         if not events:
             return []
 
         events.sort(key=lambda item: item.get("timestamp_ms", 0), reverse=True)
         return events
+
+    def _cashflow_dedupe_key(self, entry: Mapping[str, Any]) -> Tuple[Any, ...]:
+        """Build a stable dedupe key for a normalised cashflow entry."""
+        entry_type = entry.get("type")
+        txid = entry.get("txid") or entry.get("id")
+        if txid:
+            return (entry_type, str(txid))
+
+        currency = entry.get("currency")
+        amount = _coerce_float(entry.get("amount"))
+        if amount is None:
+            amount = 0.0
+        timestamp = _coerce_int(entry.get("timestamp_ms"))
+        if timestamp is None:
+            timestamp = 0
+        return (entry_type, currency, amount, timestamp)
 
     def _normalise_cashflow_entry(
         self,
@@ -943,9 +901,7 @@ class CCXTAccountClient(AccountClientProtocol):
             fee_currency = fee_raw.get("currency")
             if fee_cost is not None:
                 if isinstance(fee_currency, str) and fee_currency.strip():
-                    note_parts.append(
-                        f"Fee {fee_cost:g} {fee_currency.strip()}"
-                    )
+                    note_parts.append(f"Fee {fee_cost:g} {fee_currency.strip()}")
                 else:
                     note_parts.append(f"Fee {fee_cost:g}")
 
@@ -976,7 +932,7 @@ class CCXTAccountClient(AccountClientProtocol):
         self._log_exchange_payload("fetch_balance", balance_raw, self._balance_params)
         balance_value = _extract_balance(balance_raw, self.config.settle_currency)
         positions_raw: Iterable[Mapping[str, Any]] = []
-        positions: list[Dict[str, Any]] = []
+        positions: List[Dict[str, Any]] = []
         if hasattr(self.client, "fetch_positions"):
             try:
                 positions_raw = await self.client.fetch_positions(params=self._positions_params)
@@ -1051,13 +1007,13 @@ class CCXTAccountClient(AccountClientProtocol):
                 "[%s] fetch_positions not available on exchange client", self.config.name
             )
 
-        open_orders: list[Dict[str, Any]] = []
+        open_orders: List[Dict[str, Any]] = []
         if hasattr(self.client, "fetch_open_orders"):
             try:
                 self._refresh_open_order_preferences()
                 raw_orders: Optional[Iterable[Mapping[str, Any]]] = None
                 if self.config.symbols:
-                    combined: list[Mapping[str, Any]] = []
+                    combined: List[Mapping[str, Any]] = []
                     for symbol in self.config.symbols:
                         params = dict(self._orders_params)
                         raw = await self.client.fetch_open_orders(symbol, params=params)
@@ -1178,7 +1134,7 @@ class CCXTAccountClient(AccountClientProtocol):
         return payload, prefix
 
     @classmethod
-    def _extract_error_detail(cls, payload: Optional[Mapping[str, Any]]) -> Optional[str]:
+    def _extract_error_detail(cls, payload: Optional[Mapping[str, Any]]) -> Optional[string]:
         if not payload:
             return None
         candidates = (
@@ -1338,7 +1294,7 @@ class CCXTAccountClient(AccountClientProtocol):
             return None
         if not candles or len(candles) < 2:
             return None
-        closes: list[float] = []
+        closes: List[float] = []
         for candle in candles:
             price = _first_float(candle[4] if len(candle) > 4 else None)
             if price is None or price <= 0:
@@ -1346,7 +1302,7 @@ class CCXTAccountClient(AccountClientProtocol):
             closes.append(price)
         if len(closes) < 2:
             return None
-        returns: list[float] = []
+        returns: List[float] = []
         for previous, current in zip(closes, closes[1:]):
             if previous <= 0 or current <= 0:
                 continue
@@ -1421,7 +1377,7 @@ class CCXTAccountClient(AccountClientProtocol):
             "3d": 3 * 24 * 60 * 60 * 1000,
             "7d": 7 * 24 * 60 * 60 * 1000,
         }
-        aggregated: Dict[str, list[float]] = {key: [] for key in windows}
+        aggregated: Dict[str, List[float]] = {key: [] for key in windows}
         for entry in history:
             timestamp = _extract_timestamp(entry)
             rate = _extract_rate(entry)
@@ -1629,10 +1585,7 @@ class CCXTAccountClient(AccountClientProtocol):
 
         try:
             self._refresh_open_order_preferences()
-            if symbol_filter:
-                symbols = [symbol_filter]
-            else:
-                symbols = self.config.symbols or [None]
+            symbols = [symbol_filter] if symbol_filter else (self.config.symbols or [None])
             for symbol in symbols:
                 params = dict(self._orders_params)
                 orders = await self.client.fetch_open_orders(symbol, params=params)
@@ -1718,29 +1671,22 @@ class CCXTAccountClient(AccountClientProtocol):
             if position_idx is not None and "positionIdx" not in params:
                 params["positionIdx"] = position_idx
 
+            # OKX-specific param normalization
             if self._normalized_exchange == "okx":
-
                 info = position.get("info") if isinstance(position.get("info"), Mapping) else None
-
 
                 okx_pos_side = None
                 raw_okx_side = position.get("posSide")
                 if isinstance(raw_okx_side, str) and raw_okx_side.strip():
                     okx_pos_side = raw_okx_side.strip().lower()
-
                 if okx_pos_side is None and isinstance(info, Mapping):
                     info_side = info.get("posSide")
-
-                if okx_pos_side is None and isinstance(position.get("info"), Mapping):
-                    info_side = position["info"].get("posSide")
-
                     if isinstance(info_side, str) and info_side.strip():
                         okx_pos_side = info_side.strip().lower()
                 if okx_pos_side is None and position_side:
                     okx_pos_side = position_side.lower()
                 if okx_pos_side in {"long", "short", "net"} and "posSide" not in params:
                     params["posSide"] = okx_pos_side
-
 
                 okx_td_mode: Optional[str] = None
                 for key in ("tdMode", "tradeMode", "marginMode", "mgnMode"):
@@ -1756,7 +1702,6 @@ class CCXTAccountClient(AccountClientProtocol):
                             break
                 if okx_td_mode:
                     params.setdefault("tdMode", okx_td_mode)
-
 
             if side_explicit:
                 params.pop("reduceOnly", None)

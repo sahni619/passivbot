@@ -16,13 +16,11 @@ from risk_management.account_clients import _apply_credentials, _instantiate_ccx
 from risk_management.configuration import AccountConfig
 from risk_management.realized_pnl import fetch_realized_pnl_history
 
-
 T = TypeVar("T")
 
 
 def run_async(coro: Awaitable[T]) -> T:
     """Execute ``coro`` in a fresh event loop to avoid cross-test interference."""
-
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
@@ -129,7 +127,9 @@ def test_instantiate_ccxt_client_respects_load_helper_override(monkeypatch) -> N
 
     calls: list[Dict[str, Any]] = []
 
-    def fake_load(exchange_id: str, enable_rate_limit: bool = True, apply_custom_endpoints: bool = True):
+    def fake_load(
+        exchange_id: str, enable_rate_limit: bool = True, apply_custom_endpoints: bool = True
+    ):
         calls.append(
             {
                 "exchange_id": exchange_id,
@@ -209,7 +209,7 @@ def test_translate_ccxt_error_generic(monkeypatch) -> None:
     config = AccountConfig(name="Binance", exchange="binanceusdm", credentials={})
     client = module.CCXTAccountClient(config)
 
-    error = module.BaseError("binanceusdm {\"message\":\"rate limit exceeded\"}")
+    error = module.BaseError('binanceusdm {"message":"rate limit exceeded"}')
 
     translated = client._translate_ccxt_error(error)
 
@@ -219,7 +219,7 @@ def test_translate_ccxt_error_generic(monkeypatch) -> None:
     assert "See logs" in message
 
 
-def test_fetch_realized_pnl_history_binance_uses_income_endpoint(monkeypatch) -> None:
+def test_fetch_realized_pnl_history_binance_uses_income_endpoint() -> None:
     class DummyIncomeClient:
         def __init__(self) -> None:
             self.calls: list[Mapping[str, Any]] = []
@@ -261,7 +261,7 @@ def test_fetch_realized_pnl_history_bybit_paginates_closed_pnl() -> None:
                         "nextPageCursor": "cursor123",
                     }
                 },
-                {"result": {"list": [{"pnl": "0.3"}]}}
+                {"result": {"list": [{"pnl": "0.3"}]}},
             ]
 
         async def private_get_v5_position_closed_pnl(self, params=None):  # type: ignore[override]
@@ -439,7 +439,7 @@ def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) ->
             if self._fail_once:
                 self._fail_once = False
                 raise module.BadRequest(
-                    "bybit {\"retMsg\":\"The interval between the startTime and endTime is incorrect\"}"
+                    'bybit {"retMsg":"The interval between the startTime and endTime is incorrect"}'
                 )
             self._chunk_calls += 1
             if self._chunk_calls > 1:
@@ -485,7 +485,6 @@ def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) ->
 
     expected_since = fake_now_ms - int(timedelta(days=30).total_seconds() * 1000)
     assert deposit_call["params"].get("startTime") == expected_since
-
     assert deposit_call["params"].get("endTime") == fake_now_ms
     assert deposit_call["params"].get("until") == fake_now_ms
 
@@ -502,6 +501,3 @@ def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) ->
     assert first_chunk["params"].get("startTime") == expected_since
     chunk_end = first_chunk["params"].get("endTime") or first_chunk["params"].get("until")
     assert chunk_end is not None and chunk_end < fake_now_ms
-
-    assert first_withdrawal["params"].get("endTime") == fake_now_ms
-
