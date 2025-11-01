@@ -39,6 +39,15 @@
       class="view-nav__button"
       role="tab"
       aria-selected="false"
+      data-page-target="cashflows"
+    >
+      Cash flows
+    </button>
+    <button
+      type="button"
+      class="view-nav__button"
+      role="tab"
+      aria-selected="false"
       data-page-target="trading"
     >
       Trading
@@ -423,6 +432,103 @@
           </div>
         </section>
       {% endif %}
+    </div>
+
+    {% set cashflows = snapshot.cashflows if snapshot.cashflows is defined else None %}
+    <div class="page-section" data-page-section="cashflows" hidden>
+      <section class="card">
+        <h2 style="margin-bottom: 0.5rem;">Cash flow overview</h2>
+        <p style="color: var(--muted); margin: 0;">
+          Recent deposits and withdrawals across all monitored exchanges.
+        </p>
+        <div class="metrics" style="margin-top: 1.5rem;" data-cashflow-summary>
+          {% for window in ["7d", "14d", "21d", "30d"] %}
+            {% set label = window.replace('d', ' days') %}
+            {% set window_summary = cashflows.summary[window] if cashflows and cashflows.summary is defined and cashflows.summary.get(window) else None %}
+            {% set currencies = window_summary.currencies if window_summary and window_summary.currencies is defined else [] %}
+            {% set totals = window_summary.totals if window_summary and window_summary.totals is defined else {} %}
+            {% set primary = currencies[0] if currencies else None %}
+            {% set net_value = primary.net if primary and primary.net is not none else (totals.net if totals and totals.net is defined else None) %}
+            {% set net_class = 'gain' if net_value is not none and net_value >= 0 else ('loss' if net_value is not none else '') %}
+            <div class="metric" data-cashflow-window="{{ window }}">
+              <span class="label">Last {{ label }}</span>
+              <span class="value {{ net_class }}">
+                {% if net_value is not none %}
+                  {{ net_value|float|round(2) }}{% if primary and primary.currency %} {{ primary.currency }}{% endif %}
+                {% else %}
+                  -
+                {% endif %}
+              </span>
+              <span class="subvalue">
+                {% if totals %}
+                  Deposits {{ totals.deposits|default(0.0)|float|round(2) }} · Withdrawals {{ totals.withdrawals|default(0.0)|float|round(2) }}
+                {% else %}
+                  No activity recorded
+                {% endif %}
+              </span>
+              {% if currencies|length > 1 %}
+                <ul class="cashflow-breakdown">
+                  {% for entry in currencies %}
+                    <li>
+                      <strong>{{ entry.currency or 'UNKNOWN' }}</strong>:
+                      <span class="{{ 'gain' if entry.net >= 0 else 'loss' }}">{{ entry.net|float|round(2) }}</span>
+                      ({{ entry.deposit_count }} in · {{ entry.withdrawal_count }} out)
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% endif %}
+            </div>
+          {% endfor %}
+        </div>
+      </section>
+      <section class="card" style="margin-top: 1.5rem;">
+        <h2 style="margin-bottom: 0.5rem;">Recent transfers</h2>
+        <p style="color: var(--muted); margin: 0;">
+          Latest funding movements aggregated across all accounts.
+        </p>
+        <div class="table-wrapper" style="margin-top: 1.5rem;">
+          <table>
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Account</th>
+                <th>Exchange</th>
+                <th>Type</th>
+                <th>Amount</th>
+                <th>Status</th>
+                <th>Reference</th>
+              </tr>
+            </thead>
+            <tbody data-cashflow-events>
+              {% if cashflows and cashflows.events %}
+                {% for event in cashflows.events[:100] %}
+                  <tr>
+                    <td>{{ event.timestamp }}</td>
+                    <td>{{ event.account }}</td>
+                    <td>{{ event.exchange }}</td>
+                    <td>
+                      <span class="badge {{ 'ok' if event.type == 'deposit' else 'alert' }}">{{ event.type|capitalize }}</span>
+                    </td>
+                    <td class="{{ 'gain' if event.type == 'deposit' else 'loss' }}">
+                      {{ event.amount|float|round(4) }} {{ event.currency }}
+                    </td>
+                    <td>{{ event.status or '-' }}</td>
+                    <td>{{ event.txid or event.note or '-' }}</td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="7" class="muted">No cash flow activity recorded.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+          <div class="table-pagination" data-cashflow-pagination aria-label="Cash flow events">
+            {% set event_count = cashflows.events|length if cashflows and cashflows.events is defined else 0 %}
+            <span>{{ event_count }} record{{ '' if event_count == 1 else 's' }}</span>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div class="page-section" data-page-section="accounts" hidden>
@@ -1246,6 +1352,7 @@
     const DEFAULT_PAGE = "overview";
     const STORAGE_KEY = "risk-dashboard.activePage";
     const METRIC_WINDOWS = ["4h", "24h", "3d", "7d"];
+    const CASHFLOW_WINDOWS = ["7d", "14d", "21d", "30d"];
     const DEFAULT_SORT_KEY = "balance";
     const DEFAULT_SORT_ORDER = "desc";
     const SORT_LABELS = {
@@ -1337,6 +1444,7 @@
     const pageSections = Array.from(document.querySelectorAll("[data-page-section]"));
     const navButtons = Array.from(document.querySelectorAll("[data-page-target]"));
     const accountsSection = document.querySelector('[data-page-section="accounts"]');
+    const cashflowSection = document.querySelector('[data-page-section="cashflows"]');
     const accountsContainer = accountsSection ? accountsSection.querySelector("[data-accounts]") : null;
     const accountsControlsElement = document.querySelector("[data-accounts-controls]");
     const accountsSummaryEl = document.querySelector("[data-accounts-summary]");
@@ -1536,6 +1644,33 @@
     const formatCurrency = (value) => {
       const number = Number(value || 0);
       return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(number);
+    };
+
+    const formatTokenAmount = (value, { maximumFractionDigits = 6 } = {}) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) {
+        return "0.00";
+      }
+      const abs = Math.abs(number);
+      let decimals = 2;
+      if (abs < 1) {
+        decimals = 4;
+      } else if (abs < 1000) {
+        decimals = 3;
+      }
+      const options = {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: Math.min(Math.max(decimals, maximumFractionDigits), 8),
+      };
+      return number.toLocaleString("en-US", options);
+    };
+
+    const formatAmountWithCurrency = (amount, currency) => {
+      const formatted = formatTokenAmount(amount ?? 0);
+      if (currency && typeof currency === "string" && currency.trim()) {
+        return `${formatted} ${escapeHtml(currency.trim())}`;
+      }
+      return formatted;
     };
 
     const formatPrice = (value) => {
@@ -3039,6 +3174,109 @@
       }
     };
 
+    const renderCashflows = (snapshot) => {
+      if (!cashflowSection) {
+        return;
+      }
+      const cashflows = snapshot.cashflows || {};
+      const summary = cashflows.summary || {};
+      const events = Array.isArray(cashflows.events) ? cashflows.events.slice(0, 200) : [];
+
+      const summaryContainer = cashflowSection.querySelector("[data-cashflow-summary]");
+      if (summaryContainer) {
+        const summaryHtml = CASHFLOW_WINDOWS.map((window) => {
+          const windowSummary = summary?.[window];
+          const currencies = Array.isArray(windowSummary?.currencies)
+            ? windowSummary.currencies
+            : [];
+          const totals = windowSummary?.totals || null;
+          const primary = currencies.length > 0 ? currencies[0] : null;
+          const netRaw = primary?.net ?? (typeof totals?.net === "number" ? totals.net : null);
+          const netValue = Number.isFinite(Number(netRaw)) ? Number(netRaw) : null;
+          const netClass = netValue === null ? "" : netValue >= 0 ? "gain" : "loss";
+          const netLabel = netValue === null
+            ? "-"
+            : formatAmountWithCurrency(netValue, primary?.currency || "");
+          const totalsMarkup = totals
+            ? `Deposits ${formatTokenAmount(totals.deposits ?? 0)} · Withdrawals ${formatTokenAmount(
+                totals.withdrawals ?? 0,
+              )}`
+            : "No activity recorded";
+          const breakdown = currencies.length > 1
+            ? `<ul class="cashflow-breakdown">${currencies
+                .map((entry) => {
+                  const entryNet = Number(entry?.net ?? 0);
+                  const entryClass = entryNet >= 0 ? "gain" : "loss";
+                  const currencyCode = entry?.currency ? escapeHtml(String(entry.currency)) : "UNKNOWN";
+                  const depositCount = Number(entry?.deposit_count ?? 0);
+                  const withdrawalCount = Number(entry?.withdrawal_count ?? 0);
+                  return `<li><strong>${currencyCode}</strong>: <span class="${entryClass}">${formatTokenAmount(
+                    entryNet,
+                  )}</span> (${depositCount} in · ${withdrawalCount} out)</li>`;
+                })
+                .join("")}</ul>`
+            : "";
+          return `
+            <div class="metric" data-cashflow-window="${window}">
+              <span class="label">Last ${window.replace("d", " days")}</span>
+              <span class="value ${netClass}">${netLabel}</span>
+              <span class="subvalue">${totalsMarkup}</span>
+              ${breakdown}
+            </div>
+          `;
+        }).join("");
+        summaryContainer.innerHTML = summaryHtml;
+      }
+
+      const eventsBody = cashflowSection.querySelector("[data-cashflow-events]");
+      if (eventsBody) {
+        if (!events.length) {
+          eventsBody.innerHTML = '<tr><td colspan="7" class="muted">No cash flow activity recorded.</td></tr>';
+        } else {
+          const rows = events
+            .map((event) => {
+              const rawTimestamp = event?.timestamp;
+              let timestampLabel = "-";
+              if (typeof rawTimestamp === "string" && rawTimestamp) {
+                const parsed = new Date(rawTimestamp);
+                timestampLabel = Number.isFinite(parsed.getTime())
+                  ? parsed.toLocaleString()
+                  : escapeHtml(rawTimestamp);
+              }
+              const account = event?.account ? escapeHtml(String(event.account)) : "";
+              const exchange = event?.exchange ? escapeHtml(String(event.exchange)) : "";
+              const type = String(event?.type || "").toLowerCase();
+              const typeClass = type === "deposit" ? "ok" : "alert";
+              const amountClass = type === "deposit" ? "gain" : "loss";
+              const typeLabel = type ? `${type.charAt(0).toUpperCase()}${type.slice(1)}` : "Unknown";
+              const amountLabel = formatAmountWithCurrency(event?.amount ?? 0, event?.currency || "");
+              const status = event?.status ? escapeHtml(String(event.status)) : "-";
+              const reference = event?.txid || event?.note || "";
+              const referenceLabel = reference ? escapeHtml(String(reference)) : "-";
+              return `
+                <tr>
+                  <td>${timestampLabel}</td>
+                  <td>${account}</td>
+                  <td>${exchange}</td>
+                  <td><span class="badge ${typeClass}">${escapeHtml(typeLabel)}</span></td>
+                  <td class="${amountClass}">${amountLabel}</td>
+                  <td>${status}</td>
+                  <td>${referenceLabel}</td>
+                </tr>
+              `;
+            })
+            .join("");
+          eventsBody.innerHTML = rows;
+        }
+      }
+
+      const pagination = cashflowSection.querySelector("[data-cashflow-pagination]");
+      if (pagination) {
+        const total = Array.isArray(cashflows.events) ? cashflows.events.length : 0;
+        pagination.innerHTML = `<span>${total} record${total === 1 ? "" : "s"}</span>`;
+      }
+    };
+
     const renderSnapshot = (snapshot) => {
       latestSnapshot = snapshot;
       const generatedAtEl = document.querySelector("[data-generated-at]");
@@ -3050,6 +3288,7 @@
       renderAlerts(snapshot);
       renderNotifications(snapshot);
       renderPolicies(snapshot);
+      renderCashflows(snapshot);
       if (tradingModule) {
         tradingModule.updateSnapshot(snapshot);
       }
