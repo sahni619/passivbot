@@ -679,7 +679,9 @@ class CCXTAccountClient(AccountClientProtocol):
             if exchange_id.startswith("okx"):
                 if start_ms_int is not None:
                     merged.setdefault("from", start_ms_int)
+                    merged.setdefault("after", start_ms_int)
                 merged.setdefault("to", end_ms_int)
+                merged.setdefault("before", end_ms_int)
             # Kucoin expects startAt/endAt (seconds)
             if exchange_id.startswith("kucoin"):
                 if start_ms_int is not None:
