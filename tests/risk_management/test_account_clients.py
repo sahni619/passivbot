@@ -503,6 +503,72 @@ def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) ->
     assert chunk_end is not None and chunk_end < fake_now_ms
 
 
+def test_fetch_cashflows_okx_aligns_cursor_params(monkeypatch) -> None:
+    fake_now_ms = 1_700_000_000_000
+
+    class DummyCashflowClient:
+        def __init__(self) -> None:
+            self.calls: list[Dict[str, Any]] = []
+
+        async def fetch_deposits(self, code=None, since=None, limit=None, params=None):  # type: ignore[override]
+            params = dict(params or {})
+            self.calls.append({"type": "deposit", "params": params})
+            return [
+                {
+                    "id": "dep-okx",
+                    "amount": "10",
+                    "currency": "USDT",
+                    "timestamp": fake_now_ms - 500,
+                }
+            ]
+
+        async def fetch_withdrawals(self, code=None, since=None, limit=None, params=None):  # type: ignore[override]
+            params = dict(params or {})
+            self.calls.append({"type": "withdrawal", "params": params})
+            return [
+                {
+                    "id": "wd-okx",
+                    "amount": "4",
+                    "currency": "USDT",
+                    "timestamp": fake_now_ms - 400,
+                }
+            ]
+
+        async def close(self):  # type: ignore[override]
+            return None
+
+    dummy = DummyCashflowClient()
+
+    monkeypatch.setattr(module.time, "time", lambda: fake_now_ms / 1000)
+    monkeypatch.setattr(module, "_instantiate_ccxt_client", lambda exchange, credentials, **kwargs: dummy)
+    monkeypatch.setattr(module, "normalize_exchange_name", lambda exchange: "okx")
+    monkeypatch.setattr(module, "resolve_custom_endpoint_override", lambda exchange: None)
+    monkeypatch.setattr(module, "get_custom_endpoint_source", lambda: None)
+
+    config = AccountConfig(
+        name="OKX",
+        exchange="okx",
+        credentials={},
+        params={"cashflows": {"lookback_days": 30}},
+    )
+
+    client = module.CCXTAccountClient(config)
+
+    events = run_async(client._fetch_cashflows())
+
+    assert events, "expected cashflow events to be returned"
+
+    expected_since = fake_now_ms - int(timedelta(days=30).total_seconds() * 1000)
+
+    for call in dummy.calls:
+        params = call["params"]
+        assert params.get("from") == expected_since
+        assert params.get("to") == fake_now_ms
+        assert params.get("after") == expected_since
+        assert params.get("before") == fake_now_ms
+        assert params["after"] <= params["before"]
+
+
 def test_fetch_cashflows_bybit_account_type_variants(monkeypatch) -> None:
     fake_now_ms = 1_700_000_000_000
 

@@ -677,9 +677,51 @@ class CCXTAccountClient(AccountClientProtocol):
                 merged.setdefault("endTime", end_ms_int)
             # OKX expects from/to (ms)
             if exchange_id.startswith("okx"):
-                if start_ms_int is not None:
-                    merged.setdefault("from", start_ms_int)
-                merged.setdefault("to", end_ms_int)
+                def _coerce_ms(value: Any) -> Optional[int]:
+                    if value is None:
+                        return None
+                    if isinstance(value, bool):
+                        return None
+                    if isinstance(value, (int, float)):
+                        return int(value)
+                    if isinstance(value, str):
+                        candidate = value.strip()
+                        if not candidate:
+                            return None
+                        try:
+                            return int(float(candidate))
+                        except ValueError:
+                            return None
+                    return None
+
+                start_cursor = _coerce_ms(merged.get("from"))
+                if start_cursor is None:
+                    start_cursor = start_ms_int
+                if start_cursor is not None:
+                    merged["from"] = int(start_cursor)
+                else:
+                    merged.pop("from", None)
+
+                end_cursor = _coerce_ms(merged.get("to"))
+                if end_cursor is None:
+                    end_cursor = end_ms_int
+                if end_cursor is not None:
+                    merged["to"] = int(end_cursor)
+                else:
+                    merged.pop("to", None)
+
+                if start_cursor is not None and end_cursor is not None and start_cursor > end_cursor:
+                    start_cursor, end_cursor = end_cursor, start_cursor
+
+                if start_cursor is not None:
+                    merged["after"] = int(start_cursor)
+                else:
+                    merged.pop("after", None)
+
+                if end_cursor is not None:
+                    merged["before"] = int(end_cursor)
+                else:
+                    merged.pop("before", None)
             # Kucoin expects startAt/endAt (seconds)
             if exchange_id.startswith("kucoin"):
                 if start_ms_int is not None:
