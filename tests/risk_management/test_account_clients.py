@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Mapping, TypeVar
 
@@ -481,10 +482,26 @@ def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) ->
     assert types == {"deposit", "withdrawal"}
 
     deposit_call = next(call for call in dummy.calls if call["type"] == "deposit")
+
+    expected_since = fake_now_ms - int(timedelta(days=30).total_seconds() * 1000)
+    assert deposit_call["params"].get("startTime") == expected_since
+
     assert deposit_call["params"].get("endTime") == fake_now_ms
     assert deposit_call["params"].get("until") == fake_now_ms
 
     withdrawal_calls = [call for call in dummy.calls if call["type"] == "withdrawal"]
     assert withdrawal_calls, "expected at least one withdrawal call"
     first_withdrawal = withdrawal_calls[0]
+
+    assert first_withdrawal["params"].get("startTime") == expected_since
     assert first_withdrawal["params"].get("endTime") == fake_now_ms
+
+    chunked_calls = [call for call in withdrawal_calls[1:] if call["params"]]
+    assert chunked_calls, "expected withdrawal chunk retries after time error"
+    first_chunk = chunked_calls[0]
+    assert first_chunk["params"].get("startTime") == expected_since
+    chunk_end = first_chunk["params"].get("endTime") or first_chunk["params"].get("until")
+    assert chunk_end is not None and chunk_end < fake_now_ms
+
+    assert first_withdrawal["params"].get("endTime") == fake_now_ms
+
