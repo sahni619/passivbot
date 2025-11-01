@@ -367,10 +367,10 @@ class CCXTAccountClient(AccountClientProtocol):
             credentials,
             custom_endpoint_override=apply_override,
         )
-        self._balance_params = dict(config.params.get("balance", {}))
-        self._positions_params = dict(config.params.get("positions", {}))
-        self._orders_params = dict(config.params.get("orders", {}))
-        self._close_params = dict(config.params.get("close", {}))
+        self._balance_params = self._normalise_params(config.params.get("balance"))
+        self._positions_params = self._normalise_params(config.params.get("positions"))
+        self._orders_params = self._normalise_params(config.params.get("orders"))
+        self._close_params = self._normalise_params(config.params.get("close"))
         cashflow_params = config.params.get("cashflows", {})
         self._cashflow_params = dict(cashflow_params) if isinstance(cashflow_params, Mapping) else {}
         self._markets_loaded: Optional[asyncio.Lock] = None
@@ -404,6 +404,17 @@ class CCXTAccountClient(AccountClientProtocol):
             params_repr,
             payload_repr,
         )
+
+    @staticmethod
+    def _normalise_params(params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        """Return a copy of ``params`` when it is a mapping, otherwise an empty dict."""
+
+        if isinstance(params, Mapping):
+            return dict(params)
+        if params is None:
+            return {}
+        logger.warning("Unsupported params type %s; ignoring", type(params).__name__)
+        return {}
 
     async def _ensure_markets(self) -> None:
         lock = self._markets_loaded
@@ -726,14 +737,20 @@ class CCXTAccountClient(AccountClientProtocol):
         """Return the latest account snapshot."""
         try:
             await self._ensure_markets()
-            balance_payload = await self.client.fetch_balance(params=self._balance_params or None)
+            if self._balance_params:
+                balance_payload = await self.client.fetch_balance(params=self._balance_params)
+            else:
+                balance_payload = await self.client.fetch_balance()
         except BaseError as exc:
             raise self._translate_ccxt_error(exc)
 
         balance_value = _extract_balance(balance_payload or {}, self.config.settle_currency)
 
         try:
-            raw_positions = await self.client.fetch_positions(params=self._positions_params or None)
+            if self._positions_params:
+                raw_positions = await self.client.fetch_positions(params=self._positions_params)
+            else:
+                raw_positions = await self.client.fetch_positions()
         except NotSupported:
             raw_positions = []
         except BaseError as exc:
@@ -777,7 +794,10 @@ class CCXTAccountClient(AccountClientProtocol):
                 position.setdefault("market_data", {}).update(metrics)
 
         try:
-            open_orders_payload = await self.client.fetch_open_orders(params=self._orders_params or None)
+            if self._orders_params:
+                open_orders_payload = await self.client.fetch_open_orders(params=self._orders_params)
+            else:
+                open_orders_payload = await self.client.fetch_open_orders()
         except BaseError as exc:
             if _is_symbol_specific_open_orders_warning(exc):
                 self._refresh_open_order_preferences()
@@ -880,7 +900,10 @@ class CCXTAccountClient(AccountClientProtocol):
                 raise NotSupported("cancel_all_orders is not supported by this exchange")
             return {}
         try:
-            return await canceller(symbol, params=self._close_params or None)
+            kwargs: Dict[str, Any] = {}
+            if self._close_params:
+                kwargs["params"] = self._close_params
+            return await canceller(symbol, **kwargs)
         except BaseError as exc:
             raise self._translate_ccxt_error(exc)
 
