@@ -3,6 +3,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -45,12 +46,32 @@ def test_parse_snapshot_skips_accounts_missing_required_fields(caplog):
     assert thresholds.wallet_exposure_pct == defaults.wallet_exposure_pct
     assert notifications == ["email"]
 
-
     assert any("Skipping account" in message for message in caplog.messages)
 
     messages = "".join(record.message for record in caplog.records)
     assert "Skipping account" in messages
 
+
+def test_parse_snapshot_accepts_account_field():
+    snapshot = {
+        "generated_at": "2024-07-01T12:00:00Z",
+        "accounts": [
+            {
+                "account": "Binance Futures",
+                "balance": "12345.67",
+                "positions": [],
+                "open_orders": [],
+            }
+        ],
+        "alert_thresholds": {},
+    }
+
+    _, accounts, _, _ = parse_snapshot(snapshot)
+
+    assert len(accounts) == 1
+    account = accounts[0]
+    assert account.name == "Binance Futures"
+    assert account.balance == pytest.approx(12345.67)
 
 
 def test_parse_snapshot_ignores_non_mapping_accounts(caplog):
@@ -81,4 +102,3 @@ def test_parse_snapshot_logs_when_accounts_payload_not_iterable(caplog):
 
     messages = "".join(record.message for record in caplog.records)
     assert "not a mapping" in messages
-

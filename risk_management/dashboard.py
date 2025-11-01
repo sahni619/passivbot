@@ -21,7 +21,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .configuration import CustomEndpointSettings, load_realtime_config
 from .domain.models import (
@@ -255,8 +255,19 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
 
 
 def _parse_account(raw: Mapping[str, Any]) -> Account:
-    if "name" not in raw or "balance" not in raw:
+    name_raw = raw.get("name")
+    if name_raw in (None, "") and "account" in raw:
+        name_raw = raw.get("account")
+
+    balance_raw = raw.get("balance")
+
+    if name_raw in (None, "") or balance_raw in (None, ""):
         raise ValueError("Account entries must include 'name' and 'balance'.")
+
+    try:
+        balance_value = float(balance_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Account balance must be numeric.") from exc
 
     positions_raw = raw.get("positions", [])
     positions = [_parse_position(pos) for pos in positions_raw]
@@ -284,8 +295,8 @@ def _parse_account(raw: Mapping[str, Any]) -> Account:
         if key in raw and key not in metadata:
             metadata[key] = raw[key]
     return Account(
-        name=str(raw["name"]),
-        balance=float(raw["balance"]),
+        name=str(name_raw),
+        balance=balance_value,
         positions=positions,
         orders=orders,
         daily_realized_pnl=float(daily_realized),
@@ -352,45 +363,62 @@ def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], A
     accounts: List[Account] = []
     accounts_raw = data.get("accounts", [])
 
+    indexed_accounts: List[Tuple[int, Any]] = []
+    key_lookup: Dict[int, Any] = {}
 
     if isinstance(accounts_raw, Mapping):
-        accounts_iterable: Iterable[Any] = accounts_raw.values()
+        for idx, (key, value) in enumerate(accounts_raw.items()):
+            key_lookup[idx] = key
+            indexed_accounts.append((idx, value))
     elif isinstance(accounts_raw, Iterable) and not isinstance(
         accounts_raw, (str, bytes, bytearray)
     ):
-        accounts_iterable = accounts_raw
+        indexed_accounts = list(enumerate(accounts_raw))
     else:
         if accounts_raw not in (None, []):
             logger.warning(
-                "Skipping accounts payload because it is not an iterable of mappings: %r",
+                "Skipping accounts payload because it is not an iterable of mappings; "
+                "entries must be mappings but received %r (not a mapping).",
                 accounts_raw,
             )
-        accounts_iterable = []
+        indexed_accounts = []
 
-    for index, raw_account in enumerate(accounts_iterable):
-
-    if not isinstance(accounts_raw, Iterable):
-        accounts_raw = []
-
-    for index, raw_account in enumerate(accounts_raw):
-
+    for index, raw_account in indexed_accounts:
+        key_hint = key_lookup.get(index)
         if not isinstance(raw_account, Mapping):
-            logger.warning(
-                "Skipping account at index %s because entry is not a mapping: %r",
-                index,
-                raw_account,
-            )
+            if key_hint is not None:
+                logger.warning(
+                    "Skipping account at index %s (key %r) because entry is not a mapping: %r",
+                    index,
+                    key_hint,
+                    raw_account,
+                )
+            else:
+                logger.warning(
+                    "Skipping account at index %s because entry is not a mapping: %r",
+                    index,
+                    raw_account,
+                )
             continue
         try:
             account = _parse_account(raw_account)
         except (TypeError, ValueError) as exc:
             name = raw_account.get("name", "<unknown>")
-            logger.warning(
-                "Skipping account %s at index %s due to parse error: %s",
-                name,
-                index,
-                exc,
-            )
+            if key_hint is not None:
+                logger.warning(
+                    "Skipping account %s at index %s (key %r) due to parse error: %s",
+                    name,
+                    index,
+                    key_hint,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Skipping account %s at index %s due to parse error: %s",
+                    name,
+                    index,
+                    exc,
+                )
             continue
         accounts.append(account)
     thresholds = _parse_thresholds(data.get("alert_thresholds", {}))
