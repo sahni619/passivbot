@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -466,53 +467,430 @@ class CCXTAccountClient(AccountClientProtocol):
             else {}
         )
 
-        try:
-            exchange_id = self._normalized_exchange
-            if exchange_id in {"binanceusdm", "binancecoinm", "binancecm"}:
-                fetch_income = getattr(self.client, "fetch_income", None)
-                if fetch_income is None:
-                    return None
-                request = dict(params_base)
-                request.setdefault("incomeType", "REALIZED_PNL")
-                request.setdefault("startTime", since)
-                request.setdefault("endTime", until)
-                symbol_override = params_cfg.get("symbol")
-                if isinstance(symbol_override, str) and symbol_override:
-                    request.setdefault("symbol", symbol_override)
-                elif self.config.symbols and len(self.config.symbols) == 1:
-                    request.setdefault("symbol", self.config.symbols[0])
-                incomes = await fetch_income(params=request)
-                total = 0.0
-                for entry in incomes or []:
-                    amount = _coerce_float(entry.get("amount"))
-                    if amount is None and isinstance(entry.get("info"), Mapping):
-                        info = entry["info"]
-                        amount = _first_float(
-                            info.get("amount"),
-                            info.get("income"),
-                            info.get("realizedPnl"),
-                            info.get("realisedPnl"),
-                        )
-                    if amount is None:
-                        continue
-                    total += float(amount)
-                return total
+        symbol_override = params_cfg.get("symbol")
+        symbols: Optional[Sequence[Optional[str]]] = None
+        if isinstance(symbol_override, str) and symbol_override:
+            symbols = [symbol_override]
+        elif self.config.symbols:
+            symbols = [symbol for symbol in self.config.symbols if isinstance(symbol, str)]
 
-            if exchange_id == "bybit":
-                fetch_closed_pnl = getattr(
-                    self.client, "private_get_v5_position_closed_pnl", None
+        limit = _coerce_int(params_cfg.get("limit")) or _coerce_int(params_base.get("limit"))
+
+        try:
+            return await fetch_realized_pnl_history(
+                self._normalized_exchange,
+                self.client,
+                since=since,
+                until=until,
+                params=params_base,
+                limit=limit,
+                symbols=symbols,
+                account_name=self.config.name,
+                log=logger,
+                debug_api_payloads=self._debug_api_payloads,
+            )
+        except BaseError as exc:
+            logger.debug(
+                "[%s] Failed to fetch realised PnL via history endpoints: %s",
+                self.config.name,
+                exc,
+                exc_info=self._debug_api_payloads,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.debug(
+                "[%s] Unexpected error while fetching realised PnL via history: %s",
+                self.config.name,
+                exc,
+                exc_info=self._debug_api_payloads,
+            )
+
+        return None
+
+    async def _collect_symbol_metrics(
+        self, symbols: Sequence[str]
+    ) -> Dict[str, Mapping[str, Any]]:
+        """Fetch optional market data used to enrich position analytics."""
+        metrics: Dict[str, Mapping[str, Any]] = {}
+        if not symbols:
+            return metrics
+        settings = self._liquidity_settings
+        if not getattr(settings, "fetch_order_book", True):
+            return metrics
+        depth = getattr(settings, "depth", 25) or 25
+        for symbol in dict.fromkeys(symbols):
+            if not symbol:
+                continue
+            try:
+                order_book = await self.client.fetch_order_book(symbol, limit=depth)
+            except NotSupported:
+                logger.debug("[%s] Order book not supported for %s", self.config.name, symbol)
+                continue
+            except BaseError as exc:
+                logger.debug(
+                    "[%s] Failed to fetch order book for %s: %s",
+                    self.config.name,
+                    symbol,
+                    exc,
+                    exc_info=self._debug_api_payloads,
                 )
-                if fetch_closed_pnl is None:
-                    return None
-                limit = _coerce_int(params_cfg.get("limit")) or _coerce_int(
-                    params_base.get("limit")
+                continue
+            normalised = normalise_order_book(order_book, depth=depth)
+            if normalised:
+                metrics[symbol] = {"order_book": normalised}
+        return metrics
+
+    async def _fetch_cashflows(self) -> List[Mapping[str, Any]]:
+        """Return recent deposit and withdrawal events when configured."""
+        params_cfg = self._cashflow_params or {}
+        now_ms = int(time.time() * 1000)
+        lookback_ms = _coerce_int(params_cfg.get("lookback_ms"))
+        if lookback_ms is None:
+            lookback_days = _coerce_int(params_cfg.get("lookback_days"))
+            if lookback_days is None:
+                lookback_days = 30
+            lookback_ms = int(timedelta(days=lookback_days).total_seconds() * 1000)
+        since = _coerce_int(params_cfg.get("since_ms")) or now_ms - lookback_ms
+        until = _coerce_int(params_cfg.get("until_ms")) or now_ms
+        if since >= until:
+            since = max(0, until - lookback_ms)
+
+        base_params = (
+            dict(params_cfg.get("params", {}))
+            if isinstance(params_cfg.get("params"), Mapping)
+            else {}
+        )
+        limit = _coerce_int(params_cfg.get("limit"))
+        code = params_cfg.get("code") or self.config.settle_currency
+
+        account_types_cfg = params_cfg.get("account_types")
+        if isinstance(account_types_cfg, Sequence) and not isinstance(account_types_cfg, (str, bytes)):
+            account_types: Sequence[Optional[str]] = list(account_types_cfg)  # type: ignore[list-item]
+        elif account_types_cfg is None:
+            if self._normalized_exchange == "bybit":
+                account_types = [None, "UNIFIED", "CONTRACT", "SPOT"]
+            else:
+                account_types = [None]
+        else:
+            account_types = [account_types_cfg]
+
+        async def _fetch_side(
+            fetcher,
+            side: str,
+            account_type: Optional[str],
+        ) -> List[Mapping[str, Any]]:
+            events: List[Mapping[str, Any]] = []
+            ranges: List[Tuple[int, int]] = [(since, until)]
+
+            def _build_params(start: int, end: int) -> Dict[str, Any]:
+                params = dict(base_params)
+                if self._normalized_exchange == "okx":
+                    params.setdefault("from", start)
+                    params.setdefault("to", end)
+                    params.setdefault("after", start)
+                    params.setdefault("before", end)
+                else:
+                    params.setdefault("startTime", start)
+                    params.setdefault("endTime", end)
+                    params.setdefault("until", end)
+                if account_type:
+                    params.setdefault("accountType", account_type)
+                if limit:
+                    params.setdefault("limit", limit)
+                return params
+
+            while ranges:
+                start, end = ranges.pop(0)
+                if start >= end:
+                    continue
+                params = _build_params(start, end)
+                try:
+                    payload = await fetcher(
+                        code=code,
+                        since=start,
+                        limit=limit,
+                        params=params,
+                    )
+                except BadRequest as exc:
+                    message = str(exc)
+                    if "interval between the startTime and endTime is incorrect" in message:
+                        window = end - start
+                        if window <= 60 * 60 * 1000:
+                            logger.debug(
+                                "[%s] Cashflow window too small to split further: %s",
+                                self.config.name,
+                                exc,
+                            )
+                            continue
+                        midpoint = start + window // 2
+                        ranges.insert(0, (midpoint, end))
+                        ranges.insert(0, (start, midpoint))
+                        continue
+                    raise self._translate_ccxt_error(exc)
+                except BaseError as exc:
+                    raise self._translate_ccxt_error(exc)
+
+                for entry in payload or []:
+                    amount = _coerce_float(entry.get("amount"))
+                    timestamp = _coerce_int(entry.get("timestamp")) or _coerce_int(entry.get("time"))
+                    currency = entry.get("currency") or entry.get("code")
+                    events.append(
+                        {
+                            "type": side,
+                            "id": entry.get("id") or entry.get("txid") or entry.get("txId"),
+                            "amount": float(amount or 0.0),
+                            "currency": currency,
+                            "timestamp": timestamp,
+                            "info": entry,
+                        }
+                    )
+            return events
+
+        client = _instantiate_ccxt_client(
+            self.config.exchange,
+            self.config.credentials,
+            custom_endpoint_override=self._custom_endpoint_override,
+        )
+        try:
+            events: List[Mapping[str, Any]] = []
+            for account_type in account_types:
+                fetch_deposits = getattr(client, "fetch_deposits", None)
+                if callable(fetch_deposits):
+                    events.extend(await _fetch_side(fetch_deposits, "deposit", account_type))
+                fetch_withdrawals = getattr(client, "fetch_withdrawals", None)
+                if callable(fetch_withdrawals):
+                    events.extend(await _fetch_side(fetch_withdrawals, "withdrawal", account_type))
+            seen: set[tuple[Any, Any, Any]] = set()
+            unique_events: List[Mapping[str, Any]] = []
+            for event in events:
+                key = (event.get("type"), event.get("id"), event.get("timestamp"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_events.append(event)
+            return unique_events
+        finally:
+            closer = getattr(client, "close", None)
+            if closer is not None:
+                try:
+                    result = closer()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("[%s] Failed to close cashflow client", self.config.name)
+
+    def _translate_ccxt_error(self, error: BaseError) -> Exception:
+        """Map ccxt exceptions to richer runtime errors."""
+        message = str(error)
+        payload_text: Optional[str] = None
+        json_payload: Optional[Mapping[str, Any]] = None
+        if "{" in message and "}" in message:
+            payload_text = message[message.find("{") : message.rfind("}") + 1]
+            try:
+                json_payload = json.loads(payload_text)
+            except Exception:
+                json_payload = None
+
+        extracted_message = None
+        source = None
+        if isinstance(json_payload, Mapping):
+            extracted_message = (
+                json_payload.get("msg")
+                or json_payload.get("message")
+                or json_payload.get("error")
+            )
+            source = json_payload.get("source") or json_payload.get("sourceId")
+
+        detail = extracted_message or message
+        parts = [detail]
+        if source:
+            parts.append(f"source: {source}")
+        if self._using_custom_endpoints and self._custom_endpoint_source:
+            parts.append(f"custom endpoint source: {self._custom_endpoint_source}")
+        summary = " | ".join(part for part in parts if part)
+
+        lower = summary.lower()
+        auth_tokens = ("api key", "apikey", "auth", "permission", "sign", "invalid key")
+        is_auth = any(token in lower for token in auth_tokens)
+
+        if not is_auth:
+            summary = f"{summary} — See logs for additional details."
+
+        message_prefix = f"[{self.config.name}] "
+        final_message = message_prefix + summary
+
+        if is_auth:
+            return AuthenticationError(final_message)
+        return RuntimeError(final_message)
+
+    async def fetch(self) -> Dict[str, Any]:
+        """Return the latest account snapshot."""
+        try:
+            await self._ensure_markets()
+            balance_payload = await self.client.fetch_balance(params=self._balance_params or None)
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+        balance_value = _extract_balance(balance_payload or {}, self.config.settle_currency)
+
+        try:
+            raw_positions = await self.client.fetch_positions(params=self._positions_params or None)
+        except NotSupported:
+            raw_positions = []
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+        parsed_positions: List[Dict[str, Any]] = []
+        for position in raw_positions or []:
+            parsed = _parse_position(position, balance_value)
+            if not parsed:
+                continue
+            hedge_side, position_idx, side_explicit = _extract_position_details(position)
+            parsed["hedge_side"] = hedge_side
+            parsed["position_idx"] = position_idx
+            parsed["hedge_side_explicit"] = side_explicit
+            size_value = _first_float(
+                position.get("contracts"),
+                position.get("size"),
+                position.get("amount"),
+                position.get("info", {}).get("positionAmt") if isinstance(position.get("info"), Mapping) else None,
+            )
+            if size_value is not None:
+                parsed["size"] = float(size_value)
+            parsed_positions.append(parsed)
+
+        symbol_metrics = await self._collect_symbol_metrics([p["symbol"] for p in parsed_positions])
+        for position in parsed_positions:
+            metrics = symbol_metrics.get(position["symbol"])
+            if metrics and "order_book" in metrics:
+                position["liquidity"] = calculate_position_liquidity(
+                    {
+                        "side": position.get("side"),
+                        "size": position.get("size"),
+                        "notional": position.get("notional"),
+                        "entry_price": position.get("entry_price"),
+                        "mark_price": position.get("mark_price"),
+                    },
+                    metrics["order_book"],
+                    fallback_price=position.get("mark_price") or position.get("entry_price"),
+                    warning_threshold=self._liquidity_settings.slippage_warning_pct,
                 )
-                if limit is None or limit <= 0:
-                    limit = 200
-                total = 0.0
-                cursor: Optional[str] = None
-                while True:
-                    request = dict(params_base)
-                    request.setdefault("startTime", since)
-                    request.setdefault("endTime", until)
-                    request.setdefault("limit", limit)
+                position.setdefault("market_data", {}).update(metrics)
+
+        try:
+            open_orders_payload = await self.client.fetch_open_orders(params=self._orders_params or None)
+        except BaseError as exc:
+            if _is_symbol_specific_open_orders_warning(exc):
+                self._refresh_open_order_preferences()
+                open_orders_payload = []
+            else:
+                raise self._translate_ccxt_error(exc)
+
+        open_orders = []
+        for order in open_orders_payload or []:
+            parsed_order = _parse_order(order)
+            if parsed_order:
+                open_orders.append(parsed_order)
+
+        realized = await self._fetch_realized_pnl(parsed_positions)
+        if realized is None:
+            realized = sum(position.get("daily_realized_pnl", 0.0) for position in parsed_positions)
+
+        total_unrealized = sum(position.get("unrealized_pnl", 0.0) for position in parsed_positions)
+        total_notional = sum(position.get("notional", 0.0) for position in parsed_positions)
+
+        snapshot: Dict[str, Any] = {
+            "account": self.config.name,
+            "exchange": self.config.exchange,
+            "balance": balance_value,
+            "balance_raw": balance_payload,
+            "positions": parsed_positions,
+            "orders": open_orders,
+            "unrealized_pnl": total_unrealized,
+            "notional": total_notional,
+            "daily_realized_pnl": realized,
+            "using_custom_endpoints": self._using_custom_endpoints,
+        }
+        if self._custom_endpoint_source:
+            snapshot["custom_endpoint_source"] = self._custom_endpoint_source
+        return snapshot
+
+    async def close(self) -> None:
+        closer = getattr(self.client, "close", None)
+        if closer is None:
+            return
+        try:
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("[%s] Failed to close client cleanly", self.config.name)
+
+    async def kill_switch(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        result["cancelled_orders"] = await self.cancel_all_orders(symbol)
+        result["closed_positions"] = await self.close_all_positions(symbol)
+        return result
+
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        try:
+            return await self.client.create_order(symbol, order_type, side, amount, price, params)
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+    async def cancel_order(
+        self,
+        order_id: str,
+        symbol: Optional[str] = None,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        try:
+            return await self.client.cancel_order(order_id, symbol, params)
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+    async def close_position(self, symbol: str) -> Mapping[str, Any]:
+        closer = getattr(self.client, "close_position", None)
+        if not callable(closer):
+            raise NotSupported("close_position is not supported by this exchange")
+        try:
+            return await closer(symbol)
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+    async def list_order_types(self) -> Sequence[str]:
+        has = getattr(self.client, "has", {})
+        if isinstance(has, Mapping):
+            supported = [key.replace("createOrder", "order") for key, value in has.items() if key.startswith("createOrder") and value]
+            if supported:
+                return tuple(sorted(dict.fromkeys(supported)))
+        return ("limit", "market")
+
+    async def cancel_all_orders(self, symbol: Optional[str] = None) -> Mapping[str, Any]:
+        canceller = getattr(self.client, "cancel_all_orders", None)
+        if not callable(canceller):
+            if symbol:
+                raise NotSupported("cancel_all_orders is not supported by this exchange")
+            return {}
+        try:
+            return await canceller(symbol, params=self._close_params or None)
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+    async def close_all_positions(self, symbol: Optional[str] = None) -> Mapping[str, Any]:
+        closer = getattr(self.client, "close_all_positions", None)
+        if callable(closer):
+            try:
+                return await closer(symbol)
+            except BaseError as exc:
+                raise self._translate_ccxt_error(exc)
+        if symbol:
+            return await self.close_position(symbol)
+        raise NotSupported("close_all_positions is not supported by this exchange")
