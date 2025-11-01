@@ -108,6 +108,11 @@ def build_presentable_snapshot(
     if isinstance(concentration_raw, Mapping):
         payload["concentration"] = _normalise_concentration(concentration_raw)
 
+    cashflows_raw = snapshot.get("cashflows") if isinstance(snapshot, Mapping) else None
+    cashflows_view = _normalise_cashflows(cashflows_raw)
+    if cashflows_view:
+        payload["cashflows"] = cashflows_view
+
     return payload
 
 
@@ -574,6 +579,91 @@ def _normalise_concentration(data: Mapping[str, Any]) -> Dict[str, Any]:
     if top_asset is not None:
         payload["top_asset"] = top_asset
     return payload
+
+
+def _normalise_cashflows(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, Mapping):
+        return None
+
+    summary_result: Dict[str, Any] = {}
+    summary_raw = raw.get("summary")
+    if isinstance(summary_raw, Mapping):
+        for window, data in summary_raw.items():
+            if not isinstance(window, str) or not isinstance(data, Mapping):
+                continue
+            currencies_out: List[Dict[str, Any]] = []
+            currencies_raw = data.get("currencies")
+            if isinstance(currencies_raw, Iterable):
+                for entry in currencies_raw:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    currency = str(entry.get("currency", ""))
+                    try:
+                        deposits = float(entry.get("deposits", 0.0))
+                    except (TypeError, ValueError):
+                        deposits = 0.0
+                    try:
+                        withdrawals = float(entry.get("withdrawals", 0.0))
+                    except (TypeError, ValueError):
+                        withdrawals = 0.0
+                    try:
+                        net_value = float(entry.get("net", deposits - withdrawals))
+                    except (TypeError, ValueError):
+                        net_value = deposits - withdrawals
+                    currencies_out.append(
+                        {
+                            "currency": currency,
+                            "deposits": deposits,
+                            "withdrawals": withdrawals,
+                            "net": net_value,
+                            "deposit_count": int(entry.get("deposit_count", 0)),
+                            "withdrawal_count": int(entry.get("withdrawal_count", 0)),
+                        }
+                    )
+            totals: Dict[str, Any] = {}
+            totals_raw = data.get("totals")
+            if isinstance(totals_raw, Mapping):
+                for key in ("deposits", "withdrawals", "net"):
+                    if key in totals_raw:
+                        try:
+                            totals[key] = float(totals_raw.get(key, 0.0))
+                        except (TypeError, ValueError):
+                            totals[key] = 0.0
+                totals["deposit_count"] = int(totals_raw.get("deposit_count", 0))
+                totals["withdrawal_count"] = int(totals_raw.get("withdrawal_count", 0))
+            summary_result[window] = {
+                "currencies": currencies_out,
+                "totals": totals,
+            }
+
+    events_result: List[Dict[str, Any]] = []
+    events_raw = raw.get("events")
+    if isinstance(events_raw, Iterable):
+        for entry in events_raw:
+            if not isinstance(entry, Mapping):
+                continue
+            try:
+                amount = float(entry.get("amount", 0.0))
+            except (TypeError, ValueError):
+                amount = 0.0
+            events_result.append(
+                {
+                    "id": str(entry.get("id", "")) if entry.get("id") not in (None, "") else "",
+                    "account": str(entry.get("account", "")),
+                    "exchange": str(entry.get("exchange", "")),
+                    "type": str(entry.get("type", "")),
+                    "amount": amount,
+                    "currency": str(entry.get("currency", "")),
+                    "timestamp": str(entry.get("timestamp", "")),
+                    "status": str(entry.get("status", "")),
+                    "txid": str(entry.get("txid", "")),
+                    "note": str(entry.get("note", "")),
+                }
+            )
+
+    if not summary_result and not events_result:
+        return None
+    return {"summary": summary_result, "events": events_result}
 
 
 def _to_optional_float(value: Any) -> Optional[float]:
