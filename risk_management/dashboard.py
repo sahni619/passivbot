@@ -254,7 +254,7 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
     )
 
 
-def _parse_account(raw: Dict[str, Any]) -> Account:
+def _parse_account(raw: Mapping[str, Any]) -> Account:
     if "name" not in raw or "balance" not in raw:
         raise ValueError("Account entries must include 'name' and 'balance'.")
 
@@ -349,7 +349,43 @@ def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], A
     else:
         generated_at = datetime.now(timezone.utc)
 
-    accounts = [_parse_account(acc) for acc in data.get("accounts", [])]
+    accounts: List[Account] = []
+    accounts_raw = data.get("accounts", [])
+
+    if isinstance(accounts_raw, Mapping):
+        accounts_iterable: Iterable[Any] = accounts_raw.values()
+    elif isinstance(accounts_raw, Iterable) and not isinstance(
+        accounts_raw, (str, bytes, bytearray)
+    ):
+        accounts_iterable = accounts_raw
+    else:
+        if accounts_raw not in (None, []):
+            logger.warning(
+                "Skipping accounts payload because it is not an iterable of mappings: %r",
+                accounts_raw,
+            )
+        accounts_iterable = []
+
+    for index, raw_account in enumerate(accounts_iterable):
+        if not isinstance(raw_account, Mapping):
+            logger.warning(
+                "Skipping account at index %s because entry is not a mapping: %r",
+                index,
+                raw_account,
+            )
+            continue
+        try:
+            account = _parse_account(raw_account)
+        except (TypeError, ValueError) as exc:
+            name = raw_account.get("name", "<unknown>")
+            logger.warning(
+                "Skipping account %s at index %s due to parse error: %s",
+                name,
+                index,
+                exc,
+            )
+            continue
+        accounts.append(account)
     thresholds = _parse_thresholds(data.get("alert_thresholds", {}))
     notifications = [str(channel) for channel in data.get("notification_channels", [])]
     return generated_at, accounts, thresholds, notifications
