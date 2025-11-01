@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from types import TracebackType
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -166,6 +166,7 @@ class RealtimeDataFetcher:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         accounts_payload: List[Dict[str, Any]] = []
         account_messages: Dict[str, str] = dict(self.config.account_messages)
+        cashflow_events: List[Dict[str, Any]] = []
         account_balances: Dict[str, float] = {}
         account_entries: List[tuple[AccountConfig, Dict[str, Any], float]] = []
         for account_config, result in zip(self.config.accounts, results):
@@ -232,6 +233,12 @@ class RealtimeDataFetcher:
             if account_config.exposure_limits:
                 metadata.setdefault("exposure_limits", dict(account_config.exposure_limits))
             payload["metadata"] = metadata
+
+            raw_cashflows = payload.pop("cashflows", None)
+            if raw_cashflows:
+                extracted = self._extract_cashflow_events(account_config, raw_cashflows)
+                if extracted:
+                    cashflow_events.extend(extracted)
 
             accounts_payload.append(payload)
             account_balances[account_config.name] = balance_value
@@ -388,6 +395,8 @@ class RealtimeDataFetcher:
                 account_stop_losses[account_name] = state
         if account_stop_losses:
             snapshot["account_stop_losses"] = account_stop_losses
+        if cashflow_events:
+            snapshot["cashflows"] = self._summarise_cashflows(cashflow_events)
         performance_summary = self._performance_tracker.record(
             generated_at=generated_at_dt,
             portfolio_balance=portfolio_balance,
@@ -513,6 +522,188 @@ class RealtimeDataFetcher:
             state["triggered_at"] = datetime.now(timezone.utc).isoformat()
         self._account_stop_losses[account_name] = state
         return dict(state)
+
+    def _extract_cashflow_events(
+        self,
+        account_config: AccountConfig,
+        raw_events: Any,
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        if isinstance(raw_events, Mapping):
+            candidates = raw_events.get("events")
+            if isinstance(candidates, Iterable) and not isinstance(candidates, (str, bytes)):
+                iterable = candidates
+            else:
+                iterable = [raw_events]
+        elif isinstance(raw_events, Iterable) and not isinstance(raw_events, (str, bytes)):
+            iterable = raw_events
+        else:
+            return events
+
+        for entry in iterable:
+            if not isinstance(entry, Mapping):
+                continue
+            normalised = self._normalise_cashflow_event(account_config, entry)
+            if normalised is not None:
+                events.append(normalised)
+        return events
+
+    def _normalise_cashflow_event(
+        self,
+        account_config: AccountConfig,
+        entry: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        flow_type = str(entry.get("type", "")).strip().lower()
+        if flow_type not in {"deposit", "withdrawal"}:
+            return None
+
+        try:
+            amount = float(entry.get("amount", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if amount <= 0:
+            return None
+
+        currency_raw = entry.get("currency") or entry.get("code") or account_config.settle_currency
+        currency = str(currency_raw).upper().strip() if currency_raw else ""
+        if not currency:
+            currency = "UNKNOWN"
+
+        timestamp_ms = entry.get("timestamp_ms")
+        timestamp_dt: Optional[datetime] = None
+        if isinstance(timestamp_ms, (int, float)):
+            timestamp_ms = int(timestamp_ms)
+            timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        else:
+            timestamp_raw = entry.get("timestamp") or entry.get("datetime")
+            if isinstance(timestamp_raw, (int, float)):
+                timestamp_ms = int(timestamp_raw)
+                timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+            elif isinstance(timestamp_raw, str) and timestamp_raw.strip():
+                candidate = timestamp_raw.strip()
+                if candidate.endswith("Z"):
+                    candidate = candidate[:-1] + "+00:00"
+                try:
+                    parsed = datetime.fromisoformat(candidate)
+                except ValueError:
+                    parsed = None
+                if parsed is not None:
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    timestamp_dt = parsed.astimezone(timezone.utc)
+                    timestamp_ms = int(timestamp_dt.timestamp() * 1000)
+        if timestamp_dt is None:
+            timestamp_dt = datetime.now(timezone.utc)
+            timestamp_ms = int(timestamp_dt.timestamp() * 1000)
+
+        status_raw = entry.get("status")
+        txid_raw = entry.get("txid") or entry.get("id")
+        note_raw = entry.get("note")
+
+        account_name = str(entry.get("account", account_config.name))
+        exchange_name = str(entry.get("exchange", account_config.exchange))
+
+        return {
+            "account": account_name,
+            "exchange": exchange_name,
+            "type": flow_type,
+            "amount": amount,
+            "currency": currency,
+            "timestamp": timestamp_dt.isoformat(),
+            "timestamp_ms": int(timestamp_ms),
+            "status": str(status_raw) if status_raw not in (None, "") else "",
+            "txid": str(txid_raw) if txid_raw not in (None, "") else "",
+            "note": str(note_raw) if isinstance(note_raw, str) else "",
+        }
+
+    def _summarise_cashflows(self, events: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        ordered = sorted(
+            (
+                event
+                for event in events
+                if isinstance(event, Mapping) and event.get("timestamp_ms") is not None
+            ),
+            key=lambda item: int(item.get("timestamp_ms", 0)),
+            reverse=True,
+        )
+
+        max_events = 200
+        trimmed: List[Dict[str, Any]] = []
+        for event in ordered[:max_events]:
+            cleaned = {key: value for key, value in event.items() if key != "timestamp_ms"}
+            trimmed.append(cleaned)
+
+        now = datetime.now(timezone.utc)
+        windows = {
+            "7d": timedelta(days=7),
+            "14d": timedelta(days=14),
+            "21d": timedelta(days=21),
+            "30d": timedelta(days=30),
+        }
+        summary: Dict[str, Dict[str, Any]] = {}
+        for label, delta in windows.items():
+            cutoff = now - delta
+            per_currency: Dict[str, Dict[str, Any]] = {}
+            deposit_count = 0
+            withdrawal_count = 0
+            for event in ordered:
+                timestamp_ms = event.get("timestamp_ms")
+                if not isinstance(timestamp_ms, (int, float)):
+                    continue
+                event_dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
+                if event_dt < cutoff:
+                    continue
+                currency = str(event.get("currency") or "").upper()
+                if not currency:
+                    currency = "UNKNOWN"
+                bucket = per_currency.setdefault(
+                    currency,
+                    {
+                        "currency": currency,
+                        "deposits": 0.0,
+                        "withdrawals": 0.0,
+                        "net": 0.0,
+                        "deposit_count": 0,
+                        "withdrawal_count": 0,
+                    },
+                )
+                try:
+                    amount = float(event.get("amount", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if event.get("type") == "deposit":
+                    bucket["deposits"] += amount
+                    bucket["net"] += amount
+                    bucket["deposit_count"] += 1
+                    deposit_count += 1
+                else:
+                    bucket["withdrawals"] += amount
+                    bucket["net"] -= amount
+                    bucket["withdrawal_count"] += 1
+                    withdrawal_count += 1
+            currencies = []
+            total_deposits = 0.0
+            total_withdrawals = 0.0
+            for currency, data in per_currency.items():
+                data["currency"] = currency
+                data["deposits"] = float(data["deposits"])
+                data["withdrawals"] = float(data["withdrawals"])
+                data["net"] = float(data["net"])
+                currencies.append(data)
+                total_deposits += data["deposits"]
+                total_withdrawals += data["withdrawals"]
+            currencies.sort(key=lambda item: item["currency"])
+            summary[label] = {
+                "currencies": currencies,
+                "totals": {
+                    "deposit_count": deposit_count,
+                    "withdrawal_count": withdrawal_count,
+                    "deposits": total_deposits,
+                    "withdrawals": total_withdrawals,
+                    "net": total_deposits - total_withdrawals,
+                },
+            }
+        return {"summary": summary, "events": trimmed}
 
     def get_account_stop_loss(self, account_name: str) -> Optional[Dict[str, Any]]:
         self._resolve_account_client(account_name)

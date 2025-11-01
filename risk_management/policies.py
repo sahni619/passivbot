@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -482,8 +483,10 @@ class PolicyEvaluator:
         context = {
             "policy": policy.name,
             "metric": policy.trigger.metric,
-            "value": value,
-            "threshold": threshold,
+            "value": _FormatPlaceholder(value),
+            "value_raw": value,
+            "threshold": _FormatPlaceholder(threshold),
+            "threshold_raw": threshold,
             "status": status,
         }
         try:
@@ -505,3 +508,36 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+class _FormatPlaceholder:
+    """Provide safe formatting for optional numeric values in messages."""
+
+    __slots__ = ("_value", "_placeholder")
+
+    def __init__(self, value: Any, placeholder: str = "n/a") -> None:
+        self._value = value
+        self._placeholder = placeholder
+
+    def _is_missing(self) -> bool:
+        value = self._value
+        if value is None:
+            return True
+        if isinstance(value, float) and math.isnan(value):
+            return True
+        return False
+
+    def __format__(self, format_spec: str) -> str:
+        if self._is_missing():
+            return self._placeholder
+        return format(self._value, format_spec)
+
+    def __str__(self) -> str:
+        if self._is_missing():
+            return self._placeholder
+        return str(self._value)
+
+    def __repr__(self) -> str:
+        if self._is_missing():
+            return self._placeholder
+        return repr(self._value)

@@ -9,16 +9,22 @@ import logging
 import math
 import statistics
 import time
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency in some envs
     import ccxt.async_support as ccxt_async
-    from ccxt.base.errors import AuthenticationError, BaseError, NotSupported
+    from ccxt.base.errors import AuthenticationError, BadRequest, BaseError, NotSupported
 except ModuleNotFoundError:  # pragma: no cover - allow tests without ccxt
     ccxt_async = None  # type: ignore[assignment]
 
     class BaseError(Exception):
         """Fallback error when ccxt is unavailable."""
+
+        pass
+
+    class BadRequest(BaseError):
+        """Fallback error matching ccxt BadRequest when unavailable."""
 
         pass
 
@@ -373,6 +379,8 @@ class CCXTAccountClient(AccountClientProtocol):
         self._positions_params = dict(config.params.get("positions", {}))
         self._orders_params = dict(config.params.get("orders", {}))
         self._close_params = dict(config.params.get("close", {}))
+        cashflow_params = config.params.get("cashflows", {})
+        self._cashflow_params = dict(cashflow_params) if isinstance(cashflow_params, Mapping) else {}
         self._markets_loaded: Optional[asyncio.Lock] = None
         self._debug_api_payloads = bool(config.debug_api_payloads)
         self._custom_endpoint_override = apply_override
@@ -631,6 +639,297 @@ class CCXTAccountClient(AccountClientProtocol):
             )
         return None
 
+    async def _fetch_cashflows(self) -> List[Dict[str, Any]]:
+        """Return recent deposits and withdrawals when supported by the exchange."""
+
+        if not self._cashflow_params:
+            params_cfg: Mapping[str, Any] = {}
+        else:
+            params_cfg = self._cashflow_params
+
+        if params_cfg.get("enabled", True) is False:
+            return []
+
+        lookback_days = _coerce_int(params_cfg.get("lookback_days"))
+        if lookback_days is None or lookback_days <= 0:
+            lookback_days = 30
+        limit = _coerce_int(params_cfg.get("limit"))
+        if limit is None or limit <= 0:
+            limit = 200
+
+        now_ms = int(time.time() * 1000)
+        since_ms = now_ms - int(timedelta(days=lookback_days).total_seconds() * 1000)
+
+        common_params = (
+            dict(params_cfg.get("params", {}))
+            if isinstance(params_cfg.get("params"), Mapping)
+            else {}
+        )
+
+        def _merge_time_params(
+            base: Mapping[str, Any], start_ms: Optional[int], end_ms: int
+        ) -> Dict[str, Any]:
+            merged = dict(base) if isinstance(base, Mapping) else {}
+            end_ms_int = int(end_ms)
+            start_ms_int: Optional[int] = None
+            if start_ms is not None:
+                try:
+                    start_ms_int = int(start_ms)
+                except (TypeError, ValueError):
+                    start_ms_int = None
+            exchange_id = self._normalized_exchange or ""
+            if exchange_id.startswith("binance"):
+                if start_ms_int is not None:
+                    merged.setdefault("startTime", start_ms_int)
+                merged.setdefault("endTime", end_ms_int)
+            if exchange_id.startswith("bybit"):
+                if start_ms_int is not None:
+                    merged.setdefault("startTime", start_ms_int)
+                merged.setdefault("endTime", end_ms_int)
+            if exchange_id.startswith("okx"):
+                if start_ms_int is not None:
+                    merged.setdefault("from", start_ms_int)
+                merged.setdefault("to", end_ms_int)
+            if exchange_id.startswith("kucoin"):
+                if start_ms_int is not None:
+                    merged.setdefault("startAt", start_ms_int // 1000)
+                merged.setdefault("endAt", end_ms_int // 1000)
+            merged.setdefault("until", end_ms_int)
+            return merged
+
+        def _is_time_range_error(error: BaseError) -> bool:
+            message = str(error).lower()
+            indicators = (
+                "interval between the starttime and endtime is incorrect",
+                "time period is too large",
+                "time range is too large",
+                "time interval error",
+            )
+            return any(indicator in message for indicator in indicators)
+
+        chunk_days = _coerce_int(params_cfg.get("chunk_days"))
+        if chunk_days is None or chunk_days <= 0:
+            chunk_days = 7
+        chunk_span_ms = int(timedelta(days=chunk_days).total_seconds() * 1000)
+        if chunk_span_ms <= 0:
+            chunk_span_ms = 7 * 24 * 60 * 60 * 1000
+
+        deposit_params = dict(common_params)
+        if isinstance(params_cfg.get("deposits"), Mapping):
+            deposit_params.update(params_cfg["deposits"])
+
+        withdrawal_params = dict(common_params)
+        if isinstance(params_cfg.get("withdrawals"), Mapping):
+            withdrawal_params.update(params_cfg["withdrawals"])
+
+        currency_code = params_cfg.get("currency")
+        if not isinstance(currency_code, str) or not currency_code:
+            currency_code = None
+
+        events: List[Dict[str, Any]] = []
+        seen_keys: set[Tuple[Any, ...]] = set()
+        for flow_type, method_name, extra_params in (
+            ("deposit", "fetch_deposits", deposit_params),
+            ("withdrawal", "fetch_withdrawals", withdrawal_params),
+        ):
+            fetch_method = getattr(self.client, method_name, None)
+            if fetch_method is None:
+                continue
+
+            params_with_end = _merge_time_params(extra_params, since_ms, now_ms)
+
+            async def _fetch_chunked() -> List[Mapping[str, Any]]:
+                entries_accum: List[Mapping[str, Any]] = []
+                window_start = since_ms
+                while window_start <= now_ms:
+                    window_end = min(window_start + chunk_span_ms - 1, now_ms)
+                    window_params = _merge_time_params(extra_params, window_start, window_end)
+                    try:
+                        chunk = await fetch_method(
+                            currency_code,
+                            since=window_start,
+                            limit=limit,
+                            params=window_params,
+                        )
+                    except BaseError as chunk_exc:
+                        logger.debug(
+                            "[%s] %s chunk fetch failed for %s-%s: %s",
+                            self.config.name,
+                            method_name,
+                            window_start,
+                            window_end,
+                            chunk_exc,
+                            exc_info=self._debug_api_payloads,
+                        )
+                        break
+                    if chunk:
+                        entries_accum.extend(chunk)
+                    if window_end >= now_ms:
+                        break
+                    window_start = window_end + 1
+                return entries_accum
+
+            try:
+                entries = await fetch_method(
+                    currency_code,
+                    since=since_ms,
+                    limit=limit,
+                    params=params_with_end,
+                )
+            except BadRequest as exc:
+                if _is_time_range_error(exc):
+                    entries = await _fetch_chunked()
+                else:
+                    logger.debug(
+                        "[%s] %s failed: %s",
+                        self.config.name,
+                        method_name,
+                        exc,
+                        exc_info=self._debug_api_payloads,
+                    )
+                    continue
+            except NotSupported:
+                continue
+            except BaseError as exc:
+                logger.debug(
+                    "[%s] %s failed: %s",
+                    self.config.name,
+                    method_name,
+                    exc,
+                    exc_info=self._debug_api_payloads,
+                )
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "[%s] Unexpected error during %s: %s",
+                    self.config.name,
+                    method_name,
+                    exc,
+                    exc_info=self._debug_api_payloads,
+                )
+                continue
+
+            if not entries:
+                continue
+
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
+                if normalised is None:
+                    continue
+                dedupe_key = self._cashflow_dedupe_key(normalised)
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                events.append(normalised)
+
+        if not events:
+            return []
+
+        events.sort(key=lambda item: item.get("timestamp_ms", 0), reverse=True)
+        return events
+
+    def _cashflow_dedupe_key(self, entry: Mapping[str, Any]) -> Tuple[Any, ...]:
+        """Build a stable dedupe key for a normalised cashflow entry."""
+
+        entry_type = entry.get("type")
+        txid = entry.get("txid") or entry.get("id")
+        if txid:
+            return (entry_type, str(txid))
+
+        currency = entry.get("currency")
+        amount = _coerce_float(entry.get("amount"))
+        if amount is None:
+            amount = 0.0
+        timestamp = _coerce_int(entry.get("timestamp_ms"))
+        if timestamp is None:
+            timestamp = 0
+        return (entry_type, currency, amount, timestamp)
+
+    def _normalise_cashflow_entry(
+        self,
+        entry: Mapping[str, Any],
+        flow_type: str,
+        since_ms: int,
+    ) -> Optional[Dict[str, Any]]:
+        flow = flow_type.strip().lower()
+        if flow not in {"deposit", "withdrawal"}:
+            return None
+
+        amount = _coerce_float(entry.get("amount"))
+        if amount is None or amount <= 0:
+            return None
+
+        currency = entry.get("currency") or entry.get("code")
+        if not isinstance(currency, str) or not currency.strip():
+            currency = self.config.settle_currency or ""
+        currency = currency.upper()
+
+        timestamp_ms = _coerce_int(entry.get("timestamp"))
+        if timestamp_ms is None:
+            datetime_raw = entry.get("datetime")
+            parsed_dt: Optional[datetime] = None
+            if isinstance(datetime_raw, str):
+                candidate = datetime_raw.strip()
+                if candidate.endswith("Z"):
+                    candidate = candidate[:-1] + "+00:00"
+                try:
+                    parsed_dt = datetime.fromisoformat(candidate)
+                except ValueError:
+                    parsed_dt = None
+            if parsed_dt is not None:
+                if parsed_dt.tzinfo is None:
+                    parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                timestamp_ms = int(parsed_dt.timestamp() * 1000)
+        if timestamp_ms is None:
+            info = entry.get("info") if isinstance(entry.get("info"), Mapping) else None
+            if info and "timestamp" in info:
+                timestamp_ms = _coerce_int(info.get("timestamp"))
+        if timestamp_ms is None:
+            timestamp_ms = int(time.time() * 1000)
+
+        if timestamp_ms < since_ms:
+            return None
+
+        timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        note_parts: List[str] = []
+        address = entry.get("address") or entry.get("addressTo")
+        if isinstance(address, str) and address.strip():
+            note_parts.append(f"Address {address.strip()}")
+        network = entry.get("network")
+        if isinstance(network, str) and network.strip():
+            note_parts.append(f"Network {network.strip()}")
+        fee_raw = entry.get("fee")
+        if isinstance(fee_raw, Mapping):
+            fee_cost = _coerce_float(fee_raw.get("cost"))
+            fee_currency = fee_raw.get("currency")
+            if fee_cost is not None:
+                if isinstance(fee_currency, str) and fee_currency.strip():
+                    note_parts.append(
+                        f"Fee {fee_cost:g} {fee_currency.strip()}"
+                    )
+                else:
+                    note_parts.append(f"Fee {fee_cost:g}")
+
+        status = entry.get("status")
+        txid = entry.get("txid") or entry.get("id")
+        note = "; ".join(note_parts)
+
+        return {
+            "id": str(entry.get("id")) if entry.get("id") not in (None, "") else None,
+            "type": flow,
+            "amount": float(amount),
+            "currency": currency,
+            "timestamp": timestamp_dt.isoformat(),
+            "timestamp_ms": timestamp_ms,
+            "status": str(status) if status not in (None, "") else "",
+            "txid": str(txid) if txid not in (None, "") else "",
+            "note": note,
+            "account": self.config.name,
+            "exchange": self.config.exchange,
+        }
+
     async def fetch(self) -> Dict[str, Any]:
         try:
             await self._ensure_markets()
@@ -793,6 +1092,8 @@ class CCXTAccountClient(AccountClientProtocol):
             if realized_override is not None:
                 realized_total = realized_override
 
+        cashflows = await self._fetch_cashflows()
+
         return {
             "name": self.config.name,
             "balance": balance_value,
@@ -800,6 +1101,7 @@ class CCXTAccountClient(AccountClientProtocol):
             "open_orders": open_orders,
             "daily_realized_pnl": realized_total,
             "order_books": list(order_books.values()) if order_books else [],
+            "cashflows": cashflows,
         }
 
     async def close(self) -> None:
