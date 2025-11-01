@@ -73,13 +73,28 @@ logger = logging.getLogger(__name__)
 def _normalise_order_book_depth(exchange: str, requested: int) -> int:
     """Return a depth limit supported by the exchange."""
 
+
+    exchange_key = (exchange or "").strip().lower()
+    if exchange_key:
+        exchange_key = exchange_key.replace("-", "").replace("_", "")
+
+
     allowed_depths_map = {
         "binance": (5, 10, 20, 50, 100, 500, 1000),
         "binanceusdm": (5, 10, 20, 50, 100, 500, 1000),
         "binancecoinm": (5, 10, 20, 50, 100, 500, 1000),
     }
 
+
+    allowed_depths = allowed_depths_map.get(exchange_key)
+    if allowed_depths is None:
+        if exchange_key.startswith("binance") and exchange_key.endswith("coinm"):
+            allowed_depths = allowed_depths_map["binancecoinm"]
+        elif exchange_key.startswith("binance"):
+            allowed_depths = allowed_depths_map["binanceusdm"]
+
     allowed_depths = allowed_depths_map.get(exchange.lower())
+
     if not allowed_depths:
         return max(requested, 1)
 
@@ -858,6 +873,7 @@ class CCXTAccountClient(AccountClientProtocol):
 
         snapshot: Dict[str, Any] = {
             "account": self.config.name,
+            "name": self.config.name,
             "exchange": self.config.exchange,
             "balance": balance_value,
             "balance_raw": balance_payload,

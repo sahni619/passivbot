@@ -113,6 +113,12 @@ def test_instantiate_ccxt_client_applies_custom_endpoints(monkeypatch) -> None:
     assert client.urls["host"] == "https://proxy.example"
 
 
+def test_normalise_order_book_depth_clamps_binance_variants() -> None:
+    assert module._normalise_order_book_depth("binanceusdm", 25) == 50
+    assert module._normalise_order_book_depth("Binance-USDM", 7) == 10
+    assert module._normalise_order_book_depth("binance coinm", 2500) == 1000
+
+
 def test_instantiate_ccxt_client_respects_load_helper_override(monkeypatch) -> None:
     class DummyExchange:
         def __init__(self) -> None:

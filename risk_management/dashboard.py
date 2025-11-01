@@ -255,8 +255,19 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
 
 
 def _parse_account(raw: Mapping[str, Any]) -> Account:
-    if "name" not in raw or "balance" not in raw:
+    name_raw = raw.get("name")
+    if name_raw in (None, "") and "account" in raw:
+        name_raw = raw.get("account")
+
+    balance_raw = raw.get("balance")
+
+    if name_raw in (None, "") or balance_raw in (None, ""):
         raise ValueError("Account entries must include 'name' and 'balance'.")
+
+    try:
+        balance_value = float(balance_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Account balance must be numeric.") from exc
 
     positions_raw = raw.get("positions", [])
     positions = [_parse_position(pos) for pos in positions_raw]
@@ -284,8 +295,8 @@ def _parse_account(raw: Mapping[str, Any]) -> Account:
         if key in raw and key not in metadata:
             metadata[key] = raw[key]
     return Account(
-        name=str(raw["name"]),
-        balance=float(raw["balance"]),
+        name=str(name_raw),
+        balance=balance_value,
         positions=positions,
         orders=orders,
         daily_realized_pnl=float(daily_realized),
