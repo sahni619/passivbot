@@ -20,6 +20,8 @@ class PortfolioHistoryStore:
         "6h": timedelta(hours=6),
         "24h": timedelta(hours=24),
         "7d": timedelta(days=7),
+        "14d": timedelta(days=14),
+        "21d": timedelta(days=21),
         "30d": timedelta(days=30),
     }
 
