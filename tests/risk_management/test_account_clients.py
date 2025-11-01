@@ -501,3 +501,60 @@ def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) ->
     assert first_chunk["params"].get("startTime") == expected_since
     chunk_end = first_chunk["params"].get("endTime") or first_chunk["params"].get("until")
     assert chunk_end is not None and chunk_end < fake_now_ms
+
+
+def test_fetch_cashflows_bybit_account_type_variants(monkeypatch) -> None:
+    fake_now_ms = 1_700_000_000_000
+
+    class DummyCashflowClient:
+        def __init__(self) -> None:
+            self.calls: list[Dict[str, Any]] = []
+
+        async def fetch_deposits(self, code=None, since=None, limit=None, params=None):  # type: ignore[override]
+            self.calls.append(
+                {
+                    "type": "deposit",
+                    "params": dict(params or {}),
+                }
+            )
+            return []
+
+        async def fetch_withdrawals(self, code=None, since=None, limit=None, params=None):  # type: ignore[override]
+            self.calls.append(
+                {
+                    "type": "withdrawal",
+                    "params": dict(params or {}),
+                }
+            )
+            return []
+
+        async def close(self):  # type: ignore[override]
+            return None
+
+    dummy = DummyCashflowClient()
+
+    monkeypatch.setattr(module.time, "time", lambda: fake_now_ms / 1000)
+    monkeypatch.setattr(module, "_instantiate_ccxt_client", lambda exchange, credentials, **kwargs: dummy)
+    monkeypatch.setattr(module, "normalize_exchange_name", lambda exchange: exchange)
+    monkeypatch.setattr(module, "resolve_custom_endpoint_override", lambda exchange: None)
+    monkeypatch.setattr(module, "get_custom_endpoint_source", lambda: None)
+
+    config = AccountConfig(
+        name="Bybit", exchange="bybit", credentials={}, params={"cashflows": {}}
+    )
+
+    client = module.CCXTAccountClient(config)
+
+    events = run_async(client._fetch_cashflows())
+
+    assert events == []
+
+    deposit_calls = [call["params"] for call in dummy.calls if call["type"] == "deposit"]
+    assert len(deposit_calls) == 4
+    account_types = [params.get("accountType") for params in deposit_calls]
+    assert account_types == [None, "UNIFIED", "CONTRACT", "SPOT"]
+
+    withdrawal_calls = [call["params"] for call in dummy.calls if call["type"] == "withdrawal"]
+    assert len(withdrawal_calls) == 4
+    withdrawal_types = [params.get("accountType") for params in withdrawal_calls]
+    assert withdrawal_types == [None, "UNIFIED", "CONTRACT", "SPOT"]

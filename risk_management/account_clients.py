@@ -709,13 +709,50 @@ class CCXTAccountClient(AccountClientProtocol):
         if chunk_span_ms <= 0:
             chunk_span_ms = 7 * 24 * 60 * 60 * 1000
 
-        deposit_params = dict(common_params)
-        if isinstance(params_cfg.get("deposits"), Mapping):
-            deposit_params.update(params_cfg["deposits"])
+        def _normalise_account_types(raw: Any) -> Tuple[str, ...]:
+            if isinstance(raw, str):
+                raw_iterable: Sequence[Any] = [raw]
+            elif isinstance(raw, Sequence):
+                raw_iterable = raw
+            else:
+                return tuple()
 
-        withdrawal_params = dict(common_params)
-        if isinstance(params_cfg.get("withdrawals"), Mapping):
-            withdrawal_params.update(params_cfg["withdrawals"])
+            normalised: List[str] = []
+            seen: set[str] = set()
+            for value in raw_iterable:
+                if not isinstance(value, str):
+                    continue
+                candidate = value.strip()
+                if not candidate:
+                    continue
+                candidate_upper = candidate.upper()
+                if candidate_upper in seen:
+                    continue
+                seen.add(candidate_upper)
+                normalised.append(candidate_upper)
+            return tuple(normalised)
+
+        default_account_types = _normalise_account_types(params_cfg.get("account_types"))
+
+        def _extract_flow_params(
+            key: str,
+        ) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+            params_out = dict(common_params)
+            account_types_out: Tuple[str, ...] = tuple()
+            flow_cfg_raw = params_cfg.get(key)
+            if isinstance(flow_cfg_raw, Mapping):
+                flow_cfg = dict(flow_cfg_raw)
+                account_types_out = _normalise_account_types(flow_cfg.pop("account_types", None))
+                params_out.update(flow_cfg)
+            return params_out, account_types_out
+
+        deposit_params, deposit_account_types = _extract_flow_params("deposits")
+        if not deposit_account_types:
+            deposit_account_types = default_account_types
+
+        withdrawal_params, withdrawal_account_types = _extract_flow_params("withdrawals")
+        if not withdrawal_account_types:
+            withdrawal_account_types = default_account_types
 
         currency_code = params_cfg.get("currency")
         if not isinstance(currency_code, str) or not currency_code:
@@ -724,101 +761,153 @@ class CCXTAccountClient(AccountClientProtocol):
         events: List[Dict[str, Any]] = []
         seen_keys: set[Tuple[Any, ...]] = set()
 
-        for flow_type, method_name, extra_params in (
-            ("deposit", "fetch_deposits", deposit_params),
-            ("withdrawal", "fetch_withdrawals", withdrawal_params),
+        async def _fetch_chunked_for_variant(
+            base_params_variant: Mapping[str, Any],
+            method_name: str,
+            fetch_callable,
+        ) -> List[Mapping[str, Any]]:
+            entries_accum: List[Mapping[str, Any]] = []
+            window_start = since_ms
+            while window_start <= now_ms:
+                window_end = min(window_start + chunk_span_ms - 1, now_ms)
+                window_params = _merge_time_params(base_params_variant, window_start, window_end)
+                try:
+                    chunk = await fetch_callable(
+                        currency_code,
+                        since=window_start,
+                        limit=limit,
+                        params=window_params,
+                    )
+                except BaseError as chunk_exc:
+                    logger.debug(
+                        "[%s] %s chunk fetch failed for %s-%s (params=%s): %s",
+                        self.config.name,
+                        method_name,
+                        window_start,
+                        window_end,
+                        _stringify_payload(window_params),
+                        chunk_exc,
+                        exc_info=self._debug_api_payloads,
+                    )
+                    break
+                if chunk:
+                    entries_accum.extend(chunk)
+                if window_end >= now_ms:
+                    break
+                window_start = window_end + 1
+            return entries_accum
+
+        for flow_type, method_name, extra_params, account_type_overrides in (
+            ("deposit", "fetch_deposits", deposit_params, deposit_account_types),
+            ("withdrawal", "fetch_withdrawals", withdrawal_params, withdrawal_account_types),
         ):
             fetch_method = getattr(self.client, method_name, None)
             if fetch_method is None:
                 continue
 
-            params_with_range = _merge_time_params(extra_params, since_ms, now_ms)
+            param_variants: List[Dict[str, Any]] = []
 
-            async def _fetch_chunked() -> List[Mapping[str, Any]]:
-                entries_accum: List[Mapping[str, Any]] = []
-                window_start = since_ms
-                while window_start <= now_ms:
-                    window_end = min(window_start + chunk_span_ms - 1, now_ms)
-                    window_params = _merge_time_params(extra_params, window_start, window_end)
-                    try:
-                        chunk = await fetch_method(
-                            currency_code,
-                            since=window_start,
-                            limit=limit,
-                            params=window_params,
+            def _add_variant(candidate: Mapping[str, Any]) -> None:
+                candidate_dict = dict(candidate) if isinstance(candidate, Mapping) else {}
+                if not any(existing == candidate_dict for existing in param_variants):
+                    param_variants.append(candidate_dict)
+
+            _add_variant(extra_params)
+
+            exchange_id = (self._normalized_exchange or "").lower()
+
+            def _extract_account_type(params_map: Mapping[str, Any]) -> Optional[str]:
+                for key in ("accountType", "account_type"):
+                    value = params_map.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip().upper()
+                return None
+
+            existing_account_type = _extract_account_type(extra_params)
+
+            if exchange_id.startswith("bybit"):
+                candidate_account_types: Tuple[str, ...]
+                if account_type_overrides:
+                    candidate_account_types = tuple(account_type_overrides)
+                elif not existing_account_type:
+                    candidate_account_types = ("UNIFIED", "CONTRACT", "SPOT")
+                else:
+                    candidate_account_types = tuple()
+
+                for account_type in candidate_account_types:
+                    if not isinstance(account_type, str):
+                        continue
+                    candidate = account_type.strip().upper()
+                    if not candidate:
+                        continue
+                    if existing_account_type and candidate == existing_account_type:
+                        continue
+                    variant = dict(extra_params)
+                    variant["accountType"] = candidate
+                    _add_variant(variant)
+
+            for params_variant in param_variants:
+                params_with_range = _merge_time_params(params_variant, since_ms, now_ms)
+
+                try:
+                    entries = await fetch_method(
+                        currency_code,
+                        since=since_ms,
+                        limit=limit,
+                        params=params_with_range,
+                    )
+                except BadRequest as exc:
+                    if _is_time_range_error(exc):
+                        entries = await _fetch_chunked_for_variant(
+                            params_variant, method_name, fetch_method
                         )
-                    except BaseError as chunk_exc:
+                    else:
                         logger.debug(
-                            "[%s] %s chunk fetch failed for %s-%s: %s",
+                            "[%s] %s failed (params=%s): %s",
                             self.config.name,
                             method_name,
-                            window_start,
-                            window_end,
-                            chunk_exc,
+                            _stringify_payload(params_with_range),
+                            exc,
                             exc_info=self._debug_api_payloads,
                         )
-                        break
-                    if chunk:
-                        entries_accum.extend(chunk)
-                    if window_end >= now_ms:
-                        break
-                    window_start = window_end + 1
-                return entries_accum
-
-            try:
-                entries = await fetch_method(
-                    currency_code,
-                    since=since_ms,
-                    limit=limit,
-                    params=params_with_range,
-                )
-            except BadRequest as exc:
-                if _is_time_range_error(exc):
-                    entries = await _fetch_chunked()
-                else:
+                        continue
+                except NotSupported:
+                    continue
+                except BaseError as exc:
                     logger.debug(
-                        "[%s] %s failed: %s",
+                        "[%s] %s failed (params=%s): %s",
                         self.config.name,
                         method_name,
+                        _stringify_payload(params_with_range),
                         exc,
                         exc_info=self._debug_api_payloads,
                     )
                     continue
-            except NotSupported:
-                continue
-            except BaseError as exc:
-                logger.debug(
-                    "[%s] %s failed: %s",
-                    self.config.name,
-                    method_name,
-                    exc,
-                    exc_info=self._debug_api_payloads,
-                )
-                continue
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug(
-                    "[%s] Unexpected error during %s: %s",
-                    self.config.name,
-                    method_name,
-                    exc,
-                    exc_info=self._debug_api_payloads,
-                )
-                continue
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "[%s] Unexpected error during %s (params=%s): %s",
+                        self.config.name,
+                        method_name,
+                        _stringify_payload(params_with_range),
+                        exc,
+                        exc_info=self._debug_api_payloads,
+                    )
+                    continue
 
-            if not entries:
-                continue
+                if not entries:
+                    continue
 
-            for entry in entries:
-                if not isinstance(entry, Mapping):
-                    continue
-                normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
-                if normalised is None:
-                    continue
-                dedupe_key = self._cashflow_dedupe_key(normalised)
-                if dedupe_key in seen_keys:
-                    continue
-                seen_keys.add(dedupe_key)
-                events.append(normalised)
+                for entry in entries:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
+                    if normalised is None:
+                        continue
+                    dedupe_key = self._cashflow_dedupe_key(normalised)
+                    if dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+                    events.append(normalised)
 
         if not events:
             return []
