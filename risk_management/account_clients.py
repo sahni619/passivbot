@@ -70,6 +70,42 @@ except (ModuleNotFoundError, ImportError):  # pragma: no cover - allow running w
 logger = logging.getLogger(__name__)
 
 
+def _normalise_order_book_depth(exchange: str, requested: int) -> int:
+    """Return a depth limit supported by the exchange."""
+
+    allowed_depths_map = {
+        "binance": (5, 10, 20, 50, 100, 500, 1000),
+        "binanceusdm": (5, 10, 20, 50, 100, 500, 1000),
+        "binancecoinm": (5, 10, 20, 50, 100, 500, 1000),
+    }
+
+    allowed_depths = allowed_depths_map.get(exchange.lower())
+    if not allowed_depths:
+        return max(requested, 1)
+
+    if requested <= 0:
+        return allowed_depths[0]
+
+    for depth in allowed_depths:
+        if requested <= depth:
+            if requested != depth:
+                logger.debug(
+                    "Normalising unsupported order book depth %s to %s for %s",
+                    requested,
+                    depth,
+                    exchange,
+                )
+            return depth
+
+    logger.debug(
+        "Normalising unsupported order book depth %s to %s for %s",
+        requested,
+        allowed_depths[-1],
+        exchange,
+    )
+    return allowed_depths[-1]
+
+
 class AccountClientProtocol(abc.ABC):
     """Abstract interface for realtime account clients."""
 
@@ -527,7 +563,9 @@ class CCXTAccountClient(AccountClientProtocol):
         settings = self._liquidity_settings
         if not getattr(settings, "fetch_order_book", True):
             return metrics
-        depth = getattr(settings, "depth", 25) or 25
+        raw_depth = getattr(settings, "depth", 25)
+        depth = _coerce_int(raw_depth) or 25
+        depth = _normalise_order_book_depth(self._normalized_exchange, depth)
         for symbol in dict.fromkeys(symbols):
             if not symbol:
                 continue
