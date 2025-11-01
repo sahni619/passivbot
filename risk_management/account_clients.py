@@ -14,12 +14,17 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 
 try:  # pragma: no cover - optional dependency in some envs
     import ccxt.async_support as ccxt_async
-    from ccxt.base.errors import AuthenticationError, BaseError, NotSupported
+    from ccxt.base.errors import AuthenticationError, BadRequest, BaseError, NotSupported
 except ModuleNotFoundError:  # pragma: no cover - allow tests without ccxt
     ccxt_async = None  # type: ignore[assignment]
 
     class BaseError(Exception):
         """Fallback error when ccxt is unavailable."""
+
+        pass
+
+    class BadRequest(BaseError):
+        """Fallback error matching ccxt BadRequest when unavailable."""
 
         pass
 
@@ -661,6 +666,39 @@ class CCXTAccountClient(AccountClientProtocol):
             else {}
         )
 
+
+        def _merge_time_params(base: Mapping[str, Any], end_ms: int) -> Dict[str, Any]:
+            merged = dict(base) if isinstance(base, Mapping) else {}
+            end_ms_int = int(end_ms)
+            exchange_id = self._normalized_exchange or ""
+            if exchange_id.startswith("binance"):
+                merged.setdefault("endTime", end_ms_int)
+            if exchange_id.startswith("bybit"):
+                merged.setdefault("endTime", end_ms_int)
+            if exchange_id.startswith("okx"):
+                merged.setdefault("to", end_ms_int)
+            if exchange_id.startswith("kucoin"):
+                merged.setdefault("endAt", end_ms_int // 1000)
+            merged.setdefault("until", end_ms_int)
+            return merged
+
+        def _is_time_range_error(error: BaseError) -> bool:
+            message = str(error).lower()
+            indicators = (
+                "interval between the starttime and endtime is incorrect",
+                "time period is too large",
+                "time range is too large",
+                "time interval error",
+            )
+            return any(indicator in message for indicator in indicators)
+
+        chunk_days = _coerce_int(params_cfg.get("chunk_days"))
+        if chunk_days is None or chunk_days <= 0:
+            chunk_days = 7
+        chunk_span_ms = int(timedelta(days=chunk_days).total_seconds() * 1000)
+        if chunk_span_ms <= 0:
+            chunk_span_ms = 7 * 24 * 60 * 60 * 1000
+
         deposit_params = dict(common_params)
         if isinstance(params_cfg.get("deposits"), Mapping):
             deposit_params.update(params_cfg["deposits"])
@@ -674,6 +712,9 @@ class CCXTAccountClient(AccountClientProtocol):
             currency_code = None
 
         events: List[Dict[str, Any]] = []
+
+        seen_keys: set[Tuple[Any, ...]] = set()
+
         for flow_type, method_name, extra_params in (
             ("deposit", "fetch_deposits", deposit_params),
             ("withdrawal", "fetch_withdrawals", withdrawal_params),
@@ -681,13 +722,63 @@ class CCXTAccountClient(AccountClientProtocol):
             fetch_method = getattr(self.client, method_name, None)
             if fetch_method is None:
                 continue
+
+            params_with_end = _merge_time_params(extra_params, now_ms)
+
+            async def _fetch_chunked() -> List[Mapping[str, Any]]:
+                entries_accum: List[Mapping[str, Any]] = []
+                window_start = since_ms
+                while window_start <= now_ms:
+                    window_end = min(window_start + chunk_span_ms, now_ms)
+                    window_params = _merge_time_params(extra_params, window_end)
+                    try:
+                        chunk = await fetch_method(
+                            currency_code,
+                            since=window_start,
+                            limit=limit,
+                            params=window_params,
+                        )
+                    except BaseError as chunk_exc:
+                        logger.debug(
+                            "[%s] %s chunk fetch failed for %s-%s: %s",
+                            self.config.name,
+                            method_name,
+                            window_start,
+                            window_end,
+                            chunk_exc,
+                            exc_info=self._debug_api_payloads,
+                        )
+                        break
+                    if chunk:
+                        entries_accum.extend(chunk)
+                    if window_end >= now_ms:
+                        break
+                    window_start = window_end + 1
+                return entries_accum
+
             try:
                 entries = await fetch_method(
                     currency_code,
                     since=since_ms,
                     limit=limit,
+                    params=params_with_end,
+                )
+            except BadRequest as exc:
+                if _is_time_range_error(exc):
+                    entries = await _fetch_chunked()
+                else:
+                    logger.debug(
+                        "[%s] %s failed: %s",
+                        self.config.name,
+                        method_name,
+                        exc,
+                        exc_info=self._debug_api_payloads,
+                    )
+                    continue
+
                     params=extra_params,
                 )
+
             except NotSupported:
                 continue
             except BaseError as exc:
@@ -716,8 +807,27 @@ class CCXTAccountClient(AccountClientProtocol):
                 if not isinstance(entry, Mapping):
                     continue
                 normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
+
+                if normalised is None:
+                    continue
+                key_id = normalised.get("txid") or normalised.get("id")
+                if key_id:
+                    dedupe_key = (normalised["type"], str(key_id))
+                else:
+                    dedupe_key = (
+                        normalised["type"],
+                        normalised.get("currency"),
+                        float(normalised.get("amount", 0.0)),
+                        int(normalised.get("timestamp_ms", 0)),
+                    )
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                events.append(normalised)
+
                 if normalised is not None:
                     events.append(normalised)
+
 
         if not events:
             return []
