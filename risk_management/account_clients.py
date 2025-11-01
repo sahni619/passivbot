@@ -666,6 +666,7 @@ class CCXTAccountClient(AccountClientProtocol):
             else {}
         )
 
+
         def _merge_time_params(
             base: Mapping[str, Any], start_ms: Optional[int], end_ms: int
         ) -> Dict[str, Any]:
@@ -693,6 +694,20 @@ class CCXTAccountClient(AccountClientProtocol):
             if exchange_id.startswith("kucoin"):
                 if start_ms_int is not None:
                     merged.setdefault("startAt", start_ms_int // 1000)
+
+
+        def _merge_time_params(base: Mapping[str, Any], end_ms: int) -> Dict[str, Any]:
+            merged = dict(base) if isinstance(base, Mapping) else {}
+            end_ms_int = int(end_ms)
+            exchange_id = self._normalized_exchange or ""
+            if exchange_id.startswith("binance"):
+                merged.setdefault("endTime", end_ms_int)
+            if exchange_id.startswith("bybit"):
+                merged.setdefault("endTime", end_ms_int)
+            if exchange_id.startswith("okx"):
+                merged.setdefault("to", end_ms_int)
+            if exchange_id.startswith("kucoin"):
+
                 merged.setdefault("endAt", end_ms_int // 1000)
             merged.setdefault("until", end_ms_int)
             return merged
@@ -727,7 +742,13 @@ class CCXTAccountClient(AccountClientProtocol):
             currency_code = None
 
         events: List[Dict[str, Any]] = []
+
         seen_keys: set[Tuple[Any, ...]] = set()
+
+
+        seen_keys: set[Tuple[Any, ...]] = set()
+
+
         for flow_type, method_name, extra_params in (
             ("deposit", "fetch_deposits", deposit_params),
             ("withdrawal", "fetch_withdrawals", withdrawal_params),
@@ -736,14 +757,23 @@ class CCXTAccountClient(AccountClientProtocol):
             if fetch_method is None:
                 continue
 
+
             params_with_end = _merge_time_params(extra_params, since_ms, now_ms)
+
+            params_with_end = _merge_time_params(extra_params, now_ms)
+
 
             async def _fetch_chunked() -> List[Mapping[str, Any]]:
                 entries_accum: List[Mapping[str, Any]] = []
                 window_start = since_ms
                 while window_start <= now_ms:
+
                     window_end = min(window_start + chunk_span_ms - 1, now_ms)
                     window_params = _merge_time_params(extra_params, window_start, window_end)
+
+                    window_end = min(window_start + chunk_span_ms, now_ms)
+                    window_params = _merge_time_params(extra_params, window_end)
+
                     try:
                         chunk = await fetch_method(
                             currency_code,
@@ -788,6 +818,13 @@ class CCXTAccountClient(AccountClientProtocol):
                         exc_info=self._debug_api_payloads,
                     )
                     continue
+
+
+
+                    params=extra_params,
+                )
+
+
             except NotSupported:
                 continue
             except BaseError as exc:
@@ -816,6 +853,8 @@ class CCXTAccountClient(AccountClientProtocol):
                 if not isinstance(entry, Mapping):
                     continue
                 normalised = self._normalise_cashflow_entry(entry, flow_type, since_ms)
+
+
                 if normalised is None:
                     continue
                 key_id = normalised.get("txid") or normalised.get("id")
@@ -832,6 +871,12 @@ class CCXTAccountClient(AccountClientProtocol):
                     continue
                 seen_keys.add(dedupe_key)
                 events.append(normalised)
+
+
+                if normalised is not None:
+                    events.append(normalised)
+
+
 
         if not events:
             return []
