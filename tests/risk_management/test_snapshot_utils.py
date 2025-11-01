@@ -210,3 +210,67 @@ def test_snapshot_utils_includes_policies() -> None:
     assert isinstance(policies, dict)
     assert policies["evaluations"][0]["name"] == "Balance floor"
     assert policies["pending_actions"][0]["policy"] == "Balance floor"
+
+
+def test_snapshot_utils_normalises_cashflows() -> None:
+    snapshot = {
+        "generated_at": "2024-04-01T00:00:00+00:00",
+        "accounts": [
+            {"name": "Alpha", "balance": 10_000, "positions": []},
+        ],
+        "alert_thresholds": {},
+        "notification_channels": [],
+        "cashflows": {
+            "summary": {
+                "7d": {
+                    "currencies": [
+                        {
+                            "currency": "USDT",
+                            "deposits": 1_500.0,
+                            "withdrawals": 200.0,
+                            "net": 1_300.0,
+                            "deposit_count": 3,
+                            "withdrawal_count": 1,
+                        }
+                    ],
+                    "totals": {
+                        "deposits": 1_500.0,
+                        "withdrawals": 200.0,
+                        "net": 1_300.0,
+                        "deposit_count": 3,
+                        "withdrawal_count": 1,
+                    },
+                }
+            },
+            "events": [
+                {
+                    "id": "evt-1",
+                    "account": "Alpha",
+                    "exchange": "binance",
+                    "type": "deposit",
+                    "amount": 500.0,
+                    "currency": "USDT",
+                    "timestamp": "2024-03-29T12:00:00+00:00",
+                    "status": "ok",
+                    "txid": "abc123",
+                    "note": "Initial funding",
+                }
+            ],
+        },
+    }
+
+    view = build_presentable_snapshot(snapshot)
+
+    cashflows = view.get("cashflows")
+    assert cashflows is not None
+    seven_day = cashflows["summary"].get("7d")
+    assert seven_day is not None
+    currency_entry = seven_day["currencies"][0]
+    assert currency_entry["currency"] == "USDT"
+    assert currency_entry["deposits"] == pytest.approx(1_500.0)
+    assert currency_entry["withdrawals"] == pytest.approx(200.0)
+    assert currency_entry["net"] == pytest.approx(1_300.0)
+    assert seven_day["totals"]["deposit_count"] == 3
+    event = cashflows["events"][0]
+    assert event["account"] == "Alpha"
+    assert event["txid"] == "abc123"

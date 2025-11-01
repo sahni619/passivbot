@@ -392,3 +392,99 @@ def test_account_fetch_uses_realized_history_when_requested(monkeypatch) -> None
 
     assert result["daily_realized_pnl"] == pytest.approx(7.5)
     assert result["positions"][0]["daily_realized_pnl"] == 0.0
+
+
+def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) -> None:
+    fake_now_ms = 1_700_000_000_000
+
+    class DummyCashflowClient:
+        def __init__(self) -> None:
+            self.calls: list[Dict[str, Any]] = []
+            self._fail_once = True
+            self._chunk_calls = 0
+
+        async def fetch_deposits(self, code=None, since=None, limit=None, params=None):  # type: ignore[override]
+            params = dict(params or {})
+            self.calls.append(
+                {
+                    "type": "deposit",
+                    "code": code,
+                    "since": since,
+                    "limit": limit,
+                    "params": params,
+                }
+            )
+            timestamp = max(int(since or 0), 0) + 1_000
+            return [
+                {
+                    "id": "dep1",
+                    "amount": "10",
+                    "currency": "USDT",
+                    "timestamp": timestamp,
+                }
+            ]
+
+        async def fetch_withdrawals(self, code=None, since=None, limit=None, params=None):  # type: ignore[override]
+            params = dict(params or {})
+            self.calls.append(
+                {
+                    "type": "withdrawal",
+                    "code": code,
+                    "since": since,
+                    "limit": limit,
+                    "params": params,
+                }
+            )
+            if self._fail_once:
+                self._fail_once = False
+                raise module.BadRequest(
+                    "bybit {\"retMsg\":\"The interval between the startTime and endTime is incorrect\"}"
+                )
+            self._chunk_calls += 1
+            if self._chunk_calls > 1:
+                return []
+            end_time = params.get("endTime") or params.get("until") or fake_now_ms
+            timestamp = int(end_time) - 500
+            return [
+                {
+                    "id": "wd1",
+                    "amount": "5",
+                    "currency": "USDT",
+                    "timestamp": timestamp,
+                }
+            ]
+
+        async def close(self):  # type: ignore[override]
+            return None
+
+    dummy = DummyCashflowClient()
+
+    monkeypatch.setattr(module.time, "time", lambda: fake_now_ms / 1000)
+    monkeypatch.setattr(module, "_instantiate_ccxt_client", lambda exchange, credentials, **kwargs: dummy)
+    monkeypatch.setattr(module, "normalize_exchange_name", lambda exchange: exchange)
+    monkeypatch.setattr(module, "resolve_custom_endpoint_override", lambda exchange: None)
+    monkeypatch.setattr(module, "get_custom_endpoint_source", lambda: None)
+
+    config = AccountConfig(
+        name="Bybit",
+        exchange="bybit",
+        credentials={},
+        params={"cashflows": {"lookback_days": 30}},
+    )
+
+    client = module.CCXTAccountClient(config)
+
+    events = run_async(client._fetch_cashflows())
+
+    assert len(events) == 2
+    types = {event["type"] for event in events}
+    assert types == {"deposit", "withdrawal"}
+
+    deposit_call = next(call for call in dummy.calls if call["type"] == "deposit")
+    assert deposit_call["params"].get("endTime") == fake_now_ms
+    assert deposit_call["params"].get("until") == fake_now_ms
+
+    withdrawal_calls = [call for call in dummy.calls if call["type"] == "withdrawal"]
+    assert withdrawal_calls, "expected at least one withdrawal call"
+    first_withdrawal = withdrawal_calls[0]
+    assert first_withdrawal["params"].get("endTime") == fake_now_ms
