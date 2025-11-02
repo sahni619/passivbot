@@ -22,7 +22,10 @@ if "uvicorn" not in sys.modules:
     sys.modules["uvicorn"] = uvicorn_stub
 
 from risk_management.configuration import AccountConfig, RealtimeConfig  # noqa: E402
-from risk_management.web_server import _determine_uvicorn_logging  # noqa: E402
+from risk_management.web_server import (  # noqa: E402
+    _INVALID_HTTP_REQUEST_FILTER_NAME,
+    _determine_uvicorn_logging,
+)
 
 
 def _make_config(global_debug: bool = False, account_debug: bool = False) -> RealtimeConfig:
@@ -49,7 +52,7 @@ def test_determine_uvicorn_logging_uses_uvicorn_config(monkeypatch) -> None:
         "version": 1,
         "disable_existing_loggers": False,
         "formatters": {},
-        "handlers": {},
+        "handlers": {"default": {"class": "logging.StreamHandler"}},
         "loggers": {"": {"handlers": ["default"], "level": "INFO"}},
     }
     uvicorn_module = types.ModuleType("uvicorn")
@@ -66,6 +69,8 @@ def test_determine_uvicorn_logging_uses_uvicorn_config(monkeypatch) -> None:
     assert log_level == "debug"
     assert log_config["loggers"][""]["level"] == "DEBUG"
     assert log_config["loggers"]["risk_management"]["level"] == "DEBUG"
+    assert _INVALID_HTTP_REQUEST_FILTER_NAME in log_config["filters"]
+    assert _INVALID_HTTP_REQUEST_FILTER_NAME in log_config["loggers"]["uvicorn.error"]["filters"]
 
 
 def test_determine_uvicorn_logging_handles_missing_uvicorn(monkeypatch) -> None:
