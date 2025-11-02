@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-"""Utilities for analysing order-book liquidity and slippage."""
-
 from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 __all__ = ["normalise_order_book", "calculate_position_liquidity"]
