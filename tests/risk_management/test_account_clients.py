@@ -401,6 +401,99 @@ def test_account_fetch_uses_realized_history_when_requested(monkeypatch) -> None
     assert result["positions"][0]["daily_realized_pnl"] == 0.0
 
 
+def test_account_fetch_includes_cashflows_when_enabled(monkeypatch) -> None:
+    class DummyExchange:
+        def __init__(self) -> None:
+            self.markets = {}
+            self.options = {}
+
+        async def load_markets(self):  # type: ignore[override]
+            self.markets = {"BTCUSDT": {}}
+
+        async def fetch_balance(self, params=None):  # type: ignore[override]
+            return {"total": {"USDT": 2_000}, "info": {}}
+
+        async def fetch_positions(self, params=None):  # type: ignore[override]
+            return []
+
+        async def fetch_open_orders(self, symbol=None, params=None):  # type: ignore[override]
+            return []
+
+    dummy_client = DummyExchange()
+
+    monkeypatch.setattr(module, "_instantiate_ccxt_client", lambda exchange, credentials, **kwargs: dummy_client)
+
+    calls: list[str] = []
+
+    async def fake_cashflows(self):  # type: ignore[override]
+        calls.append(self.config.name)
+        return [
+            {"type": "deposit", "id": "dep1", "amount": 10.0, "currency": "USDT", "timestamp": 1_700_000_000_000},
+            {"type": "withdrawal", "id": "wd1", "amount": 5.0, "currency": "USDT", "timestamp": 1_700_000_100_000},
+        ]
+
+    monkeypatch.setattr(module.CCXTAccountClient, "_fetch_cashflows", fake_cashflows)
+
+    config = AccountConfig(
+        name="Bybit",
+        exchange="bybit",
+        settle_currency="USDT",
+        credentials={},
+        params={"cashflows": {}},
+    )
+
+    client = module.CCXTAccountClient(config)
+
+    result = run_async(client.fetch())
+
+    assert calls == ["Bybit"]
+    events = result.get("cashflows", {}).get("events", [])
+    assert len(events) == 2
+    assert events[0]["id"] == "dep1"
+
+
+def test_account_fetch_skips_cashflows_when_disabled(monkeypatch) -> None:
+    class DummyExchange:
+        def __init__(self) -> None:
+            self.markets = {}
+            self.options = {}
+
+        async def load_markets(self):  # type: ignore[override]
+            self.markets = {"BTCUSDT": {}}
+
+        async def fetch_balance(self, params=None):  # type: ignore[override]
+            return {"total": {"USDT": 2_000}, "info": {}}
+
+        async def fetch_positions(self, params=None):  # type: ignore[override]
+            return []
+
+        async def fetch_open_orders(self, symbol=None, params=None):  # type: ignore[override]
+            return []
+
+    dummy_client = DummyExchange()
+
+    monkeypatch.setattr(module, "_instantiate_ccxt_client", lambda exchange, credentials, **kwargs: dummy_client)
+
+    async def fail_cashflows(self):  # type: ignore[override]
+        raise AssertionError("cashflows should be disabled")
+
+    monkeypatch.setattr(module.CCXTAccountClient, "_fetch_cashflows", fail_cashflows)
+
+    config = AccountConfig(
+        name="Bybit",
+        exchange="bybit",
+        settle_currency="USDT",
+        credentials={},
+        params={"cashflows": {"enabled": False}},
+    )
+
+    client = module.CCXTAccountClient(config)
+
+    result = run_async(client.fetch())
+
+    assert "cashflows" not in result
+
+
 def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) -> None:
     fake_now_ms = 1_700_000_000_000
 
