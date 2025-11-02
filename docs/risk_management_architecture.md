@@ -55,11 +55,42 @@ performance summaries.
 `close_all_positions()`. These power both the CLI refresh loop and FastAPI
 routes.
 - **Configuration touch points**: Upon initialisation the fetcher applies
-`CustomEndpointSettings` discovery, instantiates `CCXTAccountClient` instances
-for every `RealtimeConfig.accounts` entry, seeds notification channels, and
-configures `PerformanceTracker` output directories. Runtime kill switch, order,
-and stop-loss commands reference `_resolve_account_client()` to ensure the
-requested account exists in the active configuration.
+  `CustomEndpointSettings` discovery, instantiates `CCXTAccountClient` instances
+  for every `RealtimeConfig.accounts` entry, seeds notification channels, and
+  configures `PerformanceTracker` output directories. Runtime kill switch, order,
+  and stop-loss commands reference `_resolve_account_client()` to ensure the
+  requested account exists in the active configuration.
+  Cash flow polling is also driven by each account's `params.cashflows`
+  mapping—set `"enabled": false` to skip deposit and withdrawal collection or
+  supply `lookback_days`, `lookback_ms`, `limit`, `code`, or exchange-specific
+  `params` to tune the fetch window. When omitted, the client defaults to a
+  30-day lookback and polls both deposits and withdrawals automatically:
+
+  ```json
+  {
+    "accounts": [
+      {
+        "name": "Binance Futures",
+        "exchange": "binanceusdm",
+        "credentials": {"apiKey": "...", "secret": "..."},
+        "params": {
+          "cashflows": {
+            "enabled": true,
+            "lookback_days": 14
+          }
+        }
+      },
+      {
+        "name": "Dry Run",
+        "exchange": "okx",
+        "credentials": {},
+        "params": {
+          "cashflows": {"enabled": false}
+        }
+      }
+    ]
+  }
+  ```
 
 ## `risk_management.performance`
 - **Data structures**: Provides the `PerformanceSnapshot` dataclass to capture a
