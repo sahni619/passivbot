@@ -866,6 +866,22 @@ class CCXTAccountClient(AccountClientProtocol):
         total_unrealized = sum(position.get("unrealized_pnl", 0.0) for position in parsed_positions)
         total_notional = sum(position.get("notional", 0.0) for position in parsed_positions)
 
+        cashflow_events: Optional[List[Mapping[str, Any]]] = None
+        cashflow_settings = self._cashflow_params or {}
+        if cashflow_settings.get("enabled", True):
+            try:
+                cashflow_events = await self._fetch_cashflows()
+            except AuthenticationError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[%s] Failed to fetch cash flow events: %s",
+                    self.config.name,
+                    exc,
+                )
+                if self._debug_api_payloads:
+                    logger.debug("[%s] Cash flow fetch error", self.config.name, exc_info=True)
+
         snapshot: Dict[str, Any] = {
             "account": self.config.name,
             "name": self.config.name,
@@ -881,6 +897,8 @@ class CCXTAccountClient(AccountClientProtocol):
         }
         if self._custom_endpoint_source:
             snapshot["custom_endpoint_source"] = self._custom_endpoint_source
+        if cashflow_events is not None:
+            snapshot["cashflows"] = {"events": list(cashflow_events)}
         return snapshot
 
     async def close(self) -> None:
