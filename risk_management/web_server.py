@@ -110,6 +110,29 @@ def _determine_uvicorn_logging(config) -> tuple[Optional[dict], str]:
     return log_config, "debug"
 
 
+def _apply_https_only_policy(config, *, ssl_enabled: bool) -> bool:
+    """Ensure HTTPS-only authentication is only enforced when TLS is active."""
+
+    auth = getattr(config, "auth", None)
+    if auth is None:
+        return False
+
+    if not getattr(auth, "https_only", False):
+        return False
+
+    if ssl_enabled:
+        return True
+
+    logging.getLogger("risk_management.web_server").warning(
+        "Authentication is configured for HTTPS-only sessions but no TLS certificate/key "
+        "were supplied. Disabling HTTPS enforcement. Either launch the server with "
+        "--ssl-certfile/--ssl-keyfile or set 'auth.https_only' to false in the realtime "
+        "configuration for non-TLS development environments.",
+    )
+    auth.https_only = False
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Launch the risk dashboard web UI")
     parser.add_argument("--config", type=Path, required=True, help="Path to the realtime configuration file")
@@ -257,19 +280,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             parser.error(str(exc))
         ssl_certfile, ssl_keyfile = str(cert_path), str(key_path)
 
-    app = create_app(config, letsencrypt_challenge_dir=args.letsencrypt_webroot)
+    ssl_enabled = bool(ssl_certfile and ssl_keyfile)
+    _apply_https_only_policy(config, ssl_enabled=ssl_enabled)
 
-    if (
-        getattr(config, "auth", None)
-        and getattr(config.auth, "https_only", False)
-        and not ssl_certfile
-        and not ssl_keyfile
-    ):
-        logging.getLogger("risk_management.web_server").warning(
-            "Authentication is configured for HTTPS-only sessions but no TLS certificate/key "
-            "were supplied. Either launch the server with --ssl-certfile/--ssl-keyfile or set "
-            "'auth.https_only' to false in the realtime configuration for non-TLS development environments."
-        )
+    app = create_app(config, letsencrypt_challenge_dir=args.letsencrypt_webroot)
 
     uvicorn = _import_uvicorn()
 

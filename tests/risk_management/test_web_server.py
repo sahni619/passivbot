@@ -21,10 +21,11 @@ if "uvicorn" not in sys.modules:
     uvicorn_stub.run = _noop_run
     sys.modules["uvicorn"] = uvicorn_stub
 
-from risk_management.configuration import AccountConfig, RealtimeConfig  # noqa: E402
+from risk_management.configuration import AccountConfig, AuthConfig, RealtimeConfig  # noqa: E402
 from risk_management.web_server import (  # noqa: E402
     _INVALID_HTTP_REQUEST_FILTER_NAME,
     _determine_uvicorn_logging,
+    _apply_https_only_policy,
 )
 
 
@@ -92,3 +93,35 @@ def test_determine_uvicorn_logging_handles_missing_uvicorn(monkeypatch) -> None:
 
     assert log_config is None
     assert log_level == "debug"
+
+
+def test_apply_https_only_policy_disabled_when_tls_missing(caplog) -> None:
+    config = _make_config()
+    config.auth = AuthConfig(secret_key="secret", users={"user": "hash"}, https_only=True)
+
+    enforced = _apply_https_only_policy(config, ssl_enabled=False)
+
+    assert not enforced
+    assert config.auth.https_only is False
+    assert any("Disabling HTTPS enforcement" in message for message in caplog.messages)
+
+
+def test_apply_https_only_policy_preserves_https_when_tls_available() -> None:
+    config = _make_config()
+    config.auth = AuthConfig(secret_key="secret", users={"user": "hash"}, https_only=True)
+
+    enforced = _apply_https_only_policy(config, ssl_enabled=True)
+
+    assert enforced is True
+    assert config.auth.https_only is True
+
+
+def test_apply_https_only_policy_ignored_when_not_requested(caplog) -> None:
+    config = _make_config()
+    config.auth = AuthConfig(secret_key="secret", users={"user": "hash"}, https_only=False)
+
+    enforced = _apply_https_only_policy(config, ssl_enabled=False)
+
+    assert not enforced
+    assert config.auth.https_only is False
+    assert not caplog.messages
