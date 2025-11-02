@@ -30,19 +30,60 @@ def _import_uvicorn() -> "uvicorn":
     return uvicorn
 
 
+_INVALID_HTTP_REQUEST_FILTER_NAME = "suppress_invalid_http_request"
+
+
+class _SuppressInvalidHttpRequestFilter(logging.Filter):
+    """Filter out noisy uvicorn warnings emitted for malformed probes."""
+
+    _TARGET_MESSAGE = "Invalid HTTP request received."
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - trivial behaviour
+        return record.getMessage() != self._TARGET_MESSAGE
+
+
+def _ensure_invalid_http_warning_filter(logging_config: dict) -> None:
+    """Install a logging filter that suppresses uvicorn's invalid request warnings."""
+
+    if not logging_config:
+        return
+
+    filters = logging_config.setdefault("filters", {})
+    if _INVALID_HTTP_REQUEST_FILTER_NAME not in filters:
+        filters[_INVALID_HTTP_REQUEST_FILTER_NAME] = {
+            "()": f"{__name__}._SuppressInvalidHttpRequestFilter",
+        }
+
+    loggers = logging_config.setdefault("loggers", {})
+    uvicorn_error = loggers.setdefault(
+        "uvicorn.error", {"handlers": ["default"], "level": "INFO", "propagate": True}
+    )
+    logger_filters = uvicorn_error.setdefault("filters", [])
+    if _INVALID_HTTP_REQUEST_FILTER_NAME not in logger_filters:
+        logger_filters.append(_INVALID_HTTP_REQUEST_FILTER_NAME)
+
+
 def _determine_uvicorn_logging(config) -> tuple[Optional[dict], str]:
     """Return logging configuration overrides for uvicorn."""
 
     debug_requested = config.debug_api_payloads or any(
         account.debug_api_payloads for account in getattr(config, "accounts", [])
     )
-    if not debug_requested:
-        return None, "info"
+
     try:
         uvicorn_config = importlib.import_module("uvicorn.config")
     except ModuleNotFoundError:  # pragma: no cover - uvicorn not importable in tests
-        return None, "debug"
+        if debug_requested:
+            return None, "debug"
+        return None, "info"
+
     LOGGING_CONFIG = getattr(uvicorn_config, "LOGGING_CONFIG", None)
+    if LOGGING_CONFIG is not None:
+        _ensure_invalid_http_warning_filter(LOGGING_CONFIG)
+
+    if not debug_requested:
+        return None, "info"
+
     if LOGGING_CONFIG is None:  # pragma: no cover - unexpected configuration shape
         return None, "debug"
 
@@ -67,6 +108,29 @@ def _determine_uvicorn_logging(config) -> tuple[Optional[dict], str]:
     risk_root.setdefault("propagate", False)
 
     return log_config, "debug"
+
+
+def _apply_https_only_policy(config, *, ssl_enabled: bool) -> bool:
+    """Ensure HTTPS-only authentication is only enforced when TLS is active."""
+
+    auth = getattr(config, "auth", None)
+    if auth is None:
+        return False
+
+    if not getattr(auth, "https_only", False):
+        return False
+
+    if ssl_enabled:
+        return True
+
+    logging.getLogger("risk_management.web_server").warning(
+        "Authentication is configured for HTTPS-only sessions but no TLS certificate/key "
+        "were supplied. Disabling HTTPS enforcement. Either launch the server with "
+        "--ssl-certfile/--ssl-keyfile or set 'auth.https_only' to false in the realtime "
+        "configuration for non-TLS development environments.",
+    )
+    auth.https_only = False
+    return False
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -216,19 +280,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             parser.error(str(exc))
         ssl_certfile, ssl_keyfile = str(cert_path), str(key_path)
 
-    app = create_app(config, letsencrypt_challenge_dir=args.letsencrypt_webroot)
+    ssl_enabled = bool(ssl_certfile and ssl_keyfile)
+    _apply_https_only_policy(config, ssl_enabled=ssl_enabled)
 
-    if (
-        getattr(config, "auth", None)
-        and getattr(config.auth, "https_only", False)
-        and not ssl_certfile
-        and not ssl_keyfile
-    ):
-        logging.getLogger("risk_management.web_server").warning(
-            "Authentication is configured for HTTPS-only sessions but no TLS certificate/key "
-            "were supplied. Either launch the server with --ssl-certfile/--ssl-keyfile or set "
-            "'auth.https_only' to false in the realtime configuration for non-TLS development environments."
-        )
+    app = create_app(config, letsencrypt_challenge_dir=args.letsencrypt_webroot)
 
     uvicorn = _import_uvicorn()
 
