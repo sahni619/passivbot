@@ -34,6 +34,31 @@ _SENSITIVE_KEYWORDS = (
 _SENSITIVE_QUERY_PATTERN = re.compile(r"(?i)(signature=)([^\s&#]+)")
 
 
+def _ensure_sensitive_log_record_factory() -> None:
+    """Wrap the global log record factory with a redacting variant."""
+
+    current_factory = logging.getLogRecordFactory()
+    if getattr(current_factory, "_passivbot_sensitive", False):
+        return
+
+    def _factory(*args, **kwargs):
+        record = current_factory(*args, **kwargs)
+        original_get_message = record.getMessage
+
+        def _redacted_get_message() -> str:
+            try:
+                message = original_get_message()
+            except Exception:  # pragma: no cover - defensive, mirrors logging internals
+                return original_get_message()
+            return _mask_sensitive_values(message)
+
+        record.getMessage = _redacted_get_message  # type: ignore[assignment]
+        return record
+
+    _factory._passivbot_sensitive = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(_factory)
+
+
 def _mask_sensitive_values(text: str) -> str:
     """Return ``text`` with sensitive values redacted for logging output."""
 
@@ -113,6 +138,7 @@ def configure_logging(
     datefmt: str = DEFAULT_DATEFMT,
 ) -> None:
     """Initialise the root logger based on Passivbot's debug settings."""
+    _ensure_sensitive_log_record_factory()
     _ensure_trace_level()
     debug_level = _normalize_debug(debug)
     numeric_level = _debug_to_level(debug_level)
