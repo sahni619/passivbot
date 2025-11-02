@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -13,6 +14,53 @@ TRACE_LEVEL_NAME = "TRACE"
 
 DEFAULT_FORMAT = "%(asctime)s %(levelname)-8s %(message)s"
 DEFAULT_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+_SENSITIVE_KEYWORDS = (
+    "X-MBX-APIKEY",
+    "X-MBX-API-KEY",
+    "APIKEY",
+    "API-KEY",
+    "API_KEY",
+    "APISECRET",
+    "API-SECRET",
+    "API_SECRET",
+    "SECRETKEY",
+    "SECRET_KEY",
+    "SECRET",
+    "SIGNATURE",
+)
+
+_SENSITIVE_QUERY_PATTERN = re.compile(r"(?i)(signature=)([^\s&#]+)")
+
+
+def _mask_sensitive_values(text: str) -> str:
+    """Return ``text`` with sensitive values redacted for logging output."""
+
+    masked = text
+    for keyword in _SENSITIVE_KEYWORDS:
+        pattern = re.compile(
+            rf"(?i)(['\"]?{re.escape(keyword)}['\"]?\s*[:=]\s*)(['\"]?)([^'\"\s,&]+)(['\"]?)"
+        )
+
+        def _replace(match: re.Match[str]) -> str:
+            prefix = match.group(1)
+            opening = match.group(2) or ""
+            closing = match.group(4) or ""
+            return f"{prefix}{opening}***REDACTED***{closing}"
+
+        masked = pattern.sub(_replace, masked)
+
+    masked = _SENSITIVE_QUERY_PATTERN.sub(r"\1***REDACTED***", masked)
+    return masked
+
+
+class SensitiveDataFormatter(logging.Formatter):
+    """Formatter that redacts well-known sensitive payloads from log messages."""
+
+    def format(self, record: logging.LogRecord) -> str:  # pragma: no cover - exercised via tests
+        formatted = super().format(record)
+        return _mask_sensitive_values(formatted)
 
 
 def _ensure_trace_level() -> None:
@@ -69,7 +117,7 @@ def configure_logging(
     debug_level = _normalize_debug(debug)
     numeric_level = _debug_to_level(debug_level)
 
-    formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+    formatter = SensitiveDataFormatter(fmt=fmt, datefmt=datefmt)
     handlers: list[logging.Handler] = []
 
     if stream:
