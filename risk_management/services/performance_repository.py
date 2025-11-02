@@ -54,6 +54,20 @@ class PerformanceRepository:
         normalised = self._normalise_series(history)
         return self._filter_series(normalised, start=start, end=end)
 
+    def list_accounts(self) -> List[str]:
+        """Return the set of accounts that have recorded performance history."""
+
+        data = self._load()
+        accounts = data.get("accounts")
+        if not isinstance(accounts, Mapping):
+            return []
+        names: List[str] = []
+        for name, history in accounts.items():
+            if isinstance(history, Iterable):
+                names.append(str(name))
+        names.sort()
+        return names
+
     # ------------------------------------------------------------------
     # internal helpers
 

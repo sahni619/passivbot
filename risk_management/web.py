@@ -9,7 +9,7 @@ import json
 import logging
 from collections.abc import Iterable as IterableABC
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import (
     FileResponse,
@@ -31,6 +31,7 @@ from .domain.models import Scenario
 from .services.risk_service import RiskService, RiskServiceProtocol
 from .reporting import ReportManager
 from .services import PerformanceRepository
+from .performance_metrics import build_performance_metrics
 from .snapshot_utils import (
     ACCOUNT_SORT_FIELDS,
     DEFAULT_ACCOUNT_SORT_KEY,
@@ -563,6 +564,49 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"account": account_name, "series": series})
+
+    @app.get("/api/performance/metrics", response_class=JSONResponse)
+    async def api_performance_metrics(
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        account: Optional[str] = None,
+        repository: PerformanceRepository = Depends(get_performance_repository),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        try:
+            portfolio_series = repository.get_portfolio_series(start=start, end=end)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        payload: dict[str, object] = {
+            "portfolio": build_performance_metrics(portfolio_series),
+            "accounts": {},
+            "filters": {"start": start, "end": end},
+        }
+
+        accounts: List[str]
+        if account:
+            accounts = [account]
+        else:
+            accounts = repository.list_accounts()
+
+        accounts_metrics: Dict[str, object] = {}
+        for account_name in accounts:
+            try:
+                series = repository.get_account_series(account_name, start=start, end=end)
+            except KeyError:
+                if account:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Account '{account_name}' not found",
+                    ) from None
+                continue
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            accounts_metrics[account_name] = build_performance_metrics(series)
+
+        payload["accounts"] = accounts_metrics
+        return JSONResponse(payload)
 
     @app.get(
         "/api/trading/accounts/{account_name}/order-types",
