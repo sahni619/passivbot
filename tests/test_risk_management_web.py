@@ -221,6 +221,9 @@ class StubPerformanceRepository:
             raise KeyError(account_name)
         return self._filter(self.account_series[account_name], start=start, end=end)
 
+    def list_accounts(self) -> List[str]:
+        return sorted(self.account_series)
+
     def _filter(
         self,
         series: Sequence[Mapping[str, Any]],
@@ -1091,6 +1094,67 @@ def test_account_performance_endpoint_handles_errors(
         )
         assert invalid.status_code == 400
 
+
+def test_performance_metrics_endpoint_returns_expected_payload(
+    auth_manager: AuthManager,
+) -> None:
+    snapshot = _build_accounts_snapshot()
+    portfolio, accounts = _build_performance_series()
+    repository = StubPerformanceRepository(portfolio_series=portfolio, account_series=accounts)
+    client, _ = create_test_app(
+        snapshot,
+        auth_manager,
+        performance_repository=repository,
+    )
+
+    with client:
+        login_response = client.post(
+            "/login",
+            data={"username": "admin", "password": "admin123"},
+            allow_redirects=False,
+        )
+        assert login_response.status_code in {302, 303, 307}
+
+        response = client.get("/api/performance/metrics")
+        assert response.status_code == 200
+        payload = response.json()
+        assert set(payload.keys()) == {"portfolio", "accounts", "filters"}
+        assert payload["filters"] == {"start": None, "end": None}
+        portfolio_metrics = payload["portfolio"]
+        assert portfolio_metrics["statistics"]["num_points"] == len(portfolio)
+        assert portfolio_metrics["latest_snapshot"]["balance"] == portfolio[-1]["balance"]
+        account_metrics = payload["accounts"]["Demo"]
+        assert account_metrics["statistics"]["num_points"] == len(accounts["Demo"])
+        assert account_metrics["max_drawdown"]["amount"] >= 0
+
+
+def test_performance_metrics_endpoint_filters_accounts(
+    auth_manager: AuthManager,
+) -> None:
+    snapshot = _build_accounts_snapshot()
+    portfolio, accounts = _build_performance_series()
+    repository = StubPerformanceRepository(portfolio_series=portfolio, account_series=accounts)
+    client, _ = create_test_app(
+        snapshot,
+        auth_manager,
+        performance_repository=repository,
+    )
+
+    with client:
+        login_response = client.post(
+            "/login",
+            data={"username": "admin", "password": "admin123"},
+            allow_redirects=False,
+        )
+        assert login_response.status_code in {302, 303, 307}
+
+        response = client.get("/api/performance/metrics", params={"account": "Demo"})
+        assert response.status_code == 200
+        payload = response.json()
+        assert set(payload["accounts"].keys()) == {"Demo"}
+
+        missing = client.get("/api/performance/metrics", params={"account": "Unknown"})
+        assert missing.status_code == 404
 def test_audit_endpoints_require_configuration(auth_manager: AuthManager) -> None:
     reset_audit_registry()
     snapshot = {"accounts": []}
