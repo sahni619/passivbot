@@ -1,14 +1,18 @@
+from types import SimpleNamespace
+
+import config_utils
 import pytest
 
 from config_utils import (
     _apply_backward_compatibility_renames,
     _apply_non_live_adjustments,
     _ensure_bot_defaults_and_bounds,
-    _ensure_enforce_exposure_limit_bool,
+    _migrate_btc_collateral_settings,
     _normalize_position_counts,
     _rename_config_keys,
     _sync_with_template,
     get_template_config,
+    update_config_with_args,
 )
 
 
@@ -78,36 +82,37 @@ def test_apply_non_live_adjustments_sorts_and_filters():
     config["live"]["approved_coins"] = "btc,eth"
     config["live"]["ignored_coins"] = {"long": ["eth"], "short": []}
     config["backtest"]["end_date"] = "2023-01-01"
-    config["backtest"]["use_btc_collateral"] = False
-    config["optimize"]["scoring"] = ["btc_metric", "adg"]
-    config["optimize"]["limits"] = "--lower_bound_drawdown 0.3 --btc_penalty 0.1"
+    config["backtest"]["btc_collateral_cap"] = 0.0
+    config["optimize"]["scoring"] = ["btc_adg", "adg"]
+    config["optimize"][
+        "limits"
+    ] = "--lower_bound_drawdown_worst 0.3 --penalize_if_lower_than_gain_btc 0.1"
     config["optimize"]["bounds"]["long_entry_grid_spacing_pct"] = [0.1, 0.05]
 
     _apply_non_live_adjustments(config, verbose=False)
 
     assert config["live"]["approved_coins"]["long"] == ["btc"]
-    assert config["optimize"]["scoring"] == ["adg", "metric"]
+    assert config["optimize"]["scoring"] == ["adg_btc", "adg_usd"]
     limits = config["optimize"]["limits"]
     assert isinstance(limits, dict)
-    assert "lower_bound_drawdown" not in limits
-    assert "penalize_if_greater_than_drawdown" in limits
-    assert limits["penalty"] == pytest.approx(0.1)
+    assert "lower_bound_drawdown_worst" not in limits
+    assert limits["penalize_if_greater_than_drawdown_worst_usd"] == pytest.approx(0.3)
+    assert limits["penalize_if_lower_than_gain_btc"] == pytest.approx(0.1)
     assert config["optimize"]["bounds"]["long_entry_grid_spacing_pct"] == [0.05, 0.1]
     assert config["live"]["approved_coins"]["short"] == ["btc", "eth"]
 
 
-def test_ensure_enforce_exposure_limit_bool_casts_values():
-    config = {
-        "bot": {
-            "long": {"enforce_exposure_limit": 1},
-            "short": {"enforce_exposure_limit": 0},
-        }
-    }
+def test_migrate_btc_collateral_settings_converts_bool():
+    config = {"backtest": {"use_btc_collateral": True}}
+    _migrate_btc_collateral_settings(config, verbose=False)
+    assert config["backtest"]["btc_collateral_cap"] == pytest.approx(1.0)
+    assert config["backtest"]["btc_collateral_ltv_cap"] is None
+    assert "use_btc_collateral" not in config["backtest"]
 
-    _ensure_enforce_exposure_limit_bool(config)
-
-    assert config["bot"]["long"]["enforce_exposure_limit"] is True
-    assert config["bot"]["short"]["enforce_exposure_limit"] is False
+    config = {"backtest": {"use_btc_collateral": False}}
+    _migrate_btc_collateral_settings(config, verbose=False)
+    assert config["backtest"]["btc_collateral_cap"] == pytest.approx(0.0)
+    assert config["backtest"]["btc_collateral_ltv_cap"] is None
 
 
 def test_apply_backward_compatibility_renames_moves_filter_keys():
@@ -139,3 +144,51 @@ def test_apply_backward_compatibility_renames_moves_filter_keys():
     assert bounds["long_filter_log_range_ema_span"] == [10, 20]
     assert "short_filter_volume_rolling_window" not in bounds
     assert bounds["short_filter_volume_ema_span"] == [30, 40]
+
+
+def test_update_config_with_args_updates_coin_sources():
+    config = get_template_config("v7")
+    config["_coins_sources"] = {
+        "approved_coins": {"long": ["ADA"], "short": []},
+        "ignored_coins": {"long": [], "short": []},
+    }
+    args = SimpleNamespace()
+    vars(args)["live.approved_coins"] = ["BTC", "ETH"]
+    update_config_with_args(config, args, verbose=False)
+    assert config["live"]["approved_coins"]["long"] == ["BTC", "ETH"]
+    assert config["_coins_sources"]["approved_coins"]["long"] == ["BTC", "ETH"]
+
+
+def test_update_config_with_args_replaces_path_coin_source():
+    config = get_template_config("v7")
+    config["_coins_sources"] = {"ignored_coins": "configs/ignored.json"}
+    args = SimpleNamespace()
+    vars(args)["live.ignored_coins"] = ["DOGE"]
+    update_config_with_args(config, args, verbose=False)
+    assert config["live"]["ignored_coins"]["long"] == ["DOGE"]
+    assert config["_coins_sources"]["ignored_coins"]["long"] == ["DOGE"]
+
+
+def test_load_config_stores_raw_snapshot(monkeypatch):
+    import copy
+
+    raw = {"live": {"approved_coins": ["BTC"]}}
+
+    monkeypatch.setattr(
+        config_utils,
+        "load_hjson_config",
+        lambda path: copy.deepcopy(raw),
+    )
+
+    def fake_format(cfg, **kwargs):
+        # return a new dict to simulate normalization
+        return {"live": {"approved_coins": cfg["live"]["approved_coins"][:]}}
+
+    monkeypatch.setattr(config_utils, "format_config", fake_format)
+
+    loaded = config_utils.load_config("dummy.json", verbose=False)
+    assert loaded["_raw"] == raw
+
+    # Mutating runtime view must not mutate the raw snapshot
+    loaded["live"]["approved_coins"].append("ETH")
+    assert loaded["_raw"]["live"]["approved_coins"] == ["BTC"]

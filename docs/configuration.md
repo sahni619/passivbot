@@ -8,10 +8,34 @@ This document provides an overview of the parameters found in `config/template.j
 - **compress_cache**: Set to `true` to save disk space. Set to `false` for faster loading.
 - **end_date**: End date of backtest, e.g., `2024-06-23`. Set to `'now'` to use today's date as the end date.
 - **exchanges**: Exchanges from which to fetch 1m OHLCV data for backtesting and optimizing. Options: `[binance, bybit, gateio, bitget]`.
+- **combine_ohlcvs**: When `true`, build a single “combined” dataset by taking the best-quality feed for each coin across all configured exchanges. When `false`, the backtester/optimizer runs each exchange independently.
+- **coin_sources**: Optional mapping of `coin -> exchange` used to override the automatic selection performed when `combine_ohlcvs` is `true`. Scenarios may add more overrides; conflicting assignments raise an error.
 - **start_date**: Start date of backtest.
 - **starting_balance**: Starting balance in USD at the beginning of the backtest.
-- **use_btc_collateral**: `true`/`false`. Set to `true` to backtest with BTC as collateral, simulating starting with 100% BTC and buying BTC with all USD profits, but not selling BTC when taking losses (instead go into USD debt).
-  - Example: Given BTC/USD price of `$100,000`, if BTC balance is `1.0` and backtester makes `$10` profit, BTC balance becomes `1.0001` and USD balance is `0`. If backtester loses `$20`, BTC balance remains `1.0001` and USD balance becomes `-20`. If backtester then makes `$15` profit, USD debt is paid off first: BTC balance remains `1.0001`, USD balance becomes `-5`. If the backtester then makes `$10` profit: BTC balance becomes `1.00015`, USD balance is `0`.
+- **btc_collateral_cap**: Target (and ceiling) share of account equity to hold in BTC collateral. `0` keeps the account fully in USD; `1.0` mirrors the legacy 100% BTC mode; values `>1` allow leveraged BTC collateral, accepting negative USD balances.
+- **btc_collateral_ltv_cap**: Optional loan-to-value ceiling (`USD debt ÷ equity`) enforced when topping up BTC. Leave `null` (default) to allow unlimited debt, or set to a float (e.g., `0.6`) to stop buying BTC once leverage exceeds that threshold.
+### Suite Scenarios
+
+- **backtest.suite.enabled**: Master switch for suite runs (`--suite` forces it on).
+- **backtest.suite.include_base_scenario** / **base_label**: Optionally prepend a scenario that mirrors the base config.
+- **backtest.suite.aggregate**: Dict of metric-specific aggregation modes (default `mean`). Keys fall back to the `default` entry if unspecified.
+- **backtest.suite.scenarios**: List of scenario dicts. Supported per-scenario keys:
+  - `label`: Directory name under `backtests/suite_runs/<timestamp>/`.
+  - `start_date`, `end_date`: Override the global date window.
+  - `coins`, `ignored_coins`: Restrict or skip symbols.
+  - `exchanges`: Limit which exchanges can contribute data to this scenario.
+  - `coin_sources`: Scenario-specific overrides for `coin_sources`.
+
+Refer to `configs/examples/suite_example.json` for a practical template.
+
+## Logging
+
+- **level**: Controls global verbosity for Passivbot and tooling.
+  - Accepted values: `0` (warnings), `1` (info), `2` (debug), `3` (trace).
+  - The CLI flag `--debug-level`/`--log-level` on `src/passivbot.py` and `src/backtest.py` overrides the configured value for a single run.
+  - Components such as the CandlestickManager inherit this level, so EMA warm-up and candle maintenance logs follow the same verbosity.
+- **memory_snapshot_interval_minutes**: Interval between `_log_memory_snapshot` telemetry entries (RSS, cache footprint, asyncio task counts). Default `30`; lower values surface leaks sooner, higher values reduce noise.
+- **volume_refresh_info_threshold_seconds**: Minimum duration a bulk volume-EMA refresh must take before it is promoted to an INFO log. Runs that finish faster emit only DEBUG output (when debug logging is enabled). Set `0` to keep the previous always-INFO behaviour.
 
 ## Bot Settings
 
@@ -49,10 +73,10 @@ Passivbot can be configured to create a grid of entry orders, with prices and qu
     - `next_reentry_price_short = pos_price * (1 + entry_grid_spacing_pct * multiplier)`
   - `multiplier = 1 + (wallet_exposure / wallet_exposure_limit) * entry_grid_spacing_we_weight + log_component`
   - Setting `entry_grid_spacing_we_weight` > 0 widens spacing as the position approaches the wallet exposure limit; negative values tighten spacing when exposure is small.
-- **entry_grid_spacing_log_weight**, **entry_grid_spacing_log_span_hours**:
+- **entry_grid_spacing_log_weight**, **entry_log_range_ema_span_hours**:
   - The `log_component` in the multiplier above is derived from the EMA of the per-candle log range `ln(high/low)`.
   - `entry_grid_spacing_log_weight` controls how strongly the recent log range widens or narrows spacing. A value of `0` disables the log-based adjustment.
-  - `entry_grid_spacing_log_span_hours` sets the EMA span (in hours) used when smoothing the log-range signal before applying the weight.
+  - `entry_log_range_ema_span_hours` sets the EMA span (in hours) used when smoothing the log-range signal before applying the weight. The same log-range EMA also powers the volatility multipliers for `entry_trailing_threshold_log_weight` and `entry_trailing_retracement_log_weight`.
 - **entry_initial_ema_dist**:
   - Offset from lower/upper EMA band.
   - Long initial entry/short unstuck close prices are lower EMA band minus offset.
@@ -60,6 +84,14 @@ Passivbot can be configured to create a grid of entry orders, with prices and qu
   - See `ema_span_0`/`ema_span_1`.
 - **entry_initial_qty_pct**:
   - `initial_entry_cost = balance * wallet_exposure_limit * initial_qty_pct`
+- **entry_trailing_double_down_factor**:
+  - Multiplier controlling how aggressively trailing re-entries ramp up. As with the grid equivalent, any positive value increases the size of successive fills (higher values grow them faster).
+- **entry_trailing_threshold_pct**, **entry_trailing_retracement_pct**:
+  - Same semantics as the trailing-close parameters below, but applied to trailing entries. The bot waits for a favorable move (`threshold_pct`) and subsequent pullback (`retracement_pct`) before firing a trailing re-entry.
+- **entry_trailing_threshold_we_weight**, **entry_trailing_retracement_we_weight**:
+  - Extra scaling based on wallet exposure. As exposure approaches the per-symbol limit, positive weights widen the trailing bands to slow additional entries. Set to `0.0` to disable the adjustment.
+- **entry_trailing_threshold_log_weight**, **entry_trailing_retracement_log_weight**:
+  - Adds sensitivity to recent volatility using the shared `entry_log_range_ema_span_hours` EMA of log range. Positive weights increase the thresholds in choppy markets; `0.0` removes the volatility modulation.
 
 ### Trailing Parameters
 
@@ -155,7 +187,7 @@ Coins selected for trading are filtered by volume and log range. First, filter c
         close_grid_markup_end, close_grid_markup_start, close_grid_qty_pct, close_trailing_grid_ratio, close_trailing_qty_pct,
         close_trailing_retracement_pct, close_trailing_threshold_pct, ema_span_0, ema_span_1, enforce_exposure_limit,
         entry_grid_double_down_factor, entry_grid_spacing_pct, entry_grid_spacing_we_weight,
-        entry_grid_spacing_log_weight, entry_grid_spacing_log_span_hours, entry_initial_ema_dist,
+        entry_grid_spacing_log_weight, entry_log_range_ema_span_hours, entry_initial_ema_dist,
         entry_initial_qty_pct, entry_trailing_double_down_factor, entry_trailing_grid_ratio, entry_trailing_retracement_pct,
         entry_trailing_threshold_pct, unstuck_close_pct, unstuck_ema_dist, unstuck_threshold, wallet_exposure_limit
       ]
@@ -191,6 +223,8 @@ Coins selected for trading are filtered by volume and log range. First, filter c
   - If `true`, `approved_coins=[]` means all coins are approved.
   - If `false`, `approved_coins=[]` means no coins are approved.
 - **execution_delay_seconds**: Wait `x` seconds after executing to exchange.
+- **max_memory_candles_per_symbol**: Maximum number of 1m candles retained in RAM per symbol. Older entries are trimmed once this cap is exceeded. Default (`20_000`) balances memory footprint with trailing-history visibility.
+- **max_disk_candles_per_symbol_per_tf**: Maximum number of candles persisted on disk per symbol and timeframe. Oldest shards are pruned once the limit is hit (default `2_000_000`).
 - **filter_by_min_effective_cost**: If `true`, disallows coins where `balance * WE_limit * initial_qty_pct < min_effective_cost`.
   - Example: If the exchange's effective minimum cost for a coin is `$5`, but the bot wants to make an order of `$2`, disallow that coin.
 - **forced_mode_long**, **forced_mode_short**: Force all coins long/short to a given mode.
@@ -205,11 +239,17 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 - **max_n_cancellations_per_batch**: Cancels `n` open orders per execution.
 - **max_n_creations_per_batch**: Creates `n` new orders per execution.
 - **max_n_restarts_per_day**: If the bot crashes, restart up to `n` times per day before stopping completely.
-- **mimic_backtest_1m_delay**: If `true`, the bot will only update and evaluate open orders once per full minute, synchronized to the clock (e.g., 12:01:00, 12:02:00, etc.). This mimics the backtester's timestep logic and avoids intraminute updates. Useful for achieving higher fidelity between backtest and live performance.
 - **minimum_coin_age_days**: Disallows coins younger than a given number of days.
+- **recv_window_ms**: Millisecond tolerance for authenticated REST calls (default `5000`). Increase if your exchange intermittently rejects requests with `invalid request ... recv_window` errors due to clock drift.
 - Candlestick management is handled by the CandlestickManager with on-disk caching and TTL-based refresh. Legacy settings `ohlcvs_1m_rolling_window_days` and `ohlcvs_1m_update_after_minutes` are no longer used. Use `inactive_coin_candle_ttl_minutes` to control how long 1m candles for inactive symbols are kept in RAM before being refreshed.
 - **pnls_max_lookback_days**: How far into the past to fetch PnL history.
 - **price_distance_threshold**: Minimum distance to current price action required for EMA-based limit orders.
+- **risk_wel_enforcer_threshold**: Per-symbol multiplier that triggers the WEL enforcer. When a position’s exposure exceeds `wallet_exposure_limit * (1 + risk_we_excess_allowance_pct) * risk_wel_enforcer_threshold` the bot emits a reduce-only order to bring it back under control. Set <1.0 for continual trimming, `1.0` for a hard cap, or ≤0 to disable.
+- **risk_twel_enforcer_threshold**: Fraction of the configured `total_wallet_exposure_limit` that triggers the TWEL enforcer. When aggregate exposure exceeds this threshold the bot queues reduction orders instead of new entries. Set >1.0 to allow a grace margin, `1.0` for strict enforcement, or ≤0 to disable.
+- **risk_we_excess_allowance_pct**: Per-symbol allowance above the configured wallet exposure limit that the enforcer tolerates before trimming. Useful for smoothing reductions; leave at `0.0` for a hard cap.
+- **max_warmup_minutes**: Hard ceiling applied to the historical warm-up window for both backtests and live warm-ups. Use `0` to disable the cap; otherwise values above `0` clamp the per-symbol warmup calculated from EMA spans.
+- **warmup_ratio**: Multiplier applied to the longest EMA or log-range span (in minutes) across long/short settings to decide how much 1m history to prefetch before trading. A value of `0.2`, for example, warmups ~20% of the deepest lookback, capped by `max_warmup_minutes`.
+- **warmup_minutes**: Per-coin warm-up window (in minutes) derived from `warmup_ratio`, indicator spans, and the optional `max_warmup_minutes` ceiling. This value is used by the backtester and CandlestickManager to skip the earliest candles until indicators are fully primed; adjust `warmup_ratio` or the spans themselves to change it.
 - **time_in_force**: Default is Good-Till-Cancelled.
 - **user**: Fetch API key/secret from `api-keys.json`.
 
@@ -238,14 +278,25 @@ When optimizing, parameter values are within the lower and upper bounds.
   - Default values are median daily gain and Sharpe ratio.
   - Uses the NSGA-II algorithm (Non-dominated Sorting Genetic Algorithm II) for multi-objective optimization.
   - The fitness function minimizes both objectives (converted to negative values internally).
-  - Full list of options: `[adg, adg_w, calmar_ratio, calmar_ratio_w, drawdown_worst, drawdown_worst_mean_1pct, equity_balance_diff_neg_max, equity_balance_diff_neg_mean, equity_balance_diff_pos_max, equity_balance_diff_pos_mean, expected_shortfall_1pct, gain, loss_profit_ratio, loss_profit_ratio_w, mdg, mdg_w, omega_ratio, omega_ratio_w, position_held_hours_max, position_held_hours_mean, position_held_hours_median, position_unchanged_hours_max, positions_held_per_day, sharpe_ratio, sharpe_ratio_w, sortino_ratio, sortino_ratio_w, sterling_ratio, sterling_ratio_w]`
+  - Full list of options: `[adg, adg_w, calmar_ratio, calmar_ratio_w, drawdown_worst, drawdown_worst_mean_1pct, equity_balance_diff_neg_max, equity_balance_diff_neg_mean, equity_balance_diff_pos_max, equity_balance_diff_pos_mean, expected_shortfall_1pct, gain, loss_profit_ratio, loss_profit_ratio_w, mdg, mdg_w, omega_ratio, omega_ratio_w, peak_recovery_hours_equity, peak_recovery_hours_pnl, position_held_hours_max, position_held_hours_mean, position_held_hours_median, position_unchanged_hours_max, positions_held_per_day, sharpe_ratio, sharpe_ratio_w, sortino_ratio, sortino_ratio_w, sterling_ratio, sterling_ratio_w]`
   - Suffix `_w` indicates mean across 10 temporal subsets (whole, last_half, last_third, ..., last_tenth) to weigh recent data more heavily.
   - Examples: `["mdg", "sharpe_ratio", "loss_profit_ratio"]`, `["adg", "sortino_ratio", "drawdown_worst"]`, `["sortino_ratio", "omega_ratio", "adg_w", "position_unchanged_hours_max"]`
-    - Note: if config.backtest.use_btc_collateral=True, add prefix "btc_" to use btc denominated metrics, e.g. btc_adg or btc_drawdown_worst.
+    - Note: metrics may be suffixed with `_usd` or `_btc` to select denomination. If `config.backtest.btc_collateral_cap` is `0`, BTC values still represent the USD equity translated into BTC terms.
+
+### Optimizer Suites
+
+- **optimize.suite.enabled**: Evaluate every candidate across the configured scenarios. Equivalent to the `--suite` CLI flag.
+- **optimize.suite.include_base_scenario** / **base_label**: Same semantics as the backtest suite.
+- **optimize.suite.aggregate**: Per-metric aggregation rules applied to the scenario results before scoring.
+- **optimize.suite.scenarios**: Scenario dictionaries (same keys as `backtest.suite.scenarios`). Each one may override `coins`, `ignored_coins`, `start_date`, `end_date`, `exchanges`, and `coin_sources`.
+
+The optimizer automatically uploads all scenario slices into shared memory so the extra evaluations add minimal overhead.
 
 ### Optimization Limits
 
 The optimizer penalizes backtests whose metric values exceed or fall short of specified thresholds. Penalties are added to the fitness score to discourage undesirable configurations but do not disqualify the config.
+
+Any metric listed above (and its `btc_` prefixed counterpart when `backtest.use_btc_collateral=True`) can be used with `penalize_if_greater_than_*` / `penalize_if_lower_than_*`. Metrics present only in `analysis.json` but not in the scoring list are not currently available as limits.
 
 #### Format
 
@@ -263,5 +314,18 @@ Limits can be set in the config file under `optimize.limits` or passed via CLI u
 ##### CLI arg Example:
 
 ```
-python3 src/optimize.py --limits "--penalize_if_lower_than_btc_omega_ratio 3.0 --penalize_if_greater_than_loss_profit_ratio 0.5"
+python3 src/optimize.py --limits "--penalize_if_lower_than_omega_ratio_btc 3.0 --penalize_if_greater_than_loss_profit_ratio_usd 0.5"
 ```
+
+## Configuration Internals
+
+Passivbot stores a few metadata keys alongside the normalized config:
+
+- `_raw` retains the exact user input as it appeared on disk before formatting/normalization. It is
+  meant for inspection and diffing—callers should treat it as read-only.
+- `_coins_sources` records where approved/ignored coin lists originated (inline strings, external
+  files, CLI overrides). Future overrides update both the normalized lists and their
+  `_coins_sources` entries so live reloads honour the latest intent.
+
+Additional reserved keys may appear in future releases; all keys beginning with an underscore are
+ignored by persistence helpers to keep user configs tidy.
