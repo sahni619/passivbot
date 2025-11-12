@@ -1,0 +1,152 @@
+{
+  "api_keys_file": "/root/passivbot/api-keys.json",
+  "debug_api_payloads": false,
+  "custom_endpoints": {
+    "path": "/root/passivbot/configs/custom_endpoints.json",
+    "autodiscover": true
+  },
+  "reports_dir": "../risk_reports",
+  "grafana": {
+    "base_url": "https://108.160.138.76:8001/",
+    "default_height": 620,
+    "dashboards": [
+      {
+        "title": "Portfolio overview",
+        "url": "d-solo/abc123/portfolio-overview?orgId=1&from=now-7d&to=now&panelId=2&refresh=1m",
+        "description": "NAV, profit rate, and drawdown metrics across the portfolio."
+      },
+      {
+        "title": "Exposure & leverage",
+        "url": "d-solo/def456/portfolio-exposure?orgId=1&from=now-7d&to=now&panelId=6&refresh=1m",
+        "description": "Wallet exposure, leverage ratios, and asset allocation breakdowns."
+      }
+    ]
+  },
+
+  "accounts": [
+    {
+      "name": "Binance Futures AlphaMint",
+      "exchange": "binanceusdm",
+      "api_key_id": "binance_01",
+      "settle_currency": "USDT"
+    },
+        {
+      "name": "Binance Futures Vivek",
+      "exchange": "binanceusdm",
+      "api_key_id": "binance_03",
+      "settle_currency": "USDT"
+    },
+    {
+      "name": "OKX Futures Prismatic",
+      "exchange": "okx",
+      "api_key_id": "okx_01",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+        {
+      "name": "OKX Futures NN",
+      "exchange": "okx",
+      "api_key_id": "okx_02",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+    {
+      "name": "Bybit USDT Perpetuals TheAlternative",
+      "exchange": "bybit",
+      "api_key_id": "bybit_01",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+    {
+      "name": "Binance Futures BC",
+      "exchange": "binanceusdm",
+      "api_key_id": "binance_02",
+      "settle_currency": "USDT"
+    },
+        {
+      "name": "Bybit USDT Perpetuals ANU",
+      "exchange": "bybit",
+      "api_key_id": "bybit_02",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+        {
+      "name": "Bybit USDT Perpetuals SL2",
+      "exchange": "bybit",
+      "api_key_id": "bybit_03",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+        {
+      "name": "Bybit USDT Perpetuals SL",
+      "exchange": "bybit",
+      "api_key_id": "bybit_04",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+        {
+      "name": "Bybit USDT Perpetuals GP",
+      "exchange": "bybit",
+      "api_key_id": "bybit_05",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    },
+            {
+      "name": "Bybit USDT Perpetuals IK",
+      "exchange": "bybit",
+      "api_key_id": "bybit_06",
+      "settle_currency": "USDT",
+      "params": {
+        "balance": {"type": "swap"},
+        "positions": {"type": "swap"}
+      }
+    }
+  ],
+  "alert_thresholds": {
+    "wallet_exposure_pct": 0.65,
+    "position_wallet_exposure_pct": 0.25,
+    "max_drawdown_pct": 0.25,
+    "loss_threshold_pct": -0.08
+  },
+  "email": {
+    "host": "smtppro.zoho.in",
+    "port": 587,
+    "username": "admin@plezna.com",
+    "password": "L4naQ6CKK4Ja",
+    "sender": "admin@plezna.com",
+    "use_tls": true
+  },
+  "notification_channels": [
+    "email:admin@plezna.com",
+    "slack:#passivbot-risk-alerts"
+  ],
+  "auth": {
+    "secret_key": "jhgjhguyg^^554$$67CFCGFDGFd",
+    "session_cookie_name": "risk_dashboard_session",
+    "https_only": false,
+    "users": {
+      "admin": "$2b$12$0ZCLkFp6iuhlEFshgPCBz.0dXxmRCV4vcjxHfRh0qKtzc79Pj9c5W"
+    }
+  }
+}
