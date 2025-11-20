@@ -6,6 +6,8 @@ RealtimeDataFetcher utilities.
 
 from __future__ import annotations
 from collections.abc import Iterable as IterableABC
+import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
@@ -20,7 +22,11 @@ from urllib.parse import quote, urljoin
 from .configuration import RealtimeConfig
 from .realtime import RealtimeDataFetcher
 from .reporting import ReportManager
+from .history import PortfolioHistoryStore
+from .api_keys import load_api_keys, save_api_keys, validate_api_key_entry
 from .snapshot_utils import build_presentable_snapshot
+
+logger = logging.getLogger(__name__)
 
 
 class AuthManager:
@@ -116,6 +122,17 @@ class RiskDashboardService:
     async def clear_portfolio_stop_loss(self) -> None:
         await self._fetcher.clear_portfolio_stop_loss()
 
+    def list_conditional_stop_losses(self) -> list[Dict[str, Any]]:
+        return self._fetcher.get_conditional_stop_losses()
+
+    async def add_conditional_stop_loss(
+        self, name: str, metric: str, threshold: float, operator: str = "lte"
+    ) -> Dict[str, Any]:
+        return await self._fetcher.add_conditional_stop_loss(name, metric, threshold, operator)
+
+    async def clear_conditional_stop_losses(self, name: Optional[str] = None) -> None:
+        await self._fetcher.clear_conditional_stop_losses(name=name)
+
 
 def _format_kill_switch_failure(account: str, action: str, payload: Mapping[str, Any]) -> str:
     symbol = payload.get("symbol")
@@ -202,6 +219,8 @@ def create_app(
         base_root = config.config_root or Path.cwd()
         reports_dir = base_root / "reports"
     app.state.report_manager = ReportManager(reports_dir)
+    history_root = (reports_dir or config.config_root or Path.cwd()) / "history"
+    app.state.history_store = PortfolioHistoryStore(history_root)
 
     def resolve_grafana_context() -> dict[str, Any]:
         grafana_cfg = config.grafana
@@ -226,7 +245,25 @@ def create_app(
                 }
             )
 
-        return {"dashboards": dashboards, "theme": grafana_cfg.theme}
+        account_dashboards: list[dict[str, Any]] = []
+        if grafana_cfg.account_equity_template:
+            template = grafana_cfg.account_equity_template
+            for account in config.accounts:
+                url = template.replace("{account}", quote(account.name))
+                account_dashboards.append(
+                    {
+                        "title": f"{account.name} equity",
+                        "url": resolve_url(url),
+                        "description": f"Equity history for {account.name}",
+                        "height": grafana_cfg.default_height,
+                    }
+                )
+
+        return {
+            "dashboards": dashboards,
+            "account_dashboards": account_dashboards,
+            "theme": grafana_cfg.theme,
+        }
 
     app.state.grafana_context = resolve_grafana_context()
 
@@ -282,6 +319,22 @@ def create_app(
     def get_report_manager(request: Request) -> ReportManager:
         return request.app.state.report_manager
 
+    def get_history_store(request: Request) -> PortfolioHistoryStore:
+        return request.app.state.history_store
+
+    def _load_config_payload() -> Dict[str, Any]:
+        if config.config_path is None:
+            raise RuntimeError("Realtime configuration path is not available for editing")
+        try:
+            return json.loads(config.config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Realtime configuration file not found: {exc}") from exc
+
+    def _save_config_payload(payload: Mapping[str, Any]) -> None:
+        if config.config_path is None:
+            raise RuntimeError("Realtime configuration path is not available for editing")
+        config.config_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
     @app.get("/login", response_class=HTMLResponse)
     async def login_form(request: Request) -> HTMLResponse:
         if request.session.get("user"):
@@ -306,12 +359,20 @@ def create_app(
         return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard(request: Request, service: RiskDashboardService = Depends(get_service)) -> HTMLResponse:
+    async def dashboard(
+        request: Request,
+        service: RiskDashboardService = Depends(get_service),
+        history: PortfolioHistoryStore = Depends(get_history_store),
+    ) -> HTMLResponse:
         user = request.session.get("user")
         if not user:
             return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
         snapshot = await service.fetch_snapshot()
         view_model = build_presentable_snapshot(snapshot)
+        try:
+            await history.record_async(view_model)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Failed to persist snapshot history: %s", exc)
         grafana_context: dict[str, Any] = request.app.state.grafana_context
         return templates.TemplateResponse(
             "dashboard.html",
@@ -320,19 +381,26 @@ def create_app(
                 "user": user,
                 "snapshot": view_model,
                 "grafana_dashboards": grafana_context.get("dashboards", []),
+                "grafana_account_dashboards": grafana_context.get("account_dashboards", []),
                 "grafana_theme": grafana_context.get("theme"),
             },
         )
 
     @app.get("/trading-panel", response_class=HTMLResponse)
     async def trading_panel(
-        request: Request, service: RiskDashboardService = Depends(get_service)
+        request: Request,
+        service: RiskDashboardService = Depends(get_service),
+        history: PortfolioHistoryStore = Depends(get_history_store),
     ) -> HTMLResponse:
         user = request.session.get("user")
         if not user:
             return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
         snapshot = await service.fetch_snapshot()
         view_model = build_presentable_snapshot(snapshot)
+        try:
+            await history.record_async(view_model)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Failed to persist snapshot history: %s", exc)
         grafana_context: dict[str, Any] = request.app.state.grafana_context
         return templates.TemplateResponse(
             "trading_panel.html",
@@ -340,6 +408,37 @@ def create_app(
                 "request": request,
                 "user": user,
                 "snapshot": view_model,
+                "grafana_dashboards": grafana_context.get("dashboards", []),
+                "grafana_account_dashboards": grafana_context.get("account_dashboards", []),
+                "grafana_theme": grafana_context.get("theme"),
+            },
+        )
+
+    @app.get("/api-keys", response_class=HTMLResponse)
+    async def api_keys_page(request: Request) -> HTMLResponse:
+        user = request.session.get("user")
+        if not user:
+            return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+        if config.api_keys_path is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="API key file is not configured")
+        try:
+            api_keys_payload = load_api_keys(config.api_keys_path)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+        config_payload = _load_config_payload()
+        accounts_payload = config_payload.get("accounts", []) if isinstance(config_payload, Mapping) else []
+        grafana_context: dict[str, Any] = request.app.state.grafana_context
+
+        return templates.TemplateResponse(
+            "api_keys.html",
+            {
+                "request": request,
+                "user": user,
+                "api_keys": api_keys_payload,
+                "accounts": accounts_payload,
+                "config_path": str(config.config_path) if config.config_path else None,
+                "api_keys_path": str(config.api_keys_path),
                 "grafana_dashboards": grafana_context.get("dashboards", []),
                 "grafana_theme": grafana_context.get("theme"),
             },
@@ -349,10 +448,15 @@ def create_app(
     async def api_snapshot(
         request: Request,
         service: RiskDashboardService = Depends(get_service),
+        history: PortfolioHistoryStore = Depends(get_history_store),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         snapshot = await service.fetch_snapshot()
         view_model = build_presentable_snapshot(snapshot)
+        try:
+            await history.record_async(view_model)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Failed to persist snapshot history: %s", exc)
         return JSONResponse(view_model)
 
     @app.get(
@@ -517,6 +621,50 @@ def create_app(
         await service.clear_portfolio_stop_loss()
         return JSONResponse({"status": "cleared"})
 
+    @app.get("/api/trading/portfolio/conditional-stop-loss", response_class=JSONResponse)
+    async def api_list_conditional_stop_losses(
+        service: RiskDashboardService = Depends(get_service),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        return JSONResponse({"items": service.list_conditional_stop_losses()})
+
+    @app.post("/api/trading/portfolio/conditional-stop-loss", response_class=JSONResponse)
+    async def api_add_conditional_stop_loss(
+        request: Request,
+        service: RiskDashboardService = Depends(get_service),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as exc:  # pragma: no cover
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+        if not isinstance(payload, Mapping):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payload must be an object")
+        name = str(payload.get("name", "")).strip() or "conditional"
+        metric = str(payload.get("metric", "")).strip()
+        operator = str(payload.get("operator", "lte")).strip() or "lte"
+        try:
+            threshold = float(payload.get("threshold"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="threshold must be numeric")
+        try:
+            condition = await service.add_conditional_stop_loss(name, metric, threshold, operator)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(condition, status_code=status.HTTP_201_CREATED)
+
+    @app.delete("/api/trading/portfolio/conditional-stop-loss", response_class=JSONResponse)
+    async def api_clear_conditional_stop_loss(
+        request: Request,
+        service: RiskDashboardService = Depends(get_service),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        target = None
+        if request.query_params.get("name"):
+            target = request.query_params.get("name")
+        await service.clear_conditional_stop_losses(name=target)
+        return JSONResponse({"status": "cleared", "name": target})
+
     @app.post("/api/kill-switch", response_class=JSONResponse)
     async def api_global_kill_switch(
         service: RiskDashboardService = Depends(get_service),
@@ -618,6 +766,147 @@ def create_app(
         if path is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
         return FileResponse(path, media_type="text/csv", filename=path.name)
+
+    @app.get("/api/cashflows", response_class=JSONResponse)
+    async def api_list_cashflows(
+        limit: int = 100,
+        history: PortfolioHistoryStore = Depends(get_history_store),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        try:
+            records = await history.list_cashflows_async(limit=limit)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return JSONResponse({"items": records})
+
+    @app.post("/api/cashflows", response_class=JSONResponse)
+    async def api_add_cashflow(
+        request: Request,
+        history: PortfolioHistoryStore = Depends(get_history_store),
+        _: str = Depends(require_user),
+    ) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as exc:  # pragma: no cover - invalid json yields 400
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+        if not isinstance(payload, Mapping):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payload must be an object")
+        try:
+            result = await history.add_cashflow_async(
+                flow_type=str(payload.get("type", "")).strip(),
+                amount=float(payload.get("amount")),
+                currency=str(payload.get("currency", "")).strip() or "USDT",
+                account=str(payload.get("account", "")).strip() or None,
+                note=str(payload.get("note", "")).strip() or None,
+            )
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:  # pragma: no cover - defensive guard
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return JSONResponse(result, status_code=status.HTTP_201_CREATED)
+
+    @app.get("/api/admin/api-keys", response_class=JSONResponse)
+    async def api_list_api_keys(_: str = Depends(require_user)) -> JSONResponse:
+        if config.api_keys_path is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="API key file is not configured")
+        try:
+            payload = load_api_keys(config.api_keys_path)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return JSONResponse({"path": str(config.api_keys_path), "keys": payload})
+
+    @app.post("/api/admin/api-keys", response_class=JSONResponse)
+    async def api_upsert_api_key(request: Request, _: str = Depends(require_user)) -> JSONResponse:
+        if config.api_keys_path is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="API key file is not configured")
+        try:
+            payload = await request.json()
+        except Exception as exc:  # pragma: no cover - invalid json yields 400
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+        if not isinstance(payload, Mapping):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payload must be an object")
+        key_id_raw = payload.get("id")
+        if not key_id_raw:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Key id is required")
+        key_id = str(key_id_raw).strip()
+        entry = payload.get("entry")
+        try:
+            normalized = validate_api_key_entry(entry)
+            existing = load_api_keys(config.api_keys_path)
+            existing[key_id] = normalized
+            save_api_keys(config.api_keys_path, existing)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return JSONResponse({"id": key_id, "entry": normalized}, status_code=status.HTTP_201_CREATED)
+
+    @app.delete("/api/admin/api-keys/{key_id}", response_class=JSONResponse)
+    async def api_delete_api_key(key_id: str, _: str = Depends(require_user)) -> JSONResponse:
+        if config.api_keys_path is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="API key file is not configured")
+        try:
+            existing = load_api_keys(config.api_keys_path)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        if key_id in existing:
+            existing.pop(key_id, None)
+            try:
+                save_api_keys(config.api_keys_path, existing)
+            except Exception as exc:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return JSONResponse({"deleted": key_id})
+
+    @app.get("/api/admin/accounts", response_class=JSONResponse)
+    async def api_list_accounts(_: str = Depends(require_user)) -> JSONResponse:
+        try:
+            payload = _load_config_payload()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        accounts = payload.get("accounts", []) if isinstance(payload, Mapping) else []
+        if not isinstance(accounts, list):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Accounts section must be a list")
+        return JSONResponse({"accounts": accounts})
+
+    @app.post("/api/admin/accounts", response_class=JSONResponse)
+    async def api_upsert_account(request: Request, _: str = Depends(require_user)) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as exc:  # pragma: no cover
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+        if not isinstance(payload, Mapping):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payload must be an object")
+        account_name = str(payload.get("name", "")).strip()
+        if not account_name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Account name is required")
+        try:
+            config_payload = _load_config_payload()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        accounts = config_payload.get("accounts") if isinstance(config_payload, Mapping) else None
+        if not isinstance(accounts, list):
+            accounts = []
+        updated_accounts: list[Mapping[str, Any]] = []
+        for entry in accounts:
+            if isinstance(entry, Mapping) and entry.get("name") == account_name:
+                continue
+            updated_accounts.append(entry)
+        clean_entry = {
+            "name": account_name,
+            "exchange": str(payload.get("exchange", "")).strip() or payload.get("exchange"),
+            "api_key_id": str(payload.get("api_key_id", "")).strip() or None,
+            "settle_currency": str(payload.get("settle_currency", "USDT")).strip() or "USDT",
+            "symbols": payload.get("symbols") or None,
+            "params": payload.get("params") or {},
+            "enabled": payload.get("enabled", True),
+        }
+        updated_accounts.append(clean_entry)
+        config_payload["accounts"] = updated_accounts
+        try:
+            _save_config_payload(config_payload)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return JSONResponse({"account": clean_entry}, status_code=status.HTTP_201_CREATED)
 
     @app.on_event("shutdown")
     async def shutdown() -> None:  # pragma: no cover - FastAPI lifecycle

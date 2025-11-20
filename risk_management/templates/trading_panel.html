@@ -75,6 +75,7 @@
   <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
     <span class="badge">Logged in as {{ user }}</span>
     <a href="/" class="button secondary">Dashboard</a>
+    <a href="/api-keys" class="button secondary">API keys &amp; accounts</a>
     <form method="post" action="/logout">
       <button type="submit">Logout</button>
     </form>
@@ -165,6 +166,61 @@
         </div>
       </form>
     </section>
+
+    <section class="card" id="conditional-stop-card">
+      <h3 style="margin-top: 0;">Conditional stop losses</h3>
+      <p style="color: var(--muted);">Combine rule-based triggers with the hard drawdown threshold.</p>
+      <form id="conditional-form" style="display: flex; flex-direction: column; gap: 1rem;">
+        <div class="form-row">
+          <div class="form-group">
+            <label for="conditional-name">Name</label>
+            <input id="conditional-name" name="name" placeholder="e.g. Equity floor" />
+          </div>
+          <div class="form-group">
+            <label for="conditional-metric">Metric</label>
+            <select id="conditional-metric" name="metric" required>
+              <option value="equity_below">Equity below amount</option>
+              <option value="balance_below">Balance below amount</option>
+              <option value="equity_drawdown_pct">Equity drawdown %</option>
+              <option value="unrealized_loss_pct">Unrealized PnL %</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="conditional-threshold">Threshold</label>
+            <input id="conditional-threshold" name="threshold" type="number" step="any" min="0" required />
+          </div>
+          <div class="form-group">
+            <label for="conditional-operator">Operator</label>
+            <select id="conditional-operator" name="operator">
+              <option value="lte">Less than / equal</option>
+              <option value="gte">Greater than / equal</option>
+            </select>
+          </div>
+        </div>
+        <div style="display: flex; gap: 1rem; align-items: center;">
+          <button type="submit" class="button">Add condition</button>
+          <button type="button" class="button secondary" id="conditional-clear">Clear all</button>
+          <div class="status-message" id="conditional-status" hidden></div>
+        </div>
+      </form>
+      <div class="table-wrapper" style="margin-top: 1rem;">
+        <table id="conditional-table" class="compact">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Metric</th>
+              <th>Threshold</th>
+              <th>Last</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
   </section>
 
   <section class="card" style="margin-top: 1.5rem;" id="positions-card">
@@ -238,6 +294,8 @@
     const stopLossSummary = document.getElementById("stop-loss-summary");
     const stopLossStatus = document.getElementById("stop-loss-status");
     const refreshButton = document.getElementById("refresh-button");
+    const conditionalTableBody = document.querySelector("#conditional-table tbody");
+    const conditionalStatus = document.getElementById("conditional-status");
 
     const formatCurrency = (value) => {
       const number = Number(value);
@@ -383,12 +441,45 @@
       }
     };
 
+    const renderConditionalStops = () => {
+      if (!conditionalTableBody) return;
+      const conditions = Array.isArray(state.snapshot.conditional_stop_losses)
+        ? state.snapshot.conditional_stop_losses
+        : [];
+      const rows = conditions
+        .map((condition) => {
+          const triggered = condition.triggered ? "Triggered" : "Active";
+          const statusClass = condition.triggered ? "loss" : "";
+          const lastValue = condition.last_value !== undefined && condition.last_value !== null
+            ? condition.metric.includes("pct")
+              ? `${Number(condition.last_value).toFixed(2)}%`
+              : formatCurrency(condition.last_value)
+            : "-";
+          const threshold = condition.metric.includes("pct")
+            ? `${Number(condition.threshold || 0).toFixed(2)}%`
+            : formatCurrency(condition.threshold || 0);
+          return `
+            <tr>
+              <td>${condition.name || condition.metric}</td>
+              <td>${condition.metric}</td>
+              <td>${threshold}</td>
+              <td>${lastValue}</td>
+              <td class="${statusClass}">${triggered}</td>
+              <td><button type="button" class="button secondary small" data-remove-condition="${condition.name}">Remove</button></td>
+            </tr>
+          `;
+        })
+        .join("");
+      conditionalTableBody.innerHTML = rows || '<tr><td colspan="6" style="text-align: center; color: var(--muted);">No conditional rules configured.</td></tr>';
+    };
+
     const renderAll = () => {
       renderAccountOptions();
       renderOrderTypes();
       renderPositions();
       renderOrders();
       renderStopLoss();
+      renderConditionalStops();
     };
 
     const parseParams = (raw) => {
@@ -539,6 +630,55 @@
       }
     });
 
+    document.getElementById("conditional-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const payload = {
+        name: form.name.value,
+        metric: form.metric.value,
+        threshold: form.threshold.value,
+        operator: form.operator.value,
+      };
+      showStatus(conditionalStatus, "Saving condition...");
+      try {
+        const response = await fetch("/api/trading/portfolio/conditional-stop-loss", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const errorPayload = await response.json().catch(() => ({}));
+          throw new Error(errorPayload.detail || `Unable to save (${response.status})`);
+        }
+        showStatus(conditionalStatus, "Condition saved.", "success");
+        form.reset();
+        await refreshSnapshot();
+      } catch (error) {
+        console.error(error);
+        showStatus(conditionalStatus, error.message, "error");
+      }
+    });
+
+    document.getElementById("conditional-clear").addEventListener("click", async () => {
+      showStatus(conditionalStatus, "Clearing conditions...");
+      try {
+        const response = await fetch("/api/trading/portfolio/conditional-stop-loss", {
+          method: "DELETE",
+          credentials: "include",
+        });
+        if (!response.ok) {
+          const errorPayload = await response.json().catch(() => ({}));
+          throw new Error(errorPayload.detail || `Unable to clear (${response.status})`);
+        }
+        showStatus(conditionalStatus, "All conditions cleared.", "success");
+        await refreshSnapshot();
+      } catch (error) {
+        console.error(error);
+        showStatus(conditionalStatus, error.message, "error");
+      }
+    });
+
     document.addEventListener("click", async (event) => {
       const cancelButton = event.target.closest("[data-cancel-order]");
       if (cancelButton) {
@@ -588,6 +728,30 @@
         } catch (error) {
           console.error(error);
           showStatus(orderStatus, error.message, "error");
+        }
+        return;
+      }
+      const removeCondition = event.target.closest("[data-remove-condition]");
+      if (removeCondition) {
+        const name = removeCondition.getAttribute("data-remove-condition");
+        showStatus(conditionalStatus, `Removing ${name || "condition"}...`);
+        try {
+          const response = await fetch(
+            `/api/trading/portfolio/conditional-stop-loss?name=${encodeURIComponent(name || "")}`,
+            {
+              method: "DELETE",
+              credentials: "include",
+            }
+          );
+          if (!response.ok) {
+            const errorPayload = await response.json().catch(() => ({}));
+            throw new Error(errorPayload.detail || `Unable to remove (${response.status})`);
+          }
+          showStatus(conditionalStatus, "Condition removed.", "success");
+          await refreshSnapshot();
+        } catch (error) {
+          console.error(error);
+          showStatus(conditionalStatus, error.message, "error");
         }
       }
     });

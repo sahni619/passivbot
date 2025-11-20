@@ -179,6 +179,7 @@ class GrafanaConfig:
     default_height: int = 600
     theme: str = "dark"
     base_url: Optional[str] = None
+    account_equity_template: Optional[str] = None
 
 
 @dataclass()
@@ -196,6 +197,8 @@ class RealtimeConfig:
     debug_api_payloads: bool = False
     reports_dir: Optional[Path] = None
     grafana: Optional[GrafanaConfig] = None
+    api_keys_path: Optional[Path] = None
+    config_path: Optional[Path] = None
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -460,12 +463,19 @@ def _parse_grafana_config(settings: Any) -> Optional[GrafanaConfig]:
 
     base_url_raw = settings.get("base_url")
     base_url = str(base_url_raw).strip() if base_url_raw not in (None, "") else None
+    account_equity_template_raw = settings.get("account_equity_template")
+    account_equity_template = (
+        str(account_equity_template_raw).strip()
+        if account_equity_template_raw not in (None, "")
+        else None
+    )
 
     return GrafanaConfig(
         dashboards=dashboards,
         default_height=default_height,
         theme=theme,
         base_url=base_url,
+        account_equity_template=account_equity_template,
     )
 
 
@@ -596,7 +606,7 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
 
     _configure_default_logging(debug_level=1)
 
-    path = Path(path)
+    path = Path(path).resolve()
 
     config_payload = _load_json(path)
     config = _ensure_mapping(config_payload, description="Realtime configuration")
@@ -686,4 +696,6 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         reports_dir=reports_dir,
         grafana=grafana_settings,
         account_messages=account_messages,
+        api_keys_path=api_keys_path,
+        config_path=path,
     )

@@ -90,6 +90,7 @@
   <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
     <span class="badge">Logged in as {{ user }}</span>
     <a href="/trading-panel" class="button secondary">Trading panel</a>
+    <a href="/api-keys" class="button secondary">API keys &amp; accounts</a>
     <button type="button" class="button danger" data-kill-portfolio>Kill portfolio</button>
     <div class="status-message" data-kill-status="__portfolio__" hidden></div>
     <form method="post" action="/logout">
@@ -117,6 +118,15 @@
       data-page-target="accounts"
     >
       Accounts
+    </button>
+    <button
+      type="button"
+      class="view-nav__button"
+      role="tab"
+      aria-selected="false"
+      data-page-target="cashflows"
+    >
+      Cash flow
     </button>
     <button
       type="button"
@@ -482,6 +492,70 @@
       </div>
     </div>
 
+    <div class="page-section" data-page-section="cashflows" hidden>
+      <section class="card" style="margin-bottom: 1rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+          <div>
+            <h2 style="margin: 0 0 0.25rem;">Cash flow</h2>
+            <p style="color: var(--muted); margin: 0;">Record deposits and withdrawals to keep NAV changes accurate.</p>
+          </div>
+          <div class="status-message" id="cashflow-status" hidden></div>
+        </div>
+      </section>
+
+      <section class="card" style="margin-bottom: 1rem;">
+        <h3 style="margin-top: 0;">Add cash flow</h3>
+        <form id="cashflow-form" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; align-items: flex-end;">
+          <div class="form-group">
+            <label for="cashflow-type">Type</label>
+            <select id="cashflow-type" name="type" required>
+              <option value="deposit">Deposit</option>
+              <option value="withdrawal">Withdrawal</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="cashflow-amount">Amount</label>
+            <input id="cashflow-amount" name="amount" type="number" step="any" min="0" required />
+          </div>
+          <div class="form-group">
+            <label for="cashflow-currency">Currency</label>
+            <input id="cashflow-currency" name="currency" placeholder="USDT" value="USDT" />
+          </div>
+          <div class="form-group">
+            <label for="cashflow-account">Account (optional)</label>
+            <input id="cashflow-account" name="account" placeholder="e.g. Binance" />
+          </div>
+          <div class="form-group">
+            <label for="cashflow-note">Note</label>
+            <input id="cashflow-note" name="note" placeholder="Reference" />
+          </div>
+          <button type="submit" class="button">Save entry</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <h3 style="margin: 0;">Recent cash flows</h3>
+          <span id="cashflow-summary" style="color: var(--muted);"></span>
+        </div>
+        <div class="table-wrapper">
+          <table class="compact" id="cashflow-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Amount</th>
+                <th>Currency</th>
+                <th>Account</th>
+                <th>Note</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
     <div class="page-section" data-page-section="alerts" hidden>
       <section class="card alerts">
         <h2>Alerts</h2>
@@ -545,6 +619,32 @@
               </article>
             {% endfor %}
           </div>
+          {% if grafana_account_dashboards %}
+            <h3 style="margin: 1.5rem 0 0.5rem;">Account equity</h3>
+            <div class="grafana-grid" style="margin-top: 0.75rem;">
+              {% for dashboard in grafana_account_dashboards %}
+                <article class="grafana-panel">
+                  <div class="grafana-panel__meta">
+                    <div>
+                      <h4 style="margin: 0 0 0.25rem;">{{ dashboard.title }}</h4>
+                      {% if dashboard.description %}
+                        <p style="margin: 0; color: var(--muted); font-size: 0.9rem;">{{ dashboard.description }}</p>
+                      {% endif %}
+                    </div>
+                    <a class="button secondary" href="{{ dashboard.url }}" target="_blank" rel="noopener">Open</a>
+                  </div>
+                  <iframe
+                    src="{{ dashboard.url }}"
+                    title="{{ dashboard.title }}"
+                    height="{{ dashboard.height }}"
+                    loading="lazy"
+                    referrerpolicy="no-referrer-when-downgrade"
+                    allowfullscreen
+                  ></iframe>
+                </article>
+              {% endfor %}
+            </div>
+          {% endif %}
         </section>
       </div>
     {% endif %}
@@ -638,6 +738,44 @@
       const size = number / 1024 ** exponent;
       const precision = exponent === 0 ? 0 : 2;
       return `${size.toFixed(precision)} ${units[exponent]}`;
+    };
+
+    const cashflowTableBody = document.querySelector('#cashflow-table tbody');
+    const cashflowSummary = document.getElementById('cashflow-summary');
+    const cashflowStatus = document.getElementById('cashflow-status');
+
+    const renderCashflows = (items) => {
+      if (!cashflowTableBody) return;
+      const rows = (Array.isArray(items) ? items : []).map((item) => {
+        const timestamp = item.timestamp ? new Date(item.timestamp).toLocaleString() : '-';
+        const signed = Number(item.signed_amount || 0);
+        const className = signed >= 0 ? 'gain' : 'loss';
+        return `<tr>
+          <td>${timestamp}</td>
+          <td>${item.type}</td>
+          <td class="${className}">${formatCurrency(item.amount)}</td>
+          <td>${item.currency}</td>
+          <td>${item.account || '-'}</td>
+          <td>${item.note || '-'}</td>
+        </tr>`;
+      });
+      cashflowTableBody.innerHTML = rows.join('') || '<tr><td colspan="6" style="color: var(--muted); text-align: center;">No cash flow records yet.</td></tr>';
+      const depositTotal = (items || []).filter((item) => item.type === 'deposit').reduce((sum, item) => sum + Number(item.amount || 0), 0);
+      const withdrawalTotal = (items || []).filter((item) => item.type === 'withdrawal').reduce((sum, item) => sum + Number(item.amount || 0), 0);
+      if (cashflowSummary) {
+        cashflowSummary.textContent = `Deposits ${formatCurrency(depositTotal)} | Withdrawals ${formatCurrency(withdrawalTotal)}`;
+      }
+    };
+
+    const loadCashflows = async () => {
+      try {
+        const response = await fetch('/api/cashflows?limit=100', { credentials: 'include' });
+        if (!response.ok) return;
+        const payload = await response.json();
+        renderCashflows(payload.items || []);
+      } catch (error) {
+        console.error('Failed to load cashflows', error);
+      }
     };
 
     const renderPortfolio = (snapshot) => {
@@ -1159,9 +1297,37 @@
         }
         const snapshot = await response.json();
         renderSnapshot(snapshot);
+        loadCashflows();
       } catch (error) {
         console.error("Failed to refresh snapshot", error);
       }
+    }
+
+    const cashflowForm = document.getElementById('cashflow-form');
+    if (cashflowForm) {
+      cashflowForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const data = new FormData(cashflowForm);
+        const payload = Object.fromEntries(data.entries());
+        showStatus(cashflowStatus, 'Saving cash flow...');
+        try {
+          const response = await fetch('/api/cashflows', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Failed with status ${response.status}`);
+          }
+          showStatus(cashflowStatus, 'Cash flow saved.', 'success');
+          cashflowForm.reset();
+          loadCashflows();
+        } catch (error) {
+          showStatus(cashflowStatus, error.message, 'error');
+        }
+      });
     }
 
     async function triggerKillSwitch(accountName, button, symbol) {
@@ -1241,6 +1407,7 @@
     });
 
     setInterval(poll, REFRESH_INTERVAL_MS);
+    loadCashflows();
     poll();
   </script>
 {% endblock %}
