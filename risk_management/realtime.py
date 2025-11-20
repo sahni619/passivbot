@@ -139,6 +139,7 @@ class RealtimeDataFetcher:
         self._daily_snapshot_sent_date: Optional[date] = None
         self._portfolio_stop_loss: Optional[Dict[str, Any]] = None
         self._last_portfolio_balance: Optional[float] = None
+        self._conditional_stop_losses: list[Dict[str, Any]] = []
 
     def _extract_email_recipients(self) -> List[str]:
         recipients: List[str] = []
@@ -230,10 +231,17 @@ class RealtimeDataFetcher:
         portfolio_balance = sum(
             float(account.get("balance", 0.0)) for account in accounts_payload
         )
+        unrealized_total = sum(float(account.get("unrealized_pnl", 0.0)) for account in accounts_payload)
+        portfolio_equity = portfolio_balance + unrealized_total
         self._last_portfolio_balance = portfolio_balance
         stop_loss_state = self._update_portfolio_stop_loss_state(portfolio_balance)
         if stop_loss_state:
             snapshot["portfolio_stop_loss"] = stop_loss_state
+        conditional_state = self._evaluate_conditional_stop_losses(
+            portfolio_balance, portfolio_equity, unrealized_total
+        )
+        if conditional_state:
+            snapshot["conditional_stop_losses"] = conditional_state
         self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
         self._dispatch_notifications(snapshot)
         return snapshot
@@ -378,6 +386,84 @@ class RealtimeDataFetcher:
 
     async def clear_portfolio_stop_loss(self) -> None:
         self._portfolio_stop_loss = None
+
+    def _evaluate_conditional_stop_losses(
+        self, portfolio_balance: float, portfolio_equity: float, unrealized: float
+    ) -> list[Dict[str, Any]]:
+        if not self._conditional_stop_losses:
+            return []
+
+        updated: list[Dict[str, Any]] = []
+        for condition in self._conditional_stop_losses:
+            entry = dict(condition)
+            metric = str(entry.get("metric", "")).lower()
+            threshold = entry.get("threshold")
+            operator = str(entry.get("operator", "lte")).lower()
+            value: Optional[float] = None
+            if metric == "balance_below":
+                value = portfolio_balance
+            elif metric == "equity_below":
+                value = portfolio_equity
+            elif metric == "equity_drawdown_pct":
+                baseline = entry.get("baseline") or portfolio_equity
+                entry["baseline"] = baseline
+                if baseline:
+                    value = max(0.0, (baseline - portfolio_equity) / baseline * 100.0)
+            elif metric == "unrealized_loss_pct":
+                value = (unrealized / portfolio_equity * 100.0) if portfolio_equity else None
+
+            entry["last_value"] = value
+            triggered = bool(entry.get("triggered"))
+            if value is not None and threshold is not None:
+                if operator in {"lt", "lte", "below", "<="}:
+                    condition_met = value <= float(threshold)
+                else:
+                    condition_met = value >= float(threshold)
+                if condition_met and not triggered:
+                    entry["triggered"] = True
+                    entry["triggered_at"] = datetime.now(timezone.utc).isoformat()
+            updated.append(entry)
+
+        self._conditional_stop_losses = updated
+        return [dict(item) for item in updated]
+
+    def get_conditional_stop_losses(self) -> list[Dict[str, Any]]:
+        return [dict(item) for item in self._conditional_stop_losses]
+
+    async def add_conditional_stop_loss(
+        self,
+        name: str,
+        metric: str,
+        threshold: float,
+        operator: str = "lte",
+    ) -> Dict[str, Any]:
+        metric_normalized = metric.strip().lower()
+        if metric_normalized not in {"balance_below", "equity_below", "equity_drawdown_pct", "unrealized_loss_pct"}:
+            raise ValueError("metric must be one of balance_below, equity_below, equity_drawdown_pct, unrealized_loss_pct")
+        if threshold is None or float(threshold) <= 0:
+            raise ValueError("threshold must be greater than zero")
+        operator_normalized = operator.strip().lower() if operator else "lte"
+        condition = {
+            "name": name.strip() or metric,
+            "metric": metric_normalized,
+            "threshold": float(threshold),
+            "operator": operator_normalized,
+            "triggered": False,
+            "triggered_at": None,
+        }
+        self._conditional_stop_losses = [
+            entry for entry in self._conditional_stop_losses if entry.get("name") != condition["name"]
+        ]
+        self._conditional_stop_losses.append(condition)
+        return dict(condition)
+
+    async def clear_conditional_stop_losses(self, *, name: Optional[str] = None) -> None:
+        if name is None:
+            self._conditional_stop_losses = []
+            return
+        self._conditional_stop_losses = [
+            entry for entry in self._conditional_stop_losses if entry.get("name") != name
+        ]
 
     def _resolve_account_client(self, account_name: str) -> AccountClientProtocol:
         for client in self._account_clients:

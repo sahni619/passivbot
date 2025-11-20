@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+
+{% block head %}
+  <style>
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1rem;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    textarea {
+      min-height: 160px;
+      resize: vertical;
+      padding: 0.6rem 0.75rem;
+      border-radius: 0.6rem;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.6);
+      color: var(--text);
+    }
+
+    .status-message {
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .status-message.success {
+      color: var(--success);
+    }
+
+    .status-message.error {
+      color: var(--danger);
+    }
+  </style>
+{% endblock %}
+
+{% block header_controls %}
+  <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+    <span class="badge">Logged in as {{ user }}</span>
+    <a href="/" class="button secondary">Dashboard</a>
+    <a href="/trading-panel" class="button secondary">Trading panel</a>
+    <form method="post" action="/logout">
+      <button type="submit">Logout</button>
+    </form>
+  </div>
+{% endblock %}
+
+{% block content %}
+  <section class="card" style="margin-bottom: 1rem;">
+    <h2 style="margin-top: 0;">API keys and account parameters</h2>
+    <p style="color: var(--muted); margin-bottom: 0;">
+      Keys are stored at <code>{{ api_keys_path }}</code>. Account definitions are updated in <code>{{ config_path }}</code>.
+    </p>
+  </section>
+
+  <div class="grid">
+    <section class="card">
+      <h3 style="margin-top: 0;">API keys</h3>
+      <p class="status-message" id="keys-status" hidden></p>
+      <div class="table-wrapper" style="margin-bottom: 1rem; max-height: 220px;">
+        <table class="compact" id="keys-table">
+          <thead>
+            <tr>
+              <th>Id</th>
+              <th>Exchange</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <form id="key-form" style="display: flex; flex-direction: column; gap: 0.75rem;">
+        <div class="form-group">
+          <label for="key-id">Key id</label>
+          <input id="key-id" name="key_id" placeholder="e.g. binance_01" required />
+        </div>
+        <div class="form-group">
+          <label for="key-entry">API key payload (JSON)</label>
+          <textarea id="key-entry" name="entry" placeholder='{"exchange": "binance", "key": "...", "secret": "..."}' required></textarea>
+        </div>
+        <button type="submit" class="button">Save key</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h3 style="margin-top: 0;">Accounts</h3>
+      <p class="status-message" id="accounts-status" hidden></p>
+      <div class="table-wrapper" style="margin-bottom: 1rem; max-height: 220px;">
+        <table class="compact" id="accounts-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Exchange</th>
+              <th>Key id</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <form id="account-form" style="display: flex; flex-direction: column; gap: 0.75rem;">
+        <div class="form-group">
+          <label for="account-name">Name</label>
+          <input id="account-name" name="name" placeholder="e.g. Binance Futures" required />
+        </div>
+        <div class="form-group">
+          <label for="account-exchange">Exchange</label>
+          <input id="account-exchange" name="exchange" placeholder="binanceusdm" required />
+        </div>
+        <div class="form-group">
+          <label for="account-key-id">API key id</label>
+          <input id="account-key-id" name="api_key_id" placeholder="binance_01" />
+        </div>
+        <div class="form-group">
+          <label for="account-settle">Settle currency</label>
+          <input id="account-settle" name="settle_currency" placeholder="USDT" value="USDT" />
+        </div>
+        <div class="form-group">
+          <label for="account-symbols">Symbols (comma separated)</label>
+          <input id="account-symbols" name="symbols" placeholder="BTC/USDT,ETH/USDT" />
+        </div>
+        <div class="form-group">
+          <label for="account-params">Params (JSON)</label>
+          <textarea id="account-params" name="params" placeholder='{"balance": {"type": "swap"}}'></textarea>
+        </div>
+        <div class="form-group" style="flex-direction: row; gap: 0.5rem; align-items: center;">
+          <input type="checkbox" id="account-enabled" name="enabled" checked />
+          <label for="account-enabled">Enabled</label>
+        </div>
+        <button type="submit" class="button">Save account</button>
+      </form>
+    </section>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script>
+    const apiKeysPayload = {{ api_keys | tojson | safe }};
+    const accountsPayload = {{ accounts | tojson | safe }};
+
+    const keysTableBody = document.querySelector('#keys-table tbody');
+    const accountsTableBody = document.querySelector('#accounts-table tbody');
+    const keysStatus = document.getElementById('keys-status');
+    const accountsStatus = document.getElementById('accounts-status');
+
+    const renderKeys = (data) => {
+      if (!keysTableBody) return;
+      const items = Object.entries(data || {})
+        .filter(([key]) => key !== 'referrals')
+        .map(([id, entry]) => {
+          const exchange = entry?.exchange || 'unknown';
+          return `<tr><td>${id}</td><td>${exchange}</td><td><button class="button danger small" data-delete-key="${id}">Delete</button></td></tr>`;
+        })
+        .join('');
+      keysTableBody.innerHTML = items || '<tr><td colspan="3" style="color: var(--muted); text-align: center;">No API keys found.</td></tr>';
+    };
+
+    const renderAccounts = (data) => {
+      if (!accountsTableBody) return;
+      const rows = Array.isArray(data)
+        ? data.map((account) => {
+            const keyId = account.api_key_id || '-';
+            return `<tr><td>${account.name}</td><td>${account.exchange}</td><td>${keyId}</td><td><button class="button secondary small" data-fill-account='${JSON.stringify(account)}'>Edit</button></td></tr>`;
+          })
+        : [];
+      accountsTableBody.innerHTML = rows.join('') || '<tr><td colspan="4" style="color: var(--muted); text-align: center;">No accounts configured.</td></tr>';
+    };
+
+    const showStatus = (element, message, variant = 'info') => {
+      if (!element) return;
+      element.hidden = !message;
+      element.textContent = message || '';
+      element.classList.remove('success', 'error');
+      if (variant === 'success') element.classList.add('success');
+      if (variant === 'error') element.classList.add('error');
+    };
+
+    renderKeys(apiKeysPayload);
+    renderAccounts(accountsPayload);
+
+    document.getElementById('key-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const id = form.key_id.value.trim();
+      let entry;
+      try {
+        entry = JSON.parse(form.entry.value);
+      } catch (error) {
+        showStatus(keysStatus, 'Entry must be valid JSON.', 'error');
+        return;
+      }
+      showStatus(keysStatus, 'Saving key...');
+      try {
+        const response = await fetch('/api/admin/api-keys', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, entry }),
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || `Failed with ${response.status}`);
+        }
+        const updated = await (await fetch('/api/admin/api-keys', { credentials: 'include' })).json();
+        renderKeys(updated.keys);
+        showStatus(keysStatus, 'Key saved.', 'success');
+      } catch (error) {
+        showStatus(keysStatus, error.message, 'error');
+      }
+    });
+
+    document.addEventListener('click', async (event) => {
+      const deleteKey = event.target.closest('[data-delete-key]');
+      if (deleteKey) {
+        const id = deleteKey.getAttribute('data-delete-key');
+        showStatus(keysStatus, `Deleting ${id}...`);
+        try {
+          const response = await fetch(`/api/admin/api-keys/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include' });
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Failed with ${response.status}`);
+          }
+          const updated = await (await fetch('/api/admin/api-keys', { credentials: 'include' })).json();
+          renderKeys(updated.keys);
+          showStatus(keysStatus, 'Key removed.', 'success');
+        } catch (error) {
+          showStatus(keysStatus, error.message, 'error');
+        }
+      }
+
+      const fillButton = event.target.closest('[data-fill-account]');
+      if (fillButton) {
+        try {
+          const data = JSON.parse(fillButton.getAttribute('data-fill-account'));
+          document.getElementById('account-name').value = data.name || '';
+          document.getElementById('account-exchange').value = data.exchange || '';
+          document.getElementById('account-key-id').value = data.api_key_id || '';
+          document.getElementById('account-settle').value = data.settle_currency || 'USDT';
+          document.getElementById('account-symbols').value = Array.isArray(data.symbols) ? data.symbols.join(',') : '';
+          document.getElementById('account-params').value = data.params ? JSON.stringify(data.params, null, 2) : '';
+          document.getElementById('account-enabled').checked = data.enabled !== false;
+        } catch (error) {
+          showStatus(accountsStatus, 'Unable to load account into form.', 'error');
+        }
+      }
+    });
+
+    document.getElementById('account-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const symbolsRaw = form.symbols.value
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+      let params = {};
+      if (form.params.value.trim()) {
+        try {
+          params = JSON.parse(form.params.value);
+        } catch (error) {
+          showStatus(accountsStatus, 'Params must be valid JSON.', 'error');
+          return;
+        }
+      }
+      const payload = {
+        name: form.name.value,
+        exchange: form.exchange.value,
+        api_key_id: form.api_key_id.value,
+        settle_currency: form.settle_currency.value,
+        symbols: symbolsRaw.length ? symbolsRaw : null,
+        params,
+        enabled: form.enabled.checked,
+      };
+      showStatus(accountsStatus, 'Saving account...');
+      try {
+        const response = await fetch('/api/admin/accounts', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || `Failed with ${response.status}`);
+        }
+        const updated = await (await fetch('/api/admin/accounts', { credentials: 'include' })).json();
+        renderAccounts(updated.accounts);
+        showStatus(accountsStatus, 'Account saved.', 'success');
+      } catch (error) {
+        showStatus(accountsStatus, error.message, 'error');
+      }
+    });
+  </script>
+{% endblock %}

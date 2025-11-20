@@ -37,6 +37,9 @@ def build_presentable_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     stop_loss = snapshot.get("portfolio_stop_loss") if isinstance(snapshot, Mapping) else None
     if isinstance(stop_loss, Mapping):
         payload["portfolio_stop_loss"] = dict(stop_loss)
+    conditional = snapshot.get("conditional_stop_losses") if isinstance(snapshot, Mapping) else None
+    if isinstance(conditional, Sequence):
+        payload["conditional_stop_losses"] = list(conditional)
 
     return payload
 
