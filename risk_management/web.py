@@ -908,6 +908,36 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         return JSONResponse({"account": clean_entry}, status_code=status.HTTP_201_CREATED)
 
+    @app.delete("/api/admin/accounts/{account_name}", response_class=JSONResponse)
+    async def api_delete_account(account_name: str, _: str = Depends(require_user)) -> JSONResponse:
+        try:
+            config_payload = _load_config_payload()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+        accounts = config_payload.get("accounts") if isinstance(config_payload, Mapping) else None
+        if not isinstance(accounts, list):
+            accounts = []
+
+        updated_accounts: list[Mapping[str, Any]] = []
+        removed = False
+        for entry in accounts:
+            if isinstance(entry, Mapping) and entry.get("name") == account_name:
+                removed = True
+                continue
+            updated_accounts.append(entry)
+
+        if not removed:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Account '{account_name}' not found")
+
+        config_payload["accounts"] = updated_accounts
+        try:
+            _save_config_payload(config_payload)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+        return JSONResponse({"deleted": account_name})
+
     @app.on_event("shutdown")
     async def shutdown() -> None:  # pragma: no cover - FastAPI lifecycle
         await service.close()
