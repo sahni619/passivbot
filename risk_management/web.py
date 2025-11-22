@@ -414,8 +414,7 @@ def create_app(
             },
         )
 
-    @app.get("/api-keys", response_class=HTMLResponse)
-    async def api_keys_page(request: Request) -> HTMLResponse:
+    async def _render_api_keys_page(request: Request) -> HTMLResponse:
         user = request.session.get("user")
         if not user:
             return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
@@ -443,6 +442,14 @@ def create_app(
                 "grafana_theme": grafana_context.get("theme"),
             },
         )
+
+    @app.get("/api-keys", response_class=HTMLResponse)
+    async def api_keys_page(request: Request) -> HTMLResponse:
+        return await _render_api_keys_page(request)
+
+    @app.get("/account-management", response_class=HTMLResponse)
+    async def account_management_page(request: Request) -> HTMLResponse:
+        return await _render_api_keys_page(request)
 
     @app.get("/api/snapshot", response_class=JSONResponse)
     async def api_snapshot(
