@@ -90,7 +90,7 @@
   <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
     <span class="badge">Logged in as {{ user }}</span>
     <a href="/trading-panel" class="button secondary">Trading panel</a>
-    <a href="/api-keys" class="button secondary">API keys &amp; accounts</a>
+    <a href="/account-management" class="button secondary">API keys &amp; accounts</a>
     <button type="button" class="button danger" data-kill-portfolio>Kill portfolio</button>
     <div class="status-message" data-kill-status="__portfolio__" hidden></div>
     <form method="post" action="/logout">
@@ -100,6 +100,14 @@
 {% endblock %}
 
 {% block content %}
+  <section class="card" style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;">
+    <div>
+      <h2 style="margin: 0 0 0.35rem;">Manage connections</h2>
+      <p style="margin: 0; color: var(--muted);">Add, remove, or edit API keys and account parameters from a dedicated page.</p>
+    </div>
+    <a href="/account-management" class="button">Open API keys &amp; accounts</a>
+  </section>
+
   <nav class="view-nav" role="tablist" aria-label="Dashboard sections">
     <button
       type="button"

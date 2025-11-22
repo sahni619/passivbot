@@ -165,7 +165,8 @@
       const rows = Array.isArray(data)
         ? data.map((account) => {
             const keyId = account.api_key_id || '-';
-            return `<tr><td>${account.name}</td><td>${account.exchange}</td><td>${keyId}</td><td><button class="button secondary small" data-fill-account='${JSON.stringify(account)}'>Edit</button></td></tr>`;
+            const serialized = encodeURIComponent(JSON.stringify(account));
+            return `<tr><td>${account.name}</td><td>${account.exchange}</td><td>${keyId}</td><td style="display: flex; gap: 0.35rem; flex-wrap: wrap;"><button class="button secondary small" data-fill-account="${serialized}">Edit</button><button class="button danger small" data-delete-account="${account.name}">Delete</button></td></tr>`;
           })
         : [];
       accountsTableBody.innerHTML = rows.join('') || '<tr><td colspan="4" style="color: var(--muted); text-align: center;">No accounts configured.</td></tr>';
@@ -236,7 +237,9 @@
       const fillButton = event.target.closest('[data-fill-account]');
       if (fillButton) {
         try {
-          const data = JSON.parse(fillButton.getAttribute('data-fill-account'));
+          const serialized = fillButton.getAttribute('data-fill-account');
+          const decoded = serialized ? decodeURIComponent(serialized) : '{}';
+          const data = JSON.parse(decoded);
           document.getElementById('account-name').value = data.name || '';
           document.getElementById('account-exchange').value = data.exchange || '';
           document.getElementById('account-key-id').value = data.api_key_id || '';
@@ -247,6 +250,32 @@
         } catch (error) {
           showStatus(accountsStatus, 'Unable to load account into form.', 'error');
         }
+      }
+
+      const deleteAccount = event.target.closest('[data-delete-account]');
+      if (deleteAccount) {
+        const accountName = deleteAccount.getAttribute('data-delete-account');
+        if (!accountName) return;
+        showStatus(accountsStatus, `Deleting ${accountName}...`);
+        fetch(`/api/admin/accounts/${encodeURIComponent(accountName)}`, {
+          method: 'DELETE',
+          credentials: 'include',
+        })
+          .then(async (response) => {
+            if (!response.ok) {
+              const error = await response.json().catch(() => ({}));
+              throw new Error(error.detail || `Failed with ${response.status}`);
+            }
+            return fetch('/api/admin/accounts', { credentials: 'include' });
+          })
+          .then((response) => response.json())
+          .then((payload) => {
+            renderAccounts(payload.accounts);
+            showStatus(accountsStatus, 'Account removed.', 'success');
+          })
+          .catch((error) => {
+            showStatus(accountsStatus, error.message, 'error');
+          });
       }
     });
 
@@ -290,6 +319,8 @@
         const updated = await (await fetch('/api/admin/accounts', { credentials: 'include' })).json();
         renderAccounts(updated.accounts);
         showStatus(accountsStatus, 'Account saved.', 'success');
+        form.reset();
+        document.getElementById('account-settle').value = 'USDT';
       } catch (error) {
         showStatus(accountsStatus, error.message, 'error');
       }
