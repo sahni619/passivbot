@@ -9,9 +9,17 @@ import logging
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
-from .audit import get_audit_logger
-from .configuration import CustomEndpointSettings, load_realtime_config
-from .letsencrypt import LetsEncryptError, ensure_certificate
+if __name__ == "__main__" and __package__ in {None, ""}:  # pragma: no cover - script execution guard
+    import sys
+
+    # Ensure the package root is importable when executed as ``python risk_management/web_server.py``.
+    PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+    if str(PACKAGE_ROOT) not in sys.path:
+        sys.path.insert(0, str(PACKAGE_ROOT))
+
+from risk_management.audit import get_audit_logger
+from risk_management.configuration import CustomEndpointSettings, load_realtime_config
+from risk_management.letsencrypt import LetsEncryptError, ensure_certificate
 
 if TYPE_CHECKING:  # pragma: no cover - used only for type hints
     import uvicorn

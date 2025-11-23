@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
 import types
 
@@ -125,3 +126,19 @@ def test_apply_https_only_policy_ignored_when_not_requested(caplog) -> None:
     assert not enforced
     assert config.auth.https_only is False
     assert not caplog.messages
+
+
+def test_web_server_script_can_display_help() -> None:
+    """Ensure the CLI entrypoint works when executed as a script."""
+
+    # Use the repo root so ``risk_management`` is importable without installation.
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, str(repo_root / "risk_management" / "web_server.py"), "--help"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Launch the risk dashboard web UI" in result.stdout
