@@ -173,6 +173,37 @@ def test_api_key_custom_endpoint_preference(tmp_path: Path) -> None:
     assert "use_custom_endpoints" not in account.credentials
 
 
+def test_api_key_id_normalises_numeric_suffixes(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    payload = {
+        "api_keys_file": "../api-keys.json",
+        "accounts": [
+            {
+                "name": "OKX GP New",
+                "api_key_id": "okx_04",
+                "exchange": "okx",
+            }
+        ],
+    }
+    config_path = _write_config(tmp_path, payload)
+
+    api_keys_path = config_path.parent.parent / "api-keys.json"
+    api_keys_path.write_text(
+        json.dumps(
+            {
+                "okx_4": {"exchange": "okx", "key": "key", "secret": "secret", "passphrase": "p"}
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.INFO, logger="risk_management.configuration"):
+        config = load_realtime_config(config_path)
+
+    assert config.accounts[0].credentials["apiKey"] == "key"
+    assert config.accounts[0].credentials["password"] == "p"
+    assert "normalising" in " ".join(caplog.messages)
+
+
 def test_account_use_custom_endpoints_invalid(tmp_path: Path) -> None:
     payload = _base_payload()
     payload["accounts"][0]["use_custom_endpoints"] = "sometimes"
