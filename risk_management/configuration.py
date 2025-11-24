@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import difflib
 import importlib
 import importlib.util
 import json
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -45,6 +47,28 @@ def _debug_to_logging_level(debug_level: int) -> int:
     if debug_level == 1:
         return logging.INFO
     return logging.DEBUG
+
+
+def _normalise_api_key_id(api_key_id: str) -> str:
+    match = re.match(r"^(.*?)(\d+)$", api_key_id)
+    if match is None:
+        return api_key_id
+    prefix, suffix = match.groups()
+    return f"{prefix}{int(suffix)}"
+
+
+def _suggest_api_key_id(api_key_id: str, available_ids: Iterable[str]) -> Optional[str]:
+    """Suggest a likely api_key_id given a missing identifier."""
+
+    normalised_missing = _normalise_api_key_id(api_key_id)
+    normalised_map = {
+        _normalise_api_key_id(candidate): candidate for candidate in available_ids
+    }
+    if normalised_missing in normalised_map:
+        return normalised_map[normalised_missing]
+
+    closest = difflib.get_close_matches(api_key_id, list(available_ids), n=1, cutoff=0.65)
+    return closest[0] if closest else None
 
 
 def _resolve_passivbot_logging_configurator() -> Optional[Callable[..., Any]]:
@@ -911,6 +935,7 @@ def _parse_accounts(
     debug_api_payloads_default: bool = False,
     *,
     liquidity_defaults: Optional[LiquiditySettings] = None,
+    api_keys_source: Optional[str] = None,
 ) -> List[AccountConfig]:
     accounts: List[AccountConfig] = []
     debug_requested = False
@@ -932,8 +957,18 @@ def _parse_accounts(
                     f"Account '{raw.get('name')}' references api_key_id '{api_key_id}' but no api key file was provided"
                 )
             if api_key_id not in api_keys:
+                available_ids = ", ".join(sorted(api_keys)) if api_keys else "none"
+                available_message = ""
+                if api_keys_source:
+                    available_message = f" Available api_key_id values in {api_keys_source}: {available_ids}."
+                elif available_ids != "none":
+                    available_message = f" Available api_key_id values: {available_ids}."
+                suggestion = _suggest_api_key_id(api_key_id, api_keys)
+                suggestion_message = f" Did you mean '{suggestion}'?" if suggestion else ""
                 raise ValueError(
-                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'"
+                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
+                    + available_message
+                    + suggestion_message
                 )
             key_payload = api_keys[api_key_id]
             if not exchange:
@@ -1315,6 +1350,7 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         api_keys,
         debug_api_payloads_default,
         liquidity_defaults=liquidity_defaults,
+        api_keys_source=str(api_keys_path) if api_keys_path else None,
     )
     alert_thresholds = {
         str(k): float(v) for k, v in config.get("alert_thresholds", {}).items()
