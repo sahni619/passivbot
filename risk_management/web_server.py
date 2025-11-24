@@ -310,7 +310,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     ssl_enabled = bool(ssl_certfile and ssl_keyfile)
     _apply_https_only_policy(config, ssl_enabled=ssl_enabled)
 
-    app = create_app(config, letsencrypt_challenge_dir=args.letsencrypt_webroot)
+    app = create_app(
+        config,
+        config_path=Path(args.config),
+        letsencrypt_challenge_dir=args.letsencrypt_webroot,
+    )
 
     try:
         uvicorn = _import_uvicorn()

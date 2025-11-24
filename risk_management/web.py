@@ -9,7 +9,7 @@ import json
 import logging
 from collections.abc import Iterable as IterableABC
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import (
     FileResponse,
@@ -26,7 +26,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from urllib.parse import quote, urlencode, urljoin
 
 from .audit import AuditLogWriter, AuditSettings, get_audit_logger, read_audit_entries
-from .configuration import RealtimeConfig
+from .configuration import RealtimeConfig, load_realtime_config
 from .domain.models import Scenario
 from .services.risk_service import RiskService, RiskServiceProtocol
 from .reporting import ReportManager
@@ -82,6 +82,154 @@ class RiskDashboardService:
 
     async def close(self) -> None:
         await self._service.close()
+
+
+class AutoReloadingRiskDashboardService(RiskDashboardService):
+    """Wrap :class:`RiskDashboardService` to reload config changes on the fly.
+
+    The reload logic is intentionally lightweight: it monitors the realtime
+    configuration file's modification time and, when it detects a change,
+    rebuilds the underlying :class:`RiskDashboardService` with the updated
+    configuration. This keeps the dashboard and trading controls aligned with
+    newly added accounts without requiring a process restart.
+    """
+
+    def __init__(
+        self,
+        service: RiskDashboardService,
+        *,
+        config_path: Optional[Path],
+    ) -> None:
+        super().__init__(service._service)
+        self._config_path = config_path.resolve() if config_path else None
+        self._config_mtime = self._get_config_mtime()
+        self._reload_hooks: list[Callable[[RealtimeConfig], None]] = []
+
+    def _get_config_mtime(self) -> Optional[float]:
+        if not self._config_path:
+            return None
+        try:
+            return self._config_path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+
+    def add_reload_hook(self, hook: Callable[[RealtimeConfig], None]) -> None:
+        """Register a callback invoked after a successful config reload."""
+
+        self._reload_hooks.append(hook)
+
+    async def _reload_if_changed(self) -> None:
+        if not self._config_path:
+            return
+        current_mtime = self._get_config_mtime()
+        if current_mtime is None or (
+            self._config_mtime is not None and current_mtime <= self._config_mtime
+        ):
+            return
+
+        try:
+            new_config = load_realtime_config(self._config_path)
+            new_service = RiskDashboardService(RiskService.from_config(new_config))
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning("Failed to reload realtime config from %s: %s", self._config_path, exc)
+            return
+
+        try:
+            await self._service.close()
+        except Exception:  # pragma: no cover - defensive guard
+            logger.debug("Failed to close previous realtime service during reload", exc_info=True)
+
+        self._service = new_service._service
+        self._config_mtime = current_mtime
+        for hook in list(self._reload_hooks):
+            try:
+                hook(new_config)
+            except Exception:  # pragma: no cover - defensive guard
+                logger.debug("Reload hook failed", exc_info=True)
+
+    async def fetch_snapshot(self) -> Dict[str, Any]:
+        await self._reload_if_changed()
+        return await super().fetch_snapshot()
+
+    async def trigger_kill_switch(
+        self, account_name: Optional[str] = None, symbol: Optional[str] = None
+    ) -> Dict[str, Any]:
+        await self._reload_if_changed()
+        return await super().trigger_kill_switch(account_name, symbol)
+
+    async def place_order(
+        self,
+        account_name: str,
+        *,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        await self._reload_if_changed()
+        return await super().place_order(
+            account_name,
+            symbol=symbol,
+            order_type=order_type,
+            side=side,
+            amount=amount,
+            price=price,
+            params=params,
+        )
+
+    async def cancel_order(
+        self,
+        account_name: str,
+        order_id: str,
+        *,
+        symbol: Optional[str] = None,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        await self._reload_if_changed()
+        return await super().cancel_order(
+            account_name,
+            order_id,
+            symbol=symbol,
+            params=params,
+        )
+
+    async def close_position(self, account_name: str, symbol: str) -> Mapping[str, Any]:
+        await self._reload_if_changed()
+        return await super().close_position(account_name, symbol)
+
+    async def list_order_types(self, account_name: str) -> Sequence[str]:
+        await self._reload_if_changed()
+        return await super().list_order_types(account_name)
+
+    async def set_portfolio_stop_loss(self, threshold_pct: float) -> Dict[str, Any]:
+        await self._reload_if_changed()
+        return await super().set_portfolio_stop_loss(threshold_pct)
+
+    async def clear_portfolio_stop_loss(self) -> None:
+        await self._reload_if_changed()
+        await super().clear_portfolio_stop_loss()
+
+    async def set_account_stop_loss(self, account_name: str, threshold_pct: float) -> Dict[str, Any]:
+        await self._reload_if_changed()
+        return await super().set_account_stop_loss(account_name, threshold_pct)
+
+    async def clear_account_stop_loss(self, account_name: str) -> None:
+        await self._reload_if_changed()
+        await super().clear_account_stop_loss(account_name)
+
+    async def cancel_all_orders(
+        self, account_name: str, symbol: Optional[str] = None
+    ) -> Mapping[str, Any]:
+        await self._reload_if_changed()
+        return await super().cancel_all_orders(account_name, symbol)
+
+    async def close_all_positions(
+        self, account_name: str, symbol: Optional[str] = None
+    ) -> Mapping[str, Any]:
+        await self._reload_if_changed()
+        return await super().close_all_positions(account_name, symbol)
 
     async def trigger_kill_switch(
         self, account_name: Optional[str] = None, symbol: Optional[str] = None
@@ -274,6 +422,7 @@ def _build_kill_switch_response(results: Any) -> Dict[str, Any]:
 def create_app(
     config: RealtimeConfig,
     *,
+    config_path: Optional[Path] = None,
     service: Optional[RiskDashboardService] = None,
     auth_manager: Optional[AuthManager] = None,
     templates_dir: Optional[Path] = None,
@@ -281,7 +430,13 @@ def create_app(
     performance_repository: Optional[PerformanceRepository] = None,
 ) -> FastAPI:
     if service is None:
-        service = RiskDashboardService(RiskService.from_config(config))
+        base_service = RiskDashboardService(RiskService.from_config(config))
+        if config_path:
+            service = AutoReloadingRiskDashboardService(
+                base_service, config_path=config_path
+            )
+        else:
+            service = base_service
     if config.auth is None and auth_manager is None:
         raise ValueError("Realtime configuration must include authentication details for the web dashboard.")
     if auth_manager is None and config.auth is not None:
@@ -355,11 +510,8 @@ def create_app(
             limit_value = default_limit
         return action_filter, actor_filter, limit_value
 
-    app.state.scenarios = list(config.scenarios)
-
-
-    def resolve_grafana_context() -> dict[str, Any]:
-        grafana_cfg = config.grafana
+    def _build_grafana_context(conf: RealtimeConfig) -> dict[str, Any]:
+        grafana_cfg = conf.grafana
         if grafana_cfg is None:
             return {"dashboards": [], "theme": None}
 
@@ -383,7 +535,14 @@ def create_app(
 
         return {"dashboards": dashboards, "theme": grafana_cfg.theme}
 
-    app.state.grafana_context = resolve_grafana_context()
+    def _apply_config_state(conf: RealtimeConfig) -> None:
+        app.state.scenarios = list(conf.scenarios)
+        app.state.grafana_context = _build_grafana_context(conf)
+        app.state.audit_settings = conf.audit
+
+    _apply_config_state(config)
+    if isinstance(service, AutoReloadingRiskDashboardService):
+        service.add_reload_hook(_apply_config_state)
 
     templates_path = templates_dir or Path(__file__).with_name("templates")
     templates = Jinja2Templates(directory=str(templates_path))
