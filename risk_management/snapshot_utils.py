@@ -251,7 +251,6 @@ def _build_account_views(
         )
         if view["message"]:
             hidden_accounts.append({"name": view["name"], "message": view["message"]})
-            continue
         visible_accounts.append(view)
 
     return {"visible": visible_accounts, "hidden": hidden_accounts}
