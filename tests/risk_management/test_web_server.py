@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
 import types
 
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -125,3 +128,52 @@ def test_apply_https_only_policy_ignored_when_not_requested(caplog) -> None:
     assert not enforced
     assert config.auth.https_only is False
     assert not caplog.messages
+
+
+def test_web_server_script_can_display_help() -> None:
+    """Ensure the CLI entrypoint works when executed as a script."""
+
+    # Use the repo root so ``risk_management`` is importable without installation.
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, str(repo_root / "risk_management" / "web_server.py"), "--help"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Launch the risk dashboard web UI" in result.stdout
+
+
+def test_main_reports_missing_web_dependencies(monkeypatch, capsys) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    config_path = repo_root / "risk_management" / "realtime_config.json"
+
+    import risk_management.web_server as web_server
+
+    original_import = importlib.import_module
+
+    def fake_import_module(name):
+        if name == "risk_management.web":
+            raise ModuleNotFoundError("fastapi")
+        return original_import(name)
+
+    monkeypatch.setattr(web_server.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(SystemExit) as excinfo:
+        web_server.main(
+            [
+                "--config",
+                str(config_path),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+            ]
+        )
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "fastapi" in captured.err
+    assert "requirements.txt" in captured.err
