@@ -963,12 +963,18 @@ def _parse_accounts(
                     available_message = f" Available api_key_id values in {api_keys_source}: {available_ids}."
                 elif available_ids != "none":
                     available_message = f" Available api_key_id values: {available_ids}."
+
                 suggestion = _suggest_api_key_id(api_key_id, api_keys)
                 suggestion_message = f" Did you mean '{suggestion}'?" if suggestion else ""
                 raise ValueError(
                     f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
                     + available_message
                     + suggestion_message
+
+                raise ValueError(
+                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
+                    + available_message
+
                 )
             key_payload = api_keys[api_key_id]
             if not exchange:
