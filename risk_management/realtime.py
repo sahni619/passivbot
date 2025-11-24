@@ -424,14 +424,15 @@ class RealtimeDataFetcher:
     def _dispatch_notifications(
         self,
         snapshot: Mapping[str, Any],
-        portfolio_balance: float,
-        policy_result: Optional["PolicyEvaluationResult"],
+        portfolio_balance: Optional[float] = None,
+        policy_result: Optional["PolicyEvaluationResult"] = None,
     ) -> None:
         """Send relevant notifications for the snapshot.
 
-        This helper avoids repeated attribute lookups and ensures the dispatcher
-        always exists, preventing ``AttributeError`` when invoked by other
-        components.
+        Historically this method was invoked with only the snapshot payload.
+        To remain backward compatible while avoiding ``TypeError`` during web
+        requests, the optional parameters fall back to safe defaults when not
+        provided.
         """
 
         # Short-circuit if nothing is configured, allowing callers to invoke
@@ -439,7 +440,23 @@ class RealtimeDataFetcher:
         if not self.config.notification_channels and policy_result is None:
             return
 
-        self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
+        resolved_balance = portfolio_balance
+        if resolved_balance is None:
+            try:
+                accounts = snapshot.get("accounts") if isinstance(snapshot, Mapping) else None
+                if isinstance(accounts, Iterable):
+                    resolved_balance = sum(
+                        float(account.get("balance", 0.0))
+                        for account in accounts
+                        if isinstance(account, Mapping)
+                    )
+            except Exception:  # pragma: no cover - defensive fallback
+                resolved_balance = None
+
+        if resolved_balance is None:
+            resolved_balance = self._last_portfolio_balance or 0.0
+
+        self._maybe_send_daily_balance_snapshot(snapshot, resolved_balance)
         self._notifications.dispatch_alerts(snapshot)
         if policy_result is not None:
             self._notifications.handle_policy_evaluations(policy_result)
