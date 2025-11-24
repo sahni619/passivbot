@@ -408,11 +408,21 @@ class RealtimeDataFetcher:
             payload = policy_result.to_payload()
             if payload["evaluations"]:
                 snapshot["policies"] = payload
-        self._notifications.send_daily_snapshot(snapshot, portfolio_balance)
+        self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
         self._notifications.dispatch_alerts(snapshot)
         if policy_result is not None:
             self._notifications.handle_policy_evaluations(policy_result)
         return snapshot
+
+    def _maybe_send_daily_balance_snapshot(
+        self, snapshot: Mapping[str, Any], portfolio_balance: float
+    ) -> None:
+        try:
+            self._notifications.send_daily_snapshot(snapshot, portfolio_balance)
+        except Exception as exc:  # pragma: no cover - notification failures should not crash
+            logger.debug(
+                "Skipping daily balance snapshot notification due to error: %s", exc, exc_info=True
+            )
 
     async def close(self) -> None:
         await asyncio.gather(*(client.close() for client in self._account_clients))
