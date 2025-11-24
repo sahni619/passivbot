@@ -25,17 +25,33 @@ if TYPE_CHECKING:  # pragma: no cover - used only for type hints
     import uvicorn
 
 
+def _format_missing_dependency_message(package: str) -> str:
+    return (
+        f"The '{package}' package is required to run the risk management web server. "
+        "Install dependencies from requirements.txt (for example, 'pip install -r requirements.txt') "
+        "or install passivbot with the optional dashboard extras."
+    )
+
+
 def _import_uvicorn() -> "uvicorn":
     """Import :mod:`uvicorn` with a helpful error message when missing."""
 
     try:
         import uvicorn  # type: ignore[import]
     except ModuleNotFoundError as exc:  # pragma: no cover - depends on runtime environment
-        raise ModuleNotFoundError(
-            "The 'uvicorn' package is required to run the risk management web server. "
-            "Install passivbot with the 'dashboard' extras or add uvicorn to your environment."
-        ) from exc
+        raise ModuleNotFoundError(_format_missing_dependency_message("uvicorn")) from exc
     return uvicorn
+
+
+def _import_create_app():
+    """Import :func:`risk_management.web.create_app` with a friendly dependency error."""
+
+    try:
+        web = importlib.import_module("risk_management.web")
+    except ModuleNotFoundError as exc:  # pragma: no cover - depends on runtime environment
+        missing = exc.name or "fastapi"
+        raise ModuleNotFoundError(_format_missing_dependency_message(missing)) from exc
+    return web.create_app
 
 
 _INVALID_HTTP_REQUEST_FILTER_NAME = "suppress_invalid_http_request"
@@ -242,7 +258,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "Failed to emit web server audit entry: %s", exc
             )
     log_config, log_level = _determine_uvicorn_logging(config)
-    from .web import create_app  # imported lazily to avoid heavy dependencies at import time
+    try:
+        create_app = _import_create_app()
+    except ModuleNotFoundError as exc:  # pragma: no cover - depends on runtime environment
+        parser.error(str(exc))
     override = args.custom_endpoints
     if override is not None:
         override_normalized = override.strip()
@@ -293,7 +312,10 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     app = create_app(config, letsencrypt_challenge_dir=args.letsencrypt_webroot)
 
-    uvicorn = _import_uvicorn()
+    try:
+        uvicorn = _import_uvicorn()
+    except ModuleNotFoundError as exc:  # pragma: no cover - depends on runtime environment
+        parser.error(str(exc))
 
     uvicorn.run(
         app,

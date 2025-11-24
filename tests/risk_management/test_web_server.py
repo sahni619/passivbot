@@ -9,6 +9,8 @@ import types
 
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -142,3 +144,36 @@ def test_web_server_script_can_display_help() -> None:
 
     assert result.returncode == 0
     assert "Launch the risk dashboard web UI" in result.stdout
+
+
+def test_main_reports_missing_web_dependencies(monkeypatch, capsys) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    config_path = repo_root / "risk_management" / "realtime_config.json"
+
+    import risk_management.web_server as web_server
+
+    original_import = importlib.import_module
+
+    def fake_import_module(name):
+        if name == "risk_management.web":
+            raise ModuleNotFoundError("fastapi")
+        return original_import(name)
+
+    monkeypatch.setattr(web_server.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(SystemExit) as excinfo:
+        web_server.main(
+            [
+                "--config",
+                str(config_path),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+            ]
+        )
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "fastapi" in captured.err
+    assert "requirements.txt" in captured.err
