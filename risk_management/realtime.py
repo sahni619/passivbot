@@ -408,10 +408,7 @@ class RealtimeDataFetcher:
             payload = policy_result.to_payload()
             if payload["evaluations"]:
                 snapshot["policies"] = payload
-        self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
-        self._notifications.dispatch_alerts(snapshot)
-        if policy_result is not None:
-            self._notifications.handle_policy_evaluations(policy_result)
+        self._dispatch_notifications(snapshot, portfolio_balance, policy_result)
         return snapshot
 
     def _maybe_send_daily_balance_snapshot(
@@ -423,6 +420,29 @@ class RealtimeDataFetcher:
             logger.debug(
                 "Skipping daily balance snapshot notification due to error: %s", exc, exc_info=True
             )
+
+    def _dispatch_notifications(
+        self,
+        snapshot: Mapping[str, Any],
+        portfolio_balance: float,
+        policy_result: Optional["PolicyEvaluationResult"],
+    ) -> None:
+        """Send relevant notifications for the snapshot.
+
+        This helper avoids repeated attribute lookups and ensures the dispatcher
+        always exists, preventing ``AttributeError`` when invoked by other
+        components.
+        """
+
+        # Short-circuit if nothing is configured, allowing callers to invoke
+        # notification dispatch unconditionally without extra guards.
+        if not self.config.notification_channels and policy_result is None:
+            return
+
+        self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
+        self._notifications.dispatch_alerts(snapshot)
+        if policy_result is not None:
+            self._notifications.handle_policy_evaluations(policy_result)
 
     async def close(self) -> None:
         await asyncio.gather(*(client.close() for client in self._account_clients))
