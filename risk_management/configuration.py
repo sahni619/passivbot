@@ -911,6 +911,7 @@ def _parse_accounts(
     debug_api_payloads_default: bool = False,
     *,
     liquidity_defaults: Optional[LiquiditySettings] = None,
+    api_keys_source: Optional[str] = None,
 ) -> List[AccountConfig]:
     accounts: List[AccountConfig] = []
     debug_requested = False
@@ -932,8 +933,15 @@ def _parse_accounts(
                     f"Account '{raw.get('name')}' references api_key_id '{api_key_id}' but no api key file was provided"
                 )
             if api_key_id not in api_keys:
+                available_ids = ", ".join(sorted(api_keys)) if api_keys else "none"
+                available_message = ""
+                if api_keys_source:
+                    available_message = f" Available api_key_id values in {api_keys_source}: {available_ids}."
+                elif available_ids != "none":
+                    available_message = f" Available api_key_id values: {available_ids}."
                 raise ValueError(
-                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'"
+                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
+                    + available_message
                 )
             key_payload = api_keys[api_key_id]
             if not exchange:
@@ -1315,6 +1323,7 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         api_keys,
         debug_api_payloads_default,
         liquidity_defaults=liquidity_defaults,
+        api_keys_source=str(api_keys_path) if api_keys_path else None,
     )
     alert_thresholds = {
         str(k): float(v) for k, v in config.get("alert_thresholds", {}).items()
