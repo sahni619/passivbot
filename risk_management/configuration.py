@@ -970,11 +970,6 @@ def _parse_accounts(
                     f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
                     + available_message
                     + suggestion_message
-
-                raise ValueError(
-                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
-                    + available_message
-
                 )
             key_payload = api_keys[api_key_id]
             if not exchange:
