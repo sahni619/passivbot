@@ -6,8 +6,8 @@ import numpy as np
 
 sys.modules.setdefault("passivbot_rust", types.SimpleNamespace())
 
-from backtest import ensure_valid_index_metadata
-from downloader import compute_per_coin_warmup_minutes
+from backtest import ensure_valid_index_metadata  # noqa: E402
+from downloader import compute_per_coin_warmup_minutes  # noqa: E402
 
 
 def test_ensure_valid_index_metadata_infers_ranges_for_each_coin():

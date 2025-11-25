@@ -11,8 +11,8 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from risk_management.account_clients import CCXTAccountClient, BaseError
-from risk_management.configuration import LiquiditySettings
+from risk_management.account_clients import CCXTAccountClient, BaseError  # noqa: E402
+from risk_management.configuration import LiquiditySettings  # noqa: E402
 
 
 class StubExchange:

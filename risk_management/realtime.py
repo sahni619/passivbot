@@ -37,7 +37,7 @@ from .configuration import AccountConfig, CustomEndpointSettings, RealtimeConfig
 
 from .audit import get_audit_logger
 from .performance import PerformanceTracker
-from .policies import PolicyEvaluator
+from .policies import PolicyEvaluationResult, PolicyEvaluator
 from .risk_engine import (
     ActionExecutor,
     ExchangeClientAdapter,
@@ -202,8 +202,10 @@ class RealtimeDataFetcher:
         self._ensure_portfolio_aggregator()
         self._ensure_risk_rules_engine()
 
+
     async def fetch_snapshot(self) -> Dict[str, Any]:
         self._ensure_portfolio_aggregator()
+
 
         tasks = [client.fetch() for client in self._account_clients]
         results = await asyncio.gather(*tasks, return_exceptions=True)
