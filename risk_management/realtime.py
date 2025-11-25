@@ -188,6 +188,7 @@ class RealtimeDataFetcher:
             )
             self._portfolio_aggregator = PortfolioAggregator()
 
+
     def _ensure_risk_rules_engine(self) -> None:
         """Instantiate a risk rules engine if the attribute is missing."""
 
@@ -200,6 +201,10 @@ class RealtimeDataFetcher:
     async def fetch_snapshot(self) -> Dict[str, Any]:
         self._ensure_portfolio_aggregator()
         self._ensure_risk_rules_engine()
+
+    async def fetch_snapshot(self) -> Dict[str, Any]:
+        self._ensure_portfolio_aggregator()
+
         tasks = [client.fetch() for client in self._account_clients]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         accounts_payload: List[Dict[str, Any]] = []
