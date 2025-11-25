@@ -38,6 +38,14 @@ from .configuration import AccountConfig, CustomEndpointSettings, RealtimeConfig
 from .audit import get_audit_logger
 from .performance import PerformanceTracker
 from .policies import PolicyEvaluator
+from .risk_engine import (
+    ActionExecutor,
+    ExchangeClientAdapter,
+    FileStateStore,
+    PortfolioAggregator,
+    RiskEngineConfig,
+    RiskRulesEngine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +166,18 @@ class RealtimeDataFetcher:
             base_root = Path(__file__).resolve().parent
             reports_dir = base_root / "reports"
         self._performance_tracker = PerformanceTracker(Path(reports_dir))
+        self._risk_config = RiskEngineConfig.from_realtime_config(config)
+        state_path = self._risk_config.state_path or Path(reports_dir) / "risk_state.json"
+        self._state_store = FileStateStore(state_path)
+        self._portfolio_aggregator = PortfolioAggregator()
+        self._risk_rules_engine = RiskRulesEngine(self._risk_config)
+        self._exchange_clients = [ExchangeClientAdapter(client) for client in self._account_clients]
+        self._action_executor = ActionExecutor(
+            self._risk_config,
+            state_store=self._state_store,
+            notification_coordinator=self._notifications,
+            account_clients=self._exchange_clients,
+        )
 
     async def fetch_snapshot(self) -> Dict[str, Any]:
         tasks = [client.fetch() for client in self._account_clients]
@@ -402,12 +422,17 @@ class RealtimeDataFetcher:
         )
         if performance_summary:
             snapshot["performance"] = performance_summary
+        portfolio_view = self._portfolio_aggregator.aggregate(accounts_payload, cashflow_events)
+        snapshot["risk_portfolio"] = portfolio_view.to_payload()
+        risk_decision = self._risk_rules_engine.evaluate(portfolio_view, self._state_store)
+        snapshot["risk_decision"] = risk_decision.to_payload()
         policy_result = None
         if self._policy_evaluator is not None:
             policy_result = self._policy_evaluator.evaluate(snapshot)
             payload = policy_result.to_payload()
             if payload["evaluations"]:
                 snapshot["policies"] = payload
+        await self._action_executor.execute(risk_decision, portfolio_view)
         self._dispatch_notifications(snapshot, portfolio_balance, policy_result)
         return snapshot
 

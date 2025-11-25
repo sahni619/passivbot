@@ -1,0 +1,37 @@
+name: Risk CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Ruff (risk code and tests)
+        run: ruff check risk_management tests
+
+      - name: Black (check)
+        run: black --check risk_management tests
+
+      - name: Mypy (risk modules)
+        run: mypy risk_management
+
+      - name: Pytest with coverage
+        run: |
+          coverage run -m pytest
+          coverage report --include 'risk_management/*' --fail-under=90

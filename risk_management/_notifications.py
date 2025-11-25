@@ -90,6 +90,32 @@ class NotificationCoordinator:
                 targets.append((token, chat_id))
         return targets
 
+    def send_risk_signal(self, *, subject: str, body: str, severity: str = "info") -> None:
+        """Send a simple risk notification via configured channels.
+
+        The method intentionally avoids complex template rendering so it can be
+        exercised by the refactored risk engine without coupling to dashboard
+        parsing. Failures are logged but do not bubble.
+        """
+
+        if self._email_sender and self._email_recipients:
+            try:
+                self._email_sender.send(subject=subject, body=body, recipients=self._email_recipients)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to send risk email: %s", exc)
+
+        if self._telegram_notifier and self._telegram_targets:
+            for token, chat_id in self._telegram_targets:
+                try:
+                    self._telegram_notifier.send_message(token, chat_id, f"[{severity.upper()}] {body}")
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("Failed to send risk telegram message: %s", exc)
+
+        self._emit_audit(
+            action="risk_signal",
+            details={"subject": subject, "severity": severity},
+        )
+
     def send_daily_snapshot(self, snapshot: Mapping[str, Any], portfolio_balance: float) -> None:
         if not self._email_sender or not self._email_recipients:
             return
