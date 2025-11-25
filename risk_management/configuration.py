@@ -957,20 +957,33 @@ def _parse_accounts(
                     f"Account '{raw.get('name')}' references api_key_id '{api_key_id}' but no api key file was provided"
                 )
             if api_key_id not in api_keys:
-                available_ids = ", ".join(sorted(api_keys)) if api_keys else "none"
-                available_message = ""
-                if api_keys_source:
-                    available_message = f" Available api_key_id values in {api_keys_source}: {available_ids}."
-                elif available_ids != "none":
-                    available_message = f" Available api_key_id values: {available_ids}."
+                normalised_map = {
+                    _normalise_api_key_id(candidate): candidate for candidate in api_keys
+                }
+                normalised_match = normalised_map.get(_normalise_api_key_id(api_key_id))
+                if normalised_match:
+                    api_key_id = normalised_match
+                    logger.info(
+                        "Account '%s' matched api_key_id '%s' after normalising '%s'",
+                        raw.get("name"),
+                        api_key_id,
+                        raw.get("api_key_id"),
+                    )
+                else:
+                    available_ids = ", ".join(sorted(api_keys)) if api_keys else "none"
+                    available_message = ""
+                    if api_keys_source:
+                        available_message = f" Available api_key_id values in {api_keys_source}: {available_ids}."
+                    elif available_ids != "none":
+                        available_message = f" Available api_key_id values: {available_ids}."
 
-                suggestion = _suggest_api_key_id(api_key_id, api_keys)
-                suggestion_message = f" Did you mean '{suggestion}'?" if suggestion else ""
-                raise ValueError(
-                    f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
-                    + available_message
-                    + suggestion_message
-                )
+                    suggestion = _suggest_api_key_id(api_key_id, api_keys)
+                    suggestion_message = f" Did you mean '{suggestion}'?" if suggestion else ""
+                    raise ValueError(
+                        f"Account '{raw.get('name')}' references unknown api_key_id '{api_key_id}'."
+                        + available_message
+                        + suggestion_message
+                    )
             key_payload = api_keys[api_key_id]
             if not exchange:
                 exchange = key_payload.get("exchange")
