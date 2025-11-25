@@ -7,11 +7,9 @@ import asyncio
 import inspect
 import json
 import logging
-import math
-import statistics
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from datetime import timedelta
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency in some envs
     import ccxt.async_support as ccxt_async

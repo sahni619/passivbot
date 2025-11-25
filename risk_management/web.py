@@ -44,6 +44,9 @@ from .snapshot_utils import (
 from .stress import scenario_results_to_dict, simulate_scenarios
 
 
+logger = logging.getLogger(__name__)
+
+
 class AuthManager:
     """Handle authentication for the dashboard."""
 

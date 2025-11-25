@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, MutableMapping, Tuple
+from typing import Mapping, MutableMapping, Tuple
 
 
 @dataclass

@@ -8,7 +8,10 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from risk_management.liquidity import calculate_position_liquidity, normalise_order_book
+from risk_management.liquidity import (  # noqa: E402
+    calculate_position_liquidity,
+    normalise_order_book,
+)
 
 
 def test_normalise_order_book_trims_levels():

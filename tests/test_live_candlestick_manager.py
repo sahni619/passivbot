@@ -1,4 +1,3 @@
-import asyncio
 import os
 import time
 
@@ -270,7 +269,6 @@ async def test_latest_ema_metrics_per_exchange(tmp_path, ex_id, span, tf):
         vols = np.asarray(arr["bv"], dtype=np.float64)
         highs = np.asarray(arr["h"], dtype=np.float64)
         lows = np.asarray(arr["l"], dtype=np.float64)
-        denom = np.maximum(closes, 1e-12)
         log_ranges = np.log(np.maximum(highs, 1e-12) / np.maximum(lows, 1e-12))
 
         exp_close = _ema(closes, span)
