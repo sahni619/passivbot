@@ -203,10 +203,6 @@ class RealtimeDataFetcher:
         self._ensure_risk_rules_engine()
 
 
-    async def fetch_snapshot(self) -> Dict[str, Any]:
-        self._ensure_portfolio_aggregator()
-
-
         tasks = [client.fetch() for client in self._account_clients]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         accounts_payload: List[Dict[str, Any]] = []
