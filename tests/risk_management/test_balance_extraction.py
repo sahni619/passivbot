@@ -48,3 +48,12 @@ def test_extract_balance_prefers_bybit_aggregate_fields() -> None:
     result = _extract_balance(balance_payload, "USDT")
 
     assert result == pytest.approx(252484.27769571)
+
+
+def test_extract_balance_handles_btc_settlement_with_aliases() -> None:
+    balance_payload = {
+        "total": {"xbt": "0.5"},
+        "BTC": {"total": "0.5"},
+    }
+
+    assert _extract_balance(balance_payload, "btc") == pytest.approx(0.5)
