@@ -161,13 +161,10 @@ class RealtimeDataFetcher:
         self._last_portfolio_balance: Optional[float] = None
         self._account_stop_losses: Dict[str, Dict[str, Any]] = {}
         self._last_account_balances: Dict[str, float] = {}
-        reports_dir = config.reports_dir
-        if reports_dir is None:
-            base_root = Path(__file__).resolve().parent
-            reports_dir = base_root / "reports"
-        self._performance_tracker = PerformanceTracker(Path(reports_dir))
+        self._reports_dir = self._resolve_reports_dir(config)
+        self._performance_tracker = PerformanceTracker(self._reports_dir)
         self._risk_config = RiskEngineConfig.from_realtime_config(config)
-        state_path = self._risk_config.state_path or Path(reports_dir) / "risk_state.json"
+        state_path = self._risk_config.state_path or self._reports_dir / "risk_state.json"
         self._state_store = FileStateStore(state_path)
         self._portfolio_aggregator = PortfolioAggregator()
         self._risk_rules_engine = RiskRulesEngine(self._risk_config)
@@ -179,15 +176,51 @@ class RealtimeDataFetcher:
             account_clients=self._exchange_clients,
         )
 
+    def _resolve_reports_dir(self, config: RealtimeConfig) -> Path:
+        reports_dir = config.reports_dir
+        if reports_dir is None:
+            base_root = Path(__file__).resolve().parent
+            reports_dir = base_root / "reports"
+        return Path(reports_dir)
+
     def _ensure_portfolio_aggregator(self) -> None:
         """Instantiate a portfolio aggregator if the attribute is missing."""
 
         if not hasattr(self, "_portfolio_aggregator"):
             logger.debug(
-                "Portfolio aggregator attribute missing; creating a new instance for fetch cycle"
+                "Portfolio aggregator attribute missing; creating a new instance for fetch cycle",
             )
             self._portfolio_aggregator = PortfolioAggregator()
 
+    def _ensure_reports_dir(self) -> None:
+        """Instantiate reports directory path if missing."""
+
+        if not hasattr(self, "_reports_dir"):
+            logger.debug(
+                "Reports directory attribute missing; resolving path for fetch cycle",
+            )
+            self._reports_dir = self._resolve_reports_dir(self.config)
+
+    def _ensure_risk_config(self) -> None:
+        """Instantiate a risk config if the attribute is missing."""
+
+        if not hasattr(self, "_risk_config"):
+            logger.debug(
+                "Risk config attribute missing; rebuilding from realtime config for fetch cycle",
+            )
+            self._risk_config = RiskEngineConfig.from_realtime_config(self.config)
+
+    def _ensure_state_store(self) -> None:
+        """Instantiate a state store if the attribute is missing."""
+
+        if not hasattr(self, "_state_store"):
+            self._ensure_reports_dir()
+            self._ensure_risk_config()
+            logger.debug(
+                "State store attribute missing; creating a new instance for fetch cycle",
+            )
+            state_path = self._risk_config.state_path or self._reports_dir / "risk_state.json"
+            self._state_store = FileStateStore(state_path)
 
     def _ensure_risk_config(self) -> None:
         """Instantiate a risk config if the attribute is missing."""
@@ -205,13 +238,44 @@ class RealtimeDataFetcher:
         if not hasattr(self, "_risk_rules_engine"):
             self._ensure_risk_config()
             logger.debug(
-                "Risk rules engine attribute missing; creating a new instance for fetch cycle"
+                "Risk rules engine attribute missing; creating a new instance for fetch cycle",
             )
             self._risk_rules_engine = RiskRulesEngine(self._risk_config)
 
+    def _ensure_exchange_clients(self) -> None:
+        """Instantiate exchange client adapters if missing."""
+
+        if not hasattr(self, "_exchange_clients"):
+            logger.debug(
+                "Exchange clients attribute missing; creating adapters for fetch cycle",
+            )
+            self._exchange_clients = [ExchangeClientAdapter(client) for client in self._account_clients]
+
+    def _ensure_action_executor(self) -> None:
+        """Instantiate an action executor if the attribute is missing."""
+
+        if not hasattr(self, "_action_executor"):
+            self._ensure_risk_config()
+            self._ensure_state_store()
+            self._ensure_exchange_clients()
+            logger.debug(
+                "Action executor attribute missing; creating a new instance for fetch cycle",
+            )
+            self._action_executor = ActionExecutor(
+                self._risk_config,
+                state_store=self._state_store,
+                notification_coordinator=self._notifications,
+                account_clients=self._exchange_clients,
+            )
+
     async def fetch_snapshot(self) -> Dict[str, Any]:
         self._ensure_portfolio_aggregator()
+        self._ensure_reports_dir()
+        self._ensure_risk_config()
+        self._ensure_state_store()
         self._ensure_risk_rules_engine()
+        self._ensure_exchange_clients()
+        self._ensure_action_executor()
 
 
         tasks = [client.fetch() for client in self._account_clients]
