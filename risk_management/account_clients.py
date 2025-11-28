@@ -991,19 +991,79 @@ class CCXTAccountClient(AccountClientProtocol):
                 return tuple(sorted(dict.fromkeys(supported)))
         return ("limit", "market")
 
+    @staticmethod
+    def _is_missing_symbol_error(error: BaseError) -> bool:
+        """Return True when ``error`` indicates a required symbol parameter."""
+
+        message = str(error).lower()
+        if not message:
+            return False
+        mentions_symbol = any(token in message for token in ("symbol", "market", "pair"))
+        mentions_required = any(token in message for token in ("required", "missing", "argument"))
+        return mentions_symbol and mentions_required
+
+    @staticmethod
+    def _extract_order_symbols(orders: Sequence[Mapping[str, Any]]) -> List[str]:
+        symbols: List[str] = []
+        for order in orders or []:
+            if not isinstance(order, Mapping):
+                continue
+            raw_symbol = order.get("symbol")
+            if raw_symbol:
+                symbols.append(str(raw_symbol))
+        return list(dict.fromkeys(symbols))
+
     async def cancel_all_orders(self, symbol: Optional[str] = None) -> Mapping[str, Any]:
         canceller = getattr(self.client, "cancel_all_orders", None)
         if not callable(canceller):
             if symbol:
                 raise NotSupported("cancel_all_orders is not supported by this exchange")
             return {}
+
+        kwargs: Dict[str, Any] = {}
+        if self._close_params:
+            kwargs["params"] = self._close_params
+
+        if symbol:
+            try:
+                return await canceller(symbol, **kwargs)
+            except BaseError as exc:
+                raise self._translate_ccxt_error(exc)
+
+        fetch_open_orders = getattr(self.client, "fetch_open_orders", None)
         try:
-            kwargs: Dict[str, Any] = {}
-            if self._close_params:
-                kwargs["params"] = self._close_params
-            return await canceller(symbol, **kwargs)
+            return await canceller(None, **kwargs)
+        except BaseError as exc:
+            if symbol is not None or not self._is_missing_symbol_error(exc):
+                raise self._translate_ccxt_error(exc)
+            if not callable(fetch_open_orders):
+                raise RuntimeError(
+                    f"[{self.config.name}] Exchange requires a symbol to cancel orders,"
+                    " but open orders could not be inspected to determine targets."
+                )
+
+        try:
+            open_orders = await fetch_open_orders()
         except BaseError as exc:
             raise self._translate_ccxt_error(exc)
+
+        symbols = self._extract_order_symbols(open_orders if isinstance(open_orders, Sequence) else [])
+        if not symbols:
+            return {"cancelled_orders": [], "failed_order_cancellations": []}
+
+        cancelled: List[Mapping[str, Any]] = []
+        failures: List[Mapping[str, Any]] = []
+        for market_symbol in symbols:
+            try:
+                result = await canceller(market_symbol, **kwargs)
+                cancelled.append({"symbol": market_symbol, "result": result})
+            except BaseError as exc:
+                failures.append({"symbol": market_symbol, "error": str(self._translate_ccxt_error(exc))})
+
+        response: Dict[str, Any] = {"cancelled_orders": cancelled}
+        if failures:
+            response["failed_order_cancellations"] = failures
+        return response
 
     async def close_all_positions(self, symbol: Optional[str] = None) -> Mapping[str, Any]:
         closer = getattr(self.client, "close_all_positions", None)
