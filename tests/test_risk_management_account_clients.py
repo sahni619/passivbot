@@ -128,6 +128,7 @@ class SymbolRequiredNoFetchExchange:
         self.calls.append({"symbol": symbol, "params": params})
 
 
+
 class MarketOrderTypesExchange:
     def __init__(self) -> None:
         self.markets = {
@@ -152,6 +153,7 @@ class FailingOrderTypesExchange:
 
     async def load_markets(self):
         raise BaseError("load_markets unavailable")
+
 
 
 def test_kill_switch_falls_back_to_ticker_price(caplog):
@@ -364,6 +366,7 @@ def test_cancel_all_orders_requires_symbol_when_open_orders_unavailable():
 
     with pytest.raises(RuntimeError):
         asyncio.run(client.cancel_all_orders())
+
 
 
 def test_list_order_types_uses_market_metadata():
