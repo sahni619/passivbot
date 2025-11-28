@@ -26,10 +26,19 @@ def _to_float(value: Any) -> Optional[float]:
 
 
 def extract_balance(balance: Mapping[str, Any], settle_currency: str) -> float:
-    """Extract a numeric balance from ccxt balance payloads."""
+    """Extract a numeric balance from ccxt balance payloads.
+
+    The settle currency is treated case-insensitively and supports common aliases
+    (for example ``XBT`` for ``BTC``) to ensure coin-margined accounts report the
+    correct wallet value.
+    """
 
     if not isinstance(balance, Mapping):
         return 0.0
+
+    settle_key = str(settle_currency or "").upper()
+    settle_aliases = {"BTC": ("XBT",)}
+    settle_candidates = (settle_key, *(settle_aliases.get(settle_key, ())))
 
     aggregate_keys = (
         "totalMarginBalance",
@@ -73,10 +82,12 @@ def extract_balance(balance: Mapping[str, Any], settle_currency: str) -> float:
 
     total = balance.get("total")
     if isinstance(total, Mapping) and total:
-        if settle_currency in total:
-            candidate = _to_float(total.get(settle_currency))
-            if candidate is not None:
-                return candidate
+        total_normalised = {str(key).upper(): value for key, value in total.items()}
+        for candidate_key in settle_candidates:
+            if candidate_key in total_normalised:
+                candidate = _to_float(total_normalised.get(candidate_key))
+                if candidate is not None:
+                    return candidate
         summed = 0.0
         found_value = False
         for value in total.values():
@@ -88,8 +99,14 @@ def extract_balance(balance: Mapping[str, Any], settle_currency: str) -> float:
         if found_value:
             return summed
 
-    for currency_key in (settle_currency, "USDT"):
+    for currency_key in (*settle_candidates, "USDT"):
         entry = balance.get(currency_key)
+        if entry is None and isinstance(balance, Mapping):
+            # case-insensitive lookup when direct key access fails
+            for key, value in balance.items():
+                if str(key).upper() == currency_key:
+                    entry = value
+                    break
         if isinstance(entry, Mapping):
             for key in ("total", "free", "used"):
                 candidate = _to_float(entry.get(key))
