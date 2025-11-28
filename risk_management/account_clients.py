@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import time
+import re
 from datetime import timedelta
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -984,11 +985,51 @@ class CCXTAccountClient(AccountClientProtocol):
             raise self._translate_ccxt_error(exc)
 
     async def list_order_types(self) -> Sequence[str]:
+        def _normalize(order_type: str) -> str:
+            token = str(order_type).strip()
+            token = token.replace(" ", "_").replace("-", "_")
+            token = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", token)
+            return token.strip("_").lower()
+
         has = getattr(self.client, "has", {})
         if isinstance(has, Mapping):
-            supported = [key.replace("createOrder", "order") for key, value in has.items() if key.startswith("createOrder") and value]
+            supported = []
+            for key, value in has.items():
+                if not key.startswith("create") or not key.endswith("Order"):
+                    continue
+                if not value or key == "createOrder":
+                    continue
+                core = key[len("create") : -len("Order")]
+                normalized = _normalize(core)
+                if normalized:
+                    supported.append(normalized)
             if supported:
                 return tuple(sorted(dict.fromkeys(supported)))
+
+        try:
+            await self._ensure_markets()
+            markets = getattr(self.client, "markets", {}) or {}
+            order_types = []
+            for market in markets.values():
+                if not isinstance(market, Mapping):
+                    continue
+                raw_types = market.get("orderTypes")
+                if not raw_types and isinstance(market.get("info"), Mapping):
+                    raw_types = market.get("info", {}).get("orderTypes")
+                if not isinstance(raw_types, Sequence):
+                    continue
+                for order_type in raw_types:
+                    if isinstance(order_type, str):
+                        order_types.append(_normalize(order_type))
+            if order_types:
+                return tuple(sorted(dict.fromkeys(order_types)))
+        except BaseError as exc:
+            logger.info(
+                "[%s] Falling back to default order types after inspection failure: %s",
+                self.config.name,
+                exc,
+            )
+
         return ("limit", "market")
 
     @staticmethod
