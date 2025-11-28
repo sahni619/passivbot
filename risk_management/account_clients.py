@@ -573,7 +573,10 @@ class CCXTAccountClient(AccountClientProtocol):
             return metrics
         raw_depth = getattr(settings, "depth", 25)
         depth = _coerce_int(raw_depth) or 25
-        depth = _normalise_order_book_depth(self._normalized_exchange, depth)
+        exchange_id = getattr(self, "_normalized_exchange", None)
+        if not exchange_id:
+            exchange_id = normalize_exchange_name(getattr(self.config, "exchange", ""))
+        depth = _normalise_order_book_depth(exchange_id, depth)
         for symbol in dict.fromkeys(symbols):
             if not symbol:
                 continue
@@ -599,6 +602,9 @@ class CCXTAccountClient(AccountClientProtocol):
     async def _fetch_cashflows(self) -> List[Mapping[str, Any]]:
         """Return recent deposit and withdrawal events when configured."""
         params_cfg = self._cashflow_params or {}
+        normalized_exchange = getattr(
+            self, "_normalized_exchange", normalize_exchange_name(getattr(self.config, "exchange", ""))
+        )
         now_ms = int(time.time() * 1000)
         lookback_ms = _coerce_int(params_cfg.get("lookback_ms"))
         if lookback_ms is None:
@@ -623,7 +629,7 @@ class CCXTAccountClient(AccountClientProtocol):
         if isinstance(account_types_cfg, Sequence) and not isinstance(account_types_cfg, (str, bytes)):
             account_types: Sequence[Optional[str]] = list(account_types_cfg)  # type: ignore[list-item]
         elif account_types_cfg is None:
-            if self._normalized_exchange == "bybit":
+            if normalized_exchange == "bybit":
                 account_types = [None, "UNIFIED", "CONTRACT", "SPOT"]
             else:
                 account_types = [None]
@@ -640,7 +646,7 @@ class CCXTAccountClient(AccountClientProtocol):
 
             def _build_params(start: int, end: int) -> Dict[str, Any]:
                 params = dict(base_params)
-                if self._normalized_exchange == "okx":
+                if normalized_exchange == "okx":
                     params.setdefault("from", start)
                     params.setdefault("to", end)
                     params.setdefault("after", start)
@@ -865,8 +871,11 @@ class CCXTAccountClient(AccountClientProtocol):
         total_notional = sum(position.get("notional", 0.0) for position in parsed_positions)
 
         cashflow_events: Optional[List[Mapping[str, Any]]] = None
-        cashflow_settings = self._cashflow_params or {}
-        if cashflow_settings.get("enabled", True):
+        cashflow_settings = getattr(self, "_cashflow_params", {}) or {}
+        if not hasattr(self, "_cashflow_params"):
+            self._cashflow_params = dict(cashflow_settings)
+        exchange_name = getattr(self.config, "exchange", None)
+        if cashflow_settings.get("enabled", True) and exchange_name:
             try:
                 cashflow_events = await self._fetch_cashflows()
             except AuthenticationError:
@@ -880,10 +889,11 @@ class CCXTAccountClient(AccountClientProtocol):
                 if self._debug_api_payloads:
                     logger.debug("[%s] Cash flow fetch error", self.config.name, exc_info=True)
 
+        exchange_name = exchange_name or ""
         snapshot: Dict[str, Any] = {
             "account": self.config.name,
             "name": self.config.name,
-            "exchange": self.config.exchange,
+            "exchange": exchange_name,
             "balance": balance_value,
             "balance_raw": balance_payload,
             "positions": parsed_positions,
@@ -891,10 +901,12 @@ class CCXTAccountClient(AccountClientProtocol):
             "unrealized_pnl": total_unrealized,
             "notional": total_notional,
             "daily_realized_pnl": realized,
-            "using_custom_endpoints": self._using_custom_endpoints,
+            "using_custom_endpoints": getattr(self, "_using_custom_endpoints", False),
         }
-        if self._custom_endpoint_source:
-            snapshot["custom_endpoint_source"] = self._custom_endpoint_source
+        snapshot["order_books"] = symbol_metrics
+        custom_source = getattr(self, "_custom_endpoint_source", None)
+        if custom_source:
+            snapshot["custom_endpoint_source"] = custom_source
         if cashflow_events is not None:
             snapshot["cashflows"] = {"events": list(cashflow_events)}
         return snapshot
@@ -911,9 +923,30 @@ class CCXTAccountClient(AccountClientProtocol):
             logger.debug("[%s] Failed to close client cleanly", self.config.name)
 
     async def kill_switch(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        logger.info(
+            "[%s] Executing kill switch%s",
+            self.config.name,
+            f" for {symbol}" if symbol else "",
+        )
+
         result: Dict[str, Any] = {}
-        result["cancelled_orders"] = await self.cancel_all_orders(symbol)
-        result["closed_positions"] = await self.close_all_positions(symbol)
+        cancel_result = await self.cancel_all_orders(symbol)
+        result["cancelled_orders"] = cancel_result
+
+        close_result = await self.close_all_positions(symbol)
+        if isinstance(close_result, Mapping):
+            result["closed_positions"] = close_result.get("closed_positions", [])
+            if "failed_position_closures" in close_result:
+                result["failed_position_closures"] = close_result.get("failed_position_closures", [])
+        else:
+            result["closed_positions"] = close_result
+
+        if isinstance(cancel_result, Mapping) and "failed_order_cancellations" in cancel_result:
+            result["failed_order_cancellations"] = cancel_result.get("failed_order_cancellations", [])
+
+        if result.get("failed_position_closures") or result.get("failed_order_cancellations"):
+            logger.debug("[%s] Kill switch details: %s", self.config.name, result)
+        logger.info("[%s] Kill switch completed", self.config.name)
         return result
 
     async def create_order(
@@ -977,8 +1010,91 @@ class CCXTAccountClient(AccountClientProtocol):
         if callable(closer):
             try:
                 return await closer(symbol)
+            except NotSupported:
+                logger.info(
+                    "[%s] close_all_positions not supported natively; falling back to per-position closes",
+                    self.config.name,
+                )
             except BaseError as exc:
                 raise self._translate_ccxt_error(exc)
-        if symbol:
-            return await self.close_position(symbol)
-        raise NotSupported("close_all_positions is not supported by this exchange")
+        fetch_positions = getattr(self.client, "fetch_positions", None)
+        if not callable(fetch_positions):
+            if symbol:
+                raise NotSupported("close_position is not supported by this exchange")
+            raise NotSupported("close_all_positions is not supported by this exchange")
+
+        try:
+            positions_payload = await fetch_positions(self._positions_params or {})
+        except BaseError as exc:
+            raise self._translate_ccxt_error(exc)
+
+        closed: List[Mapping[str, Any]] = []
+        failed: List[Mapping[str, Any]] = []
+
+        for position in positions_payload or []:
+            raw_symbol = position.get("symbol") or position.get("id")
+            if not raw_symbol:
+                continue
+            position_symbol = str(raw_symbol)
+            if symbol and position_symbol != symbol:
+                continue
+
+            size = _coerce_float(
+                _first_float(
+                    position.get("contracts"),
+                    position.get("size"),
+                    position.get("amount"),
+                    position.get("info", {}).get("positionAmt") if isinstance(position.get("info"), Mapping) else None,
+                )
+            )
+            if not size:
+                continue
+
+            order_side = "sell" if size > 0 else "buy"
+            try:
+                ticker = await self.client.fetch_ticker(position_symbol)
+            except BaseError as exc:
+                failed.append({"symbol": position_symbol, "error": str(exc)})
+                continue
+
+            bid = _first_float(ticker.get("bid"), ticker.get("info", {}).get("bid"))
+            ask = _first_float(ticker.get("ask"), ticker.get("info", {}).get("ask"))
+            last = _first_float(ticker.get("last"), ticker.get("close"), ticker.get("info", {}).get("last") or ticker.get("info", {}).get("close"))
+            price = bid if order_side == "sell" else ask
+            if price is None:
+                price = last
+            if price is None:
+                failed.append({"symbol": position_symbol, "error": "No price available to close position"})
+                continue
+
+            params = dict(self._close_params or {})
+            provided_reduce_only = any(str(key).lower() == "reduceonly" for key in params)
+            params = {key: value for key, value in params.items() if str(key).lower() != "reduceonly"}
+            position_side, position_idx, side_explicit = _extract_position_details(position)
+            if not provided_reduce_only and not side_explicit:
+                params["reduceOnly"] = True
+
+            if position_side:
+                params.setdefault("positionSide", position_side)
+            if position_idx is not None:
+                params.setdefault("positionIdx", position_idx)
+
+            try:
+                await self.client.create_order(
+                    position_symbol,
+                    "market",
+                    order_side,
+                    abs(size),
+                    price,
+                    params,
+                )
+                closed.append({"symbol": position_symbol})
+            except BaseError as exc:
+                failed.append({"symbol": position_symbol, "error": str(exc)})
+            except Exception as exc:  # pragma: no cover - defensive
+                failed.append({"symbol": position_symbol, "error": str(exc)})
+
+        if symbol and not closed and not failed:
+            raise NotSupported("close_position is not supported by this exchange")
+
+        return {"closed_positions": closed, "failed_position_closures": failed}
