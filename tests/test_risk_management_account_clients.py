@@ -104,6 +104,56 @@ class StubDepthExchange:
         return []
 
 
+class SymbolRequiredCancelExchange:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def cancel_all_orders(self, symbol=None, params=None):
+        if symbol is None:
+            raise BaseError("symbol required")
+        self.calls.append({"symbol": symbol, "params": params})
+        return {"symbol": symbol}
+
+    async def fetch_open_orders(self, symbol=None, params=None):
+        return [{"symbol": "BTC/USDT"}, {"symbol": "ETH/USDT"}]
+
+
+class SymbolRequiredNoFetchExchange:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def cancel_all_orders(self, symbol=None, params=None):
+        if symbol is None:
+            raise BaseError("symbol required")
+        self.calls.append({"symbol": symbol, "params": params})
+
+
+class MarketOrderTypesExchange:
+    def __init__(self) -> None:
+        self.markets = {
+            "BTC/USDT": {"orderTypes": ["LIMIT", "STOP_MARKET"]},
+            "ETH/USDT": {"info": {"orderTypes": ["MARKET"]}},
+        }
+
+
+class HasOrderTypesExchange:
+    def __init__(self) -> None:
+        self.has = {
+            "createLimitOrder": True,
+            "createStopMarketOrder": "emulated",
+            "createOrder": True,
+        }
+        self.markets = True
+
+
+class FailingOrderTypesExchange:
+    def __init__(self) -> None:
+        self.markets = None
+
+    async def load_markets(self):
+        raise BaseError("load_markets unavailable")
+
+
 def test_kill_switch_falls_back_to_ticker_price(caplog):
     exchange = StubExchange(bid=101.2)
     client = CCXTAccountClient.__new__(CCXTAccountClient)
@@ -277,3 +327,94 @@ def test_fetch_includes_liquidity_metrics_for_thin_books():
     warnings = liquidity.get("warnings") if isinstance(liquidity, dict) else None
     assert warnings and "insufficient_depth" in warnings
     assert "slippage_threshold_exceeded" in warnings
+
+
+def test_cancel_all_orders_falls_back_to_per_symbol_cancellations():
+    exchange = SymbolRequiredCancelExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    client.config = SimpleNamespace(name="Demo", symbols=None)
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {}
+    client._close_params = {"foo": "bar"}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+
+    result = asyncio.run(client.cancel_all_orders())
+
+    assert [call["symbol"] for call in exchange.calls] == ["BTC/USDT", "ETH/USDT"]
+    assert all(call["params"] == {"foo": "bar"} for call in exchange.calls)
+    cancelled = result.get("cancelled_orders") or []
+    assert [entry.get("symbol") for entry in cancelled] == ["BTC/USDT", "ETH/USDT"]
+    assert "failed_order_cancellations" not in result or not result["failed_order_cancellations"]
+
+
+def test_cancel_all_orders_requires_symbol_when_open_orders_unavailable():
+    exchange = SymbolRequiredNoFetchExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    client.config = SimpleNamespace(name="Demo", symbols=None)
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {}
+    client._close_params = {}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.cancel_all_orders())
+
+
+def test_list_order_types_uses_market_metadata():
+    exchange = MarketOrderTypesExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    client.config = SimpleNamespace(name="Demo", symbols=None)
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {}
+    client._close_params = {}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+
+    order_types = asyncio.run(client.list_order_types())
+
+    assert set(order_types) == {"limit", "market", "stop_market"}
+
+
+def test_list_order_types_from_has_map():
+    exchange = HasOrderTypesExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    client.config = SimpleNamespace(name="Demo", symbols=None)
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {}
+    client._close_params = {}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+
+    order_types = asyncio.run(client.list_order_types())
+
+    assert order_types == ("limit", "stop_market")
+
+
+def test_list_order_types_falls_back_on_failure(caplog):
+    exchange = FailingOrderTypesExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    client.config = SimpleNamespace(name="Demo", symbols=None)
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {}
+    client._close_params = {}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+
+    caplog.set_level(logging.INFO, "risk_management")
+
+    order_types = asyncio.run(client.list_order_types())
+
+    assert order_types == ("limit", "market")
+    assert any("Falling back to default order types" in record.message for record in caplog.records)

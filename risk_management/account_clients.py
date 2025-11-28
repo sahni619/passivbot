@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import time
+import re
 from datetime import timedelta
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -984,12 +985,74 @@ class CCXTAccountClient(AccountClientProtocol):
             raise self._translate_ccxt_error(exc)
 
     async def list_order_types(self) -> Sequence[str]:
+        def _normalize(order_type: str) -> str:
+            token = str(order_type).strip()
+            token = token.replace(" ", "_").replace("-", "_")
+            token = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", token)
+            return token.strip("_").lower()
+
         has = getattr(self.client, "has", {})
         if isinstance(has, Mapping):
-            supported = [key.replace("createOrder", "order") for key, value in has.items() if key.startswith("createOrder") and value]
+            supported = []
+            for key, value in has.items():
+                if not key.startswith("create") or not key.endswith("Order"):
+                    continue
+                if not value or key == "createOrder":
+                    continue
+                core = key[len("create") : -len("Order")]
+                normalized = _normalize(core)
+                if normalized:
+                    supported.append(normalized)
             if supported:
                 return tuple(sorted(dict.fromkeys(supported)))
+
+        try:
+            await self._ensure_markets()
+            markets = getattr(self.client, "markets", {}) or {}
+            order_types = []
+            for market in markets.values():
+                if not isinstance(market, Mapping):
+                    continue
+                raw_types = market.get("orderTypes")
+                if not raw_types and isinstance(market.get("info"), Mapping):
+                    raw_types = market.get("info", {}).get("orderTypes")
+                if not isinstance(raw_types, Sequence):
+                    continue
+                for order_type in raw_types:
+                    if isinstance(order_type, str):
+                        order_types.append(_normalize(order_type))
+            if order_types:
+                return tuple(sorted(dict.fromkeys(order_types)))
+        except BaseError as exc:
+            logger.info(
+                "[%s] Falling back to default order types after inspection failure: %s",
+                self.config.name,
+                exc,
+            )
+
         return ("limit", "market")
+
+    @staticmethod
+    def _is_missing_symbol_error(error: BaseError) -> bool:
+        """Return True when ``error`` indicates a required symbol parameter."""
+
+        message = str(error).lower()
+        if not message:
+            return False
+        mentions_symbol = any(token in message for token in ("symbol", "market", "pair"))
+        mentions_required = any(token in message for token in ("required", "missing", "argument"))
+        return mentions_symbol and mentions_required
+
+    @staticmethod
+    def _extract_order_symbols(orders: Sequence[Mapping[str, Any]]) -> List[str]:
+        symbols: List[str] = []
+        for order in orders or []:
+            if not isinstance(order, Mapping):
+                continue
+            raw_symbol = order.get("symbol")
+            if raw_symbol:
+                symbols.append(str(raw_symbol))
+        return list(dict.fromkeys(symbols))
 
     async def cancel_all_orders(self, symbol: Optional[str] = None) -> Mapping[str, Any]:
         canceller = getattr(self.client, "cancel_all_orders", None)
@@ -997,13 +1060,51 @@ class CCXTAccountClient(AccountClientProtocol):
             if symbol:
                 raise NotSupported("cancel_all_orders is not supported by this exchange")
             return {}
+
+        kwargs: Dict[str, Any] = {}
+        if self._close_params:
+            kwargs["params"] = self._close_params
+
+        if symbol:
+            try:
+                return await canceller(symbol, **kwargs)
+            except BaseError as exc:
+                raise self._translate_ccxt_error(exc)
+
+        fetch_open_orders = getattr(self.client, "fetch_open_orders", None)
         try:
-            kwargs: Dict[str, Any] = {}
-            if self._close_params:
-                kwargs["params"] = self._close_params
-            return await canceller(symbol, **kwargs)
+            return await canceller(None, **kwargs)
+        except BaseError as exc:
+            if symbol is not None or not self._is_missing_symbol_error(exc):
+                raise self._translate_ccxt_error(exc)
+            if not callable(fetch_open_orders):
+                raise RuntimeError(
+                    f"[{self.config.name}] Exchange requires a symbol to cancel orders,"
+                    " but open orders could not be inspected to determine targets."
+                )
+
+        try:
+            open_orders = await fetch_open_orders()
         except BaseError as exc:
             raise self._translate_ccxt_error(exc)
+
+        symbols = self._extract_order_symbols(open_orders if isinstance(open_orders, Sequence) else [])
+        if not symbols:
+            return {"cancelled_orders": [], "failed_order_cancellations": []}
+
+        cancelled: List[Mapping[str, Any]] = []
+        failures: List[Mapping[str, Any]] = []
+        for market_symbol in symbols:
+            try:
+                result = await canceller(market_symbol, **kwargs)
+                cancelled.append({"symbol": market_symbol, "result": result})
+            except BaseError as exc:
+                failures.append({"symbol": market_symbol, "error": str(self._translate_ccxt_error(exc))})
+
+        response: Dict[str, Any] = {"cancelled_orders": cancelled}
+        if failures:
+            response["failed_order_cancellations"] = failures
+        return response
 
     async def close_all_positions(self, symbol: Optional[str] = None) -> Mapping[str, Any]:
         closer = getattr(self.client, "close_all_positions", None)
