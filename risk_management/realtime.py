@@ -189,10 +189,21 @@ class RealtimeDataFetcher:
             self._portfolio_aggregator = PortfolioAggregator()
 
 
+    def _ensure_risk_config(self) -> None:
+        """Instantiate a risk config if the attribute is missing."""
+
+        if not hasattr(self, "_risk_config"):
+            logger.debug(
+                "Risk config attribute missing; rebuilding from realtime config for fetch cycle",
+            )
+            self._risk_config = RiskEngineConfig.from_realtime_config(self.config)
+
+
     def _ensure_risk_rules_engine(self) -> None:
         """Instantiate a risk rules engine if the attribute is missing."""
 
         if not hasattr(self, "_risk_rules_engine"):
+            self._ensure_risk_config()
             logger.debug(
                 "Risk rules engine attribute missing; creating a new instance for fetch cycle"
             )
