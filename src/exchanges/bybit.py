@@ -355,6 +355,7 @@ class BybitBot(Passivbot):
                 if require_live_value(self.config, "time_in_force") == "post_only"
                 else "GTC"
             ),
+            "reduceOnly": order["reduce_only"],
             "orderLinkId": order["custom_id"],
         }
 
