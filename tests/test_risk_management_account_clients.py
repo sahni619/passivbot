@@ -129,6 +129,24 @@ class SymbolRequiredNoFetchExchange:
 
 
 
+class OrderParamsRequiredForFetchExchange:
+    def __init__(self) -> None:
+        self.calls = []
+        self.fetch_calls = []
+
+    async def cancel_all_orders(self, symbol=None, params=None):
+        if symbol is None:
+            raise BaseError("symbol required")
+        self.calls.append({"symbol": symbol, "params": params})
+        return {"symbol": symbol}
+
+    async def fetch_open_orders(self, symbol=None, params=None):
+        self.fetch_calls.append({"symbol": symbol, "params": params})
+        if not isinstance(params, dict) or params.get("type") != "swap":
+            raise BaseError("type required")
+        return [{"symbol": "BTC/USDT"}]
+
+
 class MarketOrderTypesExchange:
     def __init__(self) -> None:
         self.markets = {
@@ -349,6 +367,27 @@ def test_cancel_all_orders_falls_back_to_per_symbol_cancellations():
     assert all(call["params"] == {"foo": "bar"} for call in exchange.calls)
     cancelled = result.get("cancelled_orders") or []
     assert [entry.get("symbol") for entry in cancelled] == ["BTC/USDT", "ETH/USDT"]
+    assert "failed_order_cancellations" not in result or not result["failed_order_cancellations"]
+
+
+def test_cancel_all_orders_passes_order_params_to_open_order_discovery():
+    exchange = OrderParamsRequiredForFetchExchange()
+    client = CCXTAccountClient.__new__(CCXTAccountClient)
+    client.config = SimpleNamespace(name="Demo", symbols=None)
+    client.client = exchange
+    client._balance_params = {}
+    client._positions_params = {}
+    client._orders_params = {"type": "swap"}
+    client._close_params = {"foo": "bar"}
+    client._markets_loaded = None
+    client._debug_api_payloads = False
+
+    result = asyncio.run(client.cancel_all_orders())
+
+    assert exchange.fetch_calls == [{"symbol": None, "params": {"type": "swap"}}]
+    assert exchange.calls == [{"symbol": "BTC/USDT", "params": {"foo": "bar"}}]
+    cancelled = result.get("cancelled_orders") or []
+    assert [entry.get("symbol") for entry in cancelled] == ["BTC/USDT"]
     assert "failed_order_cancellations" not in result or not result["failed_order_cancellations"]
 
 

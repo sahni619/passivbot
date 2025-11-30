@@ -1083,8 +1083,13 @@ class CCXTAccountClient(AccountClientProtocol):
                     " but open orders could not be inspected to determine targets."
                 )
 
+        fetch_params = self._orders_params or self._close_params or None
+
         try:
-            open_orders = await fetch_open_orders()
+            if fetch_params:
+                open_orders = await fetch_open_orders(params=fetch_params)
+            else:
+                open_orders = await fetch_open_orders()
         except BaseError as exc:
             raise self._translate_ccxt_error(exc)
 
