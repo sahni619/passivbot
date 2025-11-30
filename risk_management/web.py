@@ -19,7 +19,7 @@ from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from urllib.parse import quote, urljoin
 
-from .configuration import RealtimeConfig
+from .configuration import RealtimeConfig, load_realtime_config
 from .realtime import RealtimeDataFetcher
 from .reporting import ReportManager
 from .history import PortfolioHistoryStore
@@ -321,6 +321,34 @@ def create_app(
 
     def get_history_store(request: Request) -> PortfolioHistoryStore:
         return request.app.state.history_store
+
+    async def _reload_runtime_config() -> None:
+        """Reload the realtime configuration and refresh the service instance."""
+
+        nonlocal config
+
+        if config.config_path is None:
+            raise RuntimeError("Realtime configuration path is not available for reloading")
+
+        try:
+            updated_config = load_realtime_config(config.config_path)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to reload realtime configuration: {exc}") from exc
+
+        try:
+            refreshed_service = RiskDashboardService(RealtimeDataFetcher(updated_config))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialise realtime service after reload: {exc}") from exc
+
+        previous_service = app.state.service
+        app.state.service = refreshed_service
+        config = updated_config
+        app.state.grafana_context = resolve_grafana_context()
+
+        try:
+            await previous_service.close()
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("Failed to close previous realtime service: %s", exc)
 
     def _load_config_payload() -> Dict[str, Any]:
         if config.config_path is None:
@@ -842,6 +870,7 @@ def create_app(
             existing = load_api_keys(config.api_keys_path)
             existing[key_id] = normalized
             save_api_keys(config.api_keys_path, existing)
+            await _reload_runtime_config()
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except Exception as exc:
@@ -860,6 +889,7 @@ def create_app(
             existing.pop(key_id, None)
             try:
                 save_api_keys(config.api_keys_path, existing)
+                await _reload_runtime_config()
             except Exception as exc:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         return JSONResponse({"deleted": key_id})
@@ -911,6 +941,7 @@ def create_app(
         config_payload["accounts"] = updated_accounts
         try:
             _save_config_payload(config_payload)
+            await _reload_runtime_config()
         except RuntimeError as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         return JSONResponse({"account": clean_entry}, status_code=status.HTTP_201_CREATED)
@@ -940,6 +971,7 @@ def create_app(
         config_payload["accounts"] = updated_accounts
         try:
             _save_config_payload(config_payload)
+            await _reload_runtime_config()
         except RuntimeError as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
