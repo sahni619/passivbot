@@ -1132,6 +1132,24 @@ class CCXTAccountClient(AccountClientProtocol):
         closed: List[Mapping[str, Any]] = []
         failed: List[Mapping[str, Any]] = []
 
+        def _detect_position_direction(payload: Mapping[str, Any]) -> Optional[str]:
+            side, _, _ = _extract_position_details(payload)
+            if side in {"LONG", "SHORT"}:
+                return side.lower()
+
+            info = payload.get("info")
+            candidates = [payload.get("side")]
+            if isinstance(info, Mapping):
+                candidates.append(info.get("side"))
+
+            for candidate in candidates:
+                if isinstance(candidate, str):
+                    normalised = candidate.strip().lower()
+                    if normalised in {"long", "short"}:
+                        return normalised
+
+            return None
+
         for position in positions_payload or []:
             raw_symbol = position.get("symbol") or position.get("id")
             if not raw_symbol:
@@ -1151,7 +1169,13 @@ class CCXTAccountClient(AccountClientProtocol):
             if not size:
                 continue
 
-            order_side = "sell" if size > 0 else "buy"
+            direction = _detect_position_direction(position)
+            if direction == "long":
+                order_side = "sell"
+            elif direction == "short":
+                order_side = "buy"
+            else:
+                order_side = "sell" if size > 0 else "buy"
             try:
                 ticker = await self.client.fetch_ticker(position_symbol)
             except BaseError as exc:
