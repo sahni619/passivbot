@@ -39,6 +39,31 @@ class DummyClient:
         self.options = {"existing": True}
 
 
+class DummyPositionClient:
+    def __init__(self, positions: list[Mapping[str, Any]], tickers: Mapping[str, Mapping[str, Any]]):
+        self._positions = positions
+        self._tickers = tickers
+        self.create_order_calls: list[Mapping[str, Any]] = []
+
+    async def fetch_positions(self, params=None):  # pragma: no cover - passthrough
+        return list(self._positions)
+
+    async def fetch_ticker(self, symbol: str):  # pragma: no cover - passthrough
+        return self._tickers[symbol]
+
+    async def create_order(self, symbol: str, order_type: str, side: str, amount: float, price, params):
+        payload = {
+            "symbol": symbol,
+            "order_type": order_type,
+            "side": side,
+            "amount": amount,
+            "price": price,
+            "params": params,
+        }
+        self.create_order_calls.append(payload)
+        return payload
+
+
 def test_apply_credentials_merges_and_sets_sensitive_fields() -> None:
     client = DummyClient()
 
@@ -492,6 +517,50 @@ def test_account_fetch_skips_cashflows_when_disabled(monkeypatch) -> None:
     result = run_async(client.fetch())
 
     assert "cashflows" not in result
+
+
+def test_close_all_positions_detects_long_direction(monkeypatch) -> None:
+    positions = [
+        {
+            "symbol": "BTC/USDT",
+            "contracts": 1.5,
+            "positionSide": "LONG",
+            "info": {"positionAmt": "1.5", "positionSide": "LONG"},
+        },
+        {
+            "symbol": "ETH/USDT",
+            "amount": 2,
+            "side": "SHORT",
+            "info": {"positionAmt": "2", "side": "short"},
+        },
+    ]
+    tickers = {
+        "BTC/USDT": {"bid": 100.0, "ask": 101.0},
+        "ETH/USDT": {"bid": 200.0, "ask": 201.0},
+    }
+
+    dummy_client = DummyPositionClient(positions, tickers)
+    monkeypatch.setattr(module, "_instantiate_ccxt_client", lambda exchange, credentials, **kwargs: dummy_client)
+
+    config = AccountConfig(name="Bybit", exchange="bybit", credentials={})
+    client = module.CCXTAccountClient(config)
+
+    result = run_async(client.close_all_positions())
+
+    assert result["failed_position_closures"] == []
+    assert len(dummy_client.create_order_calls) == 2
+
+    long_order, short_order = dummy_client.create_order_calls
+
+    assert long_order["side"] == "sell"
+    assert long_order["symbol"] == "BTC/USDT"
+    assert long_order["amount"] == pytest.approx(1.5)
+    assert long_order["price"] == 100.0
+
+    assert short_order["side"] == "buy"
+    assert short_order["symbol"] == "ETH/USDT"
+    assert short_order["amount"] == pytest.approx(2.0)
+    assert short_order["price"] == 201.0
 
 
 def test_fetch_cashflows_adds_end_time_and_chunks_on_time_errors(monkeypatch) -> None:
