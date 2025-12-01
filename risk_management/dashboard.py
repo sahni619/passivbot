@@ -21,10 +21,13 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .configuration import CustomEndpointSettings, load_realtime_config
 from .models import AccountState, Order, Position, RiskLimits
+
+if TYPE_CHECKING:  # pragma: no cover - avoids circular imports at runtime
+    from .api import DashboardController
 
 
 Account = AccountState
@@ -190,6 +193,16 @@ def load_snapshot(path: Path) -> Dict[str, Any]:
     return data
 
 
+class StaticSnapshotProvider:
+    """Minimal snapshot provider used by the CLI."""
+
+    def __init__(self, snapshot: Mapping[str, Any]):
+        self.snapshot = snapshot
+
+    async def fetch_snapshot(self) -> Mapping[str, Any]:
+        return self.snapshot
+
+
 def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], AlertThresholds, Sequence[str]]:
     generated_at_raw = data.get("generated_at")
     if generated_at_raw:
@@ -310,16 +323,25 @@ def render_dashboard(
     return "\n".join(lines)
 
 
+async def render_from_controller(controller: "DashboardController") -> str:
+    generated_at, accounts, thresholds, notifications, account_messages = await controller.fetch_cli_view()
+    alerts = evaluate_alerts(accounts, thresholds)
+    return render_dashboard(generated_at, accounts, alerts, notifications, account_messages=account_messages)
+
+
 def run_dashboard(config_path: Path) -> str:
     snapshot = load_snapshot(config_path)
-    return build_dashboard(snapshot)
+    from .api import DashboardController
+
+    controller = DashboardController(StaticSnapshotProvider(snapshot))
+    return asyncio.run(render_from_controller(controller))
 
 
 def build_dashboard(snapshot: Dict[str, Any]) -> str:
-    generated_at, accounts, thresholds, notifications = parse_snapshot(snapshot)
-    alerts = evaluate_alerts(accounts, thresholds)
-    account_messages = snapshot.get("account_messages", {}) if isinstance(snapshot, Mapping) else {}
-    return render_dashboard(generated_at, accounts, alerts, notifications, account_messages=account_messages)
+    from .api import DashboardController
+
+    controller = DashboardController(StaticSnapshotProvider(snapshot))
+    return asyncio.run(render_from_controller(controller))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -379,6 +401,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
     from .realtime import RealtimeDataFetcher
 
     realtime_fetcher: Optional[RealtimeDataFetcher] = None
+    from .api import DashboardController
+
+    controller: Optional[DashboardController] = None
     if args.realtime_config:
         realtime_config = load_realtime_config(Path(args.realtime_config))
         override = args.custom_endpoints
@@ -401,16 +426,18 @@ async def _run_cli(args: argparse.Namespace) -> int:
                         path=override_normalized, autodiscover=False
                     )
         realtime_fetcher = RealtimeDataFetcher(realtime_config)
+        controller = DashboardController(realtime_fetcher)
         logger.info("Starting realtime dashboard using %s", args.realtime_config)
 
     try:
         iteration = 0
         while True:
             if realtime_fetcher is not None:
-                snapshot = await realtime_fetcher.fetch_snapshot()
+                dashboard = await render_from_controller(controller)  # type: ignore[arg-type]
             else:
                 snapshot = load_snapshot(Path(args.config))
-            dashboard = build_dashboard(snapshot)
+                static_controller = DashboardController(StaticSnapshotProvider(snapshot))
+                dashboard = await render_from_controller(static_controller)
             print(dashboard)
             iteration += 1
             if args.iterations and iteration >= args.iterations:

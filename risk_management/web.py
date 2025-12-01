@@ -19,6 +19,7 @@ from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from urllib.parse import quote, urljoin
 
+from .api import AdminController, DashboardController
 from .configuration import RealtimeConfig, load_realtime_config
 from .realtime import RealtimeDataFetcher
 from .reporting import ReportManager
@@ -26,6 +27,7 @@ from .history import PortfolioHistoryStore
 from .api_keys import load_api_keys, save_api_keys, validate_api_key_entry
 from .snapshot_utils import build_presentable_snapshot
 from services.telemetry import Telemetry
+from .view_helpers import api_keys_context, dashboard_context
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +228,8 @@ def create_app(
     app.state.report_manager = ReportManager(reports_dir)
     history_root = (reports_dir or config.config_root or Path.cwd()) / "history"
     app.state.history_store = PortfolioHistoryStore(history_root)
+    app.state.controller = DashboardController(service, history_store=app.state.history_store, report_manager=app.state.report_manager)
+    app.state.admin_controller = AdminController(config)
 
     def resolve_grafana_context() -> dict[str, Any]:
         grafana_cfg = config.grafana
@@ -335,6 +339,12 @@ def create_app(
     def get_service(request: Request) -> RiskDashboardService:
         return request.app.state.service
 
+    def get_controller(request: Request) -> DashboardController:
+        return request.app.state.controller
+
+    def get_admin_controller(request: Request) -> AdminController:
+        return request.app.state.admin_controller
+
     def require_user(request: Request) -> str:
         user = request.session.get("user")
         if not user:
@@ -367,6 +377,11 @@ def create_app(
 
         previous_service = app.state.service
         app.state.service = refreshed_service
+        app.state.controller = DashboardController(
+            refreshed_service,
+            history_store=app.state.history_store,
+            report_manager=app.state.report_manager,
+        )
         config = updated_config
         app.state.grafana_context = resolve_grafana_context()
 
@@ -376,17 +391,12 @@ def create_app(
             logger.warning("Failed to close previous realtime service: %s", exc)
 
     def _load_config_payload() -> Dict[str, Any]:
-        if config.config_path is None:
-            raise RuntimeError("Realtime configuration path is not available for editing")
-        try:
-            return json.loads(config.config_path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Realtime configuration file not found: {exc}") from exc
+        admin = app.state.admin_controller
+        return admin.load_config_payload()
 
     def _save_config_payload(payload: Mapping[str, Any]) -> None:
-        if config.config_path is None:
-            raise RuntimeError("Realtime configuration path is not available for editing")
-        config.config_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        admin = app.state.admin_controller
+        admin.save_config_payload(payload)
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_form(request: Request) -> HTMLResponse:
@@ -414,57 +424,31 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
-        history: PortfolioHistoryStore = Depends(get_history_store),
+        controller: DashboardController = Depends(get_controller),
     ) -> HTMLResponse:
         user = request.session.get("user")
         if not user:
             return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
-        snapshot = await service.fetch_snapshot()
-        view_model = build_presentable_snapshot(snapshot)
-        try:
-            await history.record_async(view_model)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.debug("Failed to persist snapshot history: %s", exc)
+        snapshot = await controller.fetch_presentable_snapshot()
         grafana_context: dict[str, Any] = request.app.state.grafana_context
         return templates.TemplateResponse(
             "dashboard.html",
-            {
-                "request": request,
-                "user": user,
-                "snapshot": view_model,
-                "grafana_dashboards": grafana_context.get("dashboards", []),
-                "grafana_account_dashboards": grafana_context.get("account_dashboards", []),
-                "grafana_theme": grafana_context.get("theme"),
-            },
+            dashboard_context(request, user, snapshot, grafana_context),
         )
 
     @app.get("/trading-panel", response_class=HTMLResponse)
     async def trading_panel(
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
-        history: PortfolioHistoryStore = Depends(get_history_store),
+        controller: DashboardController = Depends(get_controller),
     ) -> HTMLResponse:
         user = request.session.get("user")
         if not user:
             return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
-        snapshot = await service.fetch_snapshot()
-        view_model = build_presentable_snapshot(snapshot)
-        try:
-            await history.record_async(view_model)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.debug("Failed to persist snapshot history: %s", exc)
+        snapshot = await controller.fetch_presentable_snapshot()
         grafana_context: dict[str, Any] = request.app.state.grafana_context
         return templates.TemplateResponse(
             "trading_panel.html",
-            {
-                "request": request,
-                "user": user,
-                "snapshot": view_model,
-                "grafana_dashboards": grafana_context.get("dashboards", []),
-                "grafana_account_dashboards": grafana_context.get("account_dashboards", []),
-                "grafana_theme": grafana_context.get("theme"),
-            },
+            dashboard_context(request, user, snapshot, grafana_context),
         )
 
     async def _render_api_keys_page(request: Request) -> HTMLResponse:
@@ -482,19 +466,16 @@ def create_app(
         accounts_payload = config_payload.get("accounts", []) if isinstance(config_payload, Mapping) else []
         grafana_context: dict[str, Any] = request.app.state.grafana_context
 
-        return templates.TemplateResponse(
-            "api_keys.html",
-            {
-                "request": request,
-                "user": user,
-                "api_keys": api_keys_payload,
-                "accounts": accounts_payload,
-                "config_path": str(config.config_path) if config.config_path else None,
-                "api_keys_path": str(config.api_keys_path),
-                "grafana_dashboards": grafana_context.get("dashboards", []),
-                "grafana_theme": grafana_context.get("theme"),
-            },
+        context = api_keys_context(
+            request,
+            user,
+            api_keys_payload,
+            accounts_payload,
+            str(config.config_path) if config.config_path else None,
+            str(config.api_keys_path),
+            grafana_context,
         )
+        return templates.TemplateResponse("api_keys.html", context)
 
     @app.get("/api-keys", response_class=HTMLResponse)
     async def api_keys_page(request: Request) -> HTMLResponse:
@@ -507,16 +488,10 @@ def create_app(
     @app.get("/api/snapshot", response_class=JSONResponse)
     async def api_snapshot(
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
-        history: PortfolioHistoryStore = Depends(get_history_store),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
-        snapshot = await service.fetch_snapshot()
-        view_model = build_presentable_snapshot(snapshot)
-        try:
-            await history.record_async(view_model)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.debug("Failed to persist snapshot history: %s", exc)
+        view_model = await controller.fetch_presentable_snapshot()
         return JSONResponse(view_model)
 
     @app.get(
@@ -525,11 +500,11 @@ def create_app(
     )
     async def api_list_order_types(
         account_name: str,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         try:
-            order_types = await service.list_order_types(account_name)
+            order_types = await controller.list_order_types(account_name)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         return JSONResponse({"account": account_name, "order_types": list(order_types)})
@@ -541,7 +516,7 @@ def create_app(
     async def api_place_order(
         account_name: str,
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         try:
@@ -576,7 +551,7 @@ def create_app(
         if not isinstance(params, Mapping):
             params = None
         try:
-            result = await service.place_order(
+            result = await controller.place_order(
                 account_name,
                 symbol=symbol,
                 order_type=order_type,
@@ -599,7 +574,7 @@ def create_app(
         account_name: str,
         order_id: str,
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         params: Optional[Mapping[str, Any]] = None
@@ -616,7 +591,7 @@ def create_app(
                 if isinstance(params_candidate, Mapping):
                     params = params_candidate
         try:
-            result = await service.cancel_order(account_name, order_id, symbol=symbol, params=params)
+            result = await controller.cancel_order(account_name, order_id, symbol=symbol, params=params)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -630,13 +605,13 @@ def create_app(
     async def api_close_position(
         account_name: str,
         symbol: str,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         if not symbol:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Symbol is required")
         try:
-            result = await service.close_position(account_name, symbol)
+            result = await controller.close_position(account_name, symbol)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -645,16 +620,16 @@ def create_app(
 
     @app.get("/api/trading/portfolio/stop-loss", response_class=JSONResponse)
     async def api_get_portfolio_stop_loss(
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
-        state = service.get_portfolio_stop_loss()
+        state = await controller.get_portfolio_stop_loss()
         return JSONResponse({"stop_loss": state})
 
     @app.post("/api/trading/portfolio/stop-loss", response_class=JSONResponse)
     async def api_set_portfolio_stop_loss(
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         try:
@@ -668,30 +643,30 @@ def create_app(
         except (TypeError, ValueError):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="threshold_pct must be numeric")
         try:
-            state = await service.set_portfolio_stop_loss(threshold)
+            state = await controller.set_portfolio_stop_loss(threshold)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse(state)
 
     @app.delete("/api/trading/portfolio/stop-loss", response_class=JSONResponse)
     async def api_clear_portfolio_stop_loss(
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
-        await service.clear_portfolio_stop_loss()
+        await controller.clear_portfolio_stop_loss()
         return JSONResponse({"status": "cleared"})
 
     @app.get("/api/trading/portfolio/conditional-stop-loss", response_class=JSONResponse)
     async def api_list_conditional_stop_losses(
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
-        return JSONResponse({"items": service.list_conditional_stop_losses()})
+        return JSONResponse({"items": controller.list_conditional_stop_losses()})
 
     @app.post("/api/trading/portfolio/conditional-stop-loss", response_class=JSONResponse)
     async def api_add_conditional_stop_loss(
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         try:
@@ -708,7 +683,7 @@ def create_app(
         except (TypeError, ValueError):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="threshold must be numeric")
         try:
-            condition = await service.add_conditional_stop_loss(name, metric, threshold, operator)
+            condition = await controller.add_conditional_stop_loss(name, metric, threshold, operator)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse(condition, status_code=status.HTTP_201_CREATED)
@@ -716,21 +691,21 @@ def create_app(
     @app.delete("/api/trading/portfolio/conditional-stop-loss", response_class=JSONResponse)
     async def api_clear_conditional_stop_loss(
         request: Request,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         target = None
         if request.query_params.get("name"):
             target = request.query_params.get("name")
-        await service.clear_conditional_stop_losses(name=target)
+        await controller.clear_conditional_stop_losses(name=target)
         return JSONResponse({"status": "cleared", "name": target})
 
     @app.post("/api/kill-switch", response_class=JSONResponse)
     async def api_global_kill_switch(
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
-        results = await service.trigger_kill_switch()
+        results = await controller.trigger_kill_switch()
         payload = _build_kill_switch_response(results)
         return JSONResponse(payload)
 
@@ -738,7 +713,7 @@ def create_app(
     async def api_kill_switch(
         request: Request,
         account_name: str,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         target = account_name.strip()
@@ -749,9 +724,9 @@ def create_app(
                 symbol = None
         try:
             if not target or target.lower() == "all":
-                results = await service.trigger_kill_switch(symbol=symbol)
+                results = await controller.trigger_kill_switch(symbol=symbol)
             else:
-                results = await service.trigger_kill_switch(target, symbol=symbol)
+                results = await controller.trigger_kill_switch(target, symbol=symbol)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         payload = _build_kill_switch_response(results)
@@ -764,7 +739,7 @@ def create_app(
     async def api_position_kill_switch(
         account_name: str,
         symbol: str,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         _: str = Depends(require_user),
     ) -> JSONResponse:
         target_symbol = symbol.strip()
@@ -774,7 +749,7 @@ def create_app(
         if not target_account or target_account.lower() == "all":
             target_account = None
         try:
-            results = await service.trigger_kill_switch(target_account, symbol=target_symbol)
+            results = await controller.trigger_kill_switch(target_account, symbol=target_symbol)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         payload = _build_kill_switch_response(results)
@@ -799,12 +774,11 @@ def create_app(
     @app.post("/api/accounts/{account_name}/reports", response_class=JSONResponse)
     async def api_generate_report(
         account_name: str,
-        service: RiskDashboardService = Depends(get_service),
+        controller: DashboardController = Depends(get_controller),
         manager: ReportManager = Depends(get_report_manager),
         _: str = Depends(require_user),
     ) -> JSONResponse:
-        snapshot = await service.fetch_snapshot()
-        view_model = build_presentable_snapshot(snapshot)
+        view_model = await controller.fetch_presentable_snapshot()
         try:
             report = await manager.create_account_report(account_name, view_model)
         except ValueError as exc:
