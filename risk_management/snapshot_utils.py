@@ -40,6 +40,9 @@ def build_presentable_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     conditional = snapshot.get("conditional_stop_losses") if isinstance(snapshot, Mapping) else None
     if isinstance(conditional, Sequence):
         payload["conditional_stop_losses"] = list(conditional)
+    policy_violations = snapshot.get("policy_violations") if isinstance(snapshot, Mapping) else None
+    if isinstance(policy_violations, Sequence):
+        payload["policy_violations"] = list(policy_violations)
 
     return payload
 
@@ -61,7 +64,7 @@ def _build_account_views(
 
 
 def _build_portfolio_view(accounts: Sequence[Account]) -> Dict[str, Any]:
-    total_balance = sum(account.balance for account in accounts)
+    total_balance = sum(account.balance.total for account in accounts)
     gross_notional = sum(account.total_abs_notional() for account in accounts)
     net_notional = sum(account.net_notional() for account in accounts)
     daily_realized = sum(account.total_daily_realized() for account in accounts)
@@ -132,7 +135,7 @@ def _build_portfolio_view(accounts: Sequence[Account]) -> Dict[str, Any]:
 
 
 def _build_account_view(account: Account, account_messages: Mapping[str, str]) -> Dict[str, Any]:
-    positions = [_build_position_view(position, account.balance) for position in account.positions]
+    positions = [_build_position_view(position, account.balance.total) for position in account.positions]
     orders = [_build_order_view(order) for order in account.orders]
     message = account_messages.get(account.name)
     symbol_exposures = _build_symbol_exposures(account)
@@ -140,7 +143,7 @@ def _build_account_view(account: Account, account_messages: Mapping[str, str]) -
     funding_rates = _aggregate_position_metrics(account.positions, "funding_rates")
     return {
         "name": account.name,
-        "balance": account.balance,
+        "balance": account.balance.total,
         "exposure": account.exposure_pct(),
         "gross_exposure": account.gross_exposure_pct(),
         "gross_exposure_notional": account.total_abs_notional(),
@@ -185,7 +188,7 @@ def _build_position_view(position: Position, balance: float) -> Dict[str, Any]:
 def _build_symbol_exposures(account: Account) -> List[Dict[str, Any]]:
     exposures = account.exposures_by_symbol()
     items: List[Dict[str, Any]] = []
-    balance = account.balance or 0.0
+    balance = account.balance.total or 0.0
     for symbol, values in exposures.items():
         gross = values["gross"]
         net = values["net"]
