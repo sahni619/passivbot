@@ -25,6 +25,7 @@ from .reporting import ReportManager
 from .history import PortfolioHistoryStore
 from .api_keys import load_api_keys, save_api_keys, validate_api_key_entry
 from .snapshot_utils import build_presentable_snapshot
+from services.telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -194,12 +195,15 @@ def create_app(
     config: RealtimeConfig,
     *,
     service: Optional[RiskDashboardService] = None,
+    telemetry: Optional[Telemetry] = None,
     auth_manager: Optional[AuthManager] = None,
     templates_dir: Optional[Path] = None,
     letsencrypt_challenge_dir: Optional[Path] = None,
 ) -> FastAPI:
+    if telemetry is None:
+        telemetry = Telemetry(policy=config.resilience)
     if service is None:
-        service = RiskDashboardService(RealtimeDataFetcher(config))
+        service = RiskDashboardService(RealtimeDataFetcher(config, telemetry=telemetry))
     if config.auth is None and auth_manager is None:
         raise ValueError("Realtime configuration must include authentication details for the web dashboard.")
     if auth_manager is None and config.auth is not None:
@@ -213,6 +217,7 @@ def create_app(
 
     app = FastAPI(title="Risk Management Dashboard")
     app.state.service = service
+    app.state.telemetry = telemetry
     app.state.auth_manager = auth_manager
     reports_dir = config.reports_dir
     if reports_dir is None:
@@ -266,6 +271,26 @@ def create_app(
         }
 
     app.state.grafana_context = resolve_grafana_context()
+
+    @app.get("/health", response_class=JSONResponse)
+    async def health() -> JSONResponse:
+        snapshot = telemetry.health_snapshot()
+        status_code = (
+            status.HTTP_200_OK
+            if snapshot.get("status") == "healthy"
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        return JSONResponse(snapshot, status_code=status_code)
+
+    @app.get("/readiness", response_class=JSONResponse)
+    async def readiness() -> JSONResponse:
+        snapshot = telemetry.readiness_snapshot()
+        status_code = (
+            status.HTTP_200_OK
+            if snapshot.get("ready") and snapshot.get("status") == "healthy"
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        return JSONResponse(snapshot, status_code=status_code)
 
     templates_path = templates_dir or Path(__file__).with_name("templates")
     templates = Jinja2Templates(directory=str(templates_path))

@@ -21,6 +21,8 @@ from typing import (
     Set,
 )
 
+from services.telemetry import ResiliencePolicy
+
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +195,7 @@ class RealtimeConfig:
     account_messages: Dict[str, str] = field(default_factory=dict)
     custom_endpoints: Optional[CustomEndpointSettings] = None
     email: Optional[EmailSettings] = None
+    resilience: ResiliencePolicy = field(default_factory=ResiliencePolicy)
     config_root: Optional[Path] = None
     debug_api_payloads: bool = False
     reports_dir: Optional[Path] = None
@@ -659,6 +662,7 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
     auth = _parse_auth(config.get("auth"))
     custom_endpoints = _parse_custom_endpoints(config.get("custom_endpoints"))
     email_settings = _parse_email_settings(config.get("email"))
+    resilience = ResiliencePolicy.from_mapping(config.get("resilience"))
     grafana_settings = _parse_grafana_config(config.get("grafana"))
     reports_dir_value = config.get("reports_dir")
     reports_dir: Optional[Path] = None
@@ -691,6 +695,7 @@ def load_realtime_config(path: Path | str) -> RealtimeConfig:
         auth=auth,
         custom_endpoints=custom_endpoints,
         email=email_settings,
+        resilience=resilience,
         config_root=config_root,
         debug_api_payloads=debug_api_payloads_default,
         reports_dir=reports_dir,
