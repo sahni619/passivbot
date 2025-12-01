@@ -6,6 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from risk_engine.policies import RiskViolation
 from risk_management.configuration import AccountConfig, RealtimeConfig
 from risk_management.dashboard import build_dashboard
 from risk_management.realtime import RealtimeDataFetcher
@@ -104,3 +105,48 @@ def test_realtime_fetcher_reports_errors() -> None:
     assert view["hidden_accounts"][0]["name"] == "Problematic"
 
     asyncio.run(fetcher.close())
+
+
+def test_realtime_fetcher_orders_policy_and_handlers() -> None:
+    config = RealtimeConfig(
+        accounts=[AccountConfig(name="Ordered", exchange="binance", credentials={})],
+        alert_thresholds={},
+        notification_channels=[],
+    )
+    client = StubAccountClient(
+        "Ordered",
+        1_000,
+        [
+            {
+                "symbol": "ETHUSDT",
+                "side": "short",
+                "notional": 600,
+                "unrealized_pnl": -10,
+            }
+        ],
+    )
+
+    events: list[str] = []
+
+    def policy_eval(snapshot: dict) -> list[RiskViolation]:
+        events.append("policy")
+        return [RiskViolation("test", "violation")]
+
+    async def kill_handler(violations: list[RiskViolation], snapshot: dict) -> None:
+        events.append("kill")
+
+    def notify(violations: list[RiskViolation], snapshot: dict) -> None:
+        events.append("notify")
+
+    fetcher = RealtimeDataFetcher(
+        config,
+        account_clients=[client],
+        policy_evaluator=policy_eval,
+        notification_handler=notify,
+        kill_switch_handler=kill_handler,
+    )
+
+    snapshot = asyncio.run(fetcher.fetch_snapshot())
+
+    assert snapshot["accounts"][0]["exchange"] == "binance"
+    assert events == ["policy", "kill", "notify"]
