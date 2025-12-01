@@ -1,0 +1,18 @@
+{
+  "balance": {
+    "total": {"USDT": 980.25},
+    "info": {"data": [{"totalEq": "980.25"}]}
+  },
+  "positions": [
+    {
+      "symbol": "LTC/USDT:USDT",
+      "amount": 3,
+      "entryPrice": "90",
+      "markPrice": "95",
+      "unrealisedPnl": "15",
+      "liquidationPrice": "60",
+      "info": {"positionSide": "BOTH", "positionIdx": 0, "last": "95"},
+      "notional": "285"
+    }
+  ]
+}
