@@ -40,6 +40,9 @@ def build_presentable_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     conditional = snapshot.get("conditional_stop_losses") if isinstance(snapshot, Mapping) else None
     if isinstance(conditional, Sequence):
         payload["conditional_stop_losses"] = list(conditional)
+    policy_violations = snapshot.get("policy_violations") if isinstance(snapshot, Mapping) else None
+    if isinstance(policy_violations, Sequence):
+        payload["policy_violations"] = list(policy_violations)
 
     return payload
 

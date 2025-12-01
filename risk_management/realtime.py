@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timezone, date, time
 from types import TracebackType
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from custom_endpoint_overrides import (
@@ -25,6 +25,8 @@ except (ModuleNotFoundError, ImportError):  # pragma: no cover - ccxt is optiona
         """Fallback authentication error used when ccxt is unavailable."""
 
         pass
+
+from risk_engine.policies import RiskViolation
 
 from .account_clients import AccountClientProtocol, CCXTAccountClient
 from .configuration import CustomEndpointSettings, RealtimeConfig
@@ -100,6 +102,10 @@ class RealtimeDataFetcher:
         self,
         config: RealtimeConfig,
         account_clients: Optional[Sequence[AccountClientProtocol]] = None,
+        *,
+        policy_evaluator: Optional[PolicyEvaluator] = None,
+        notification_handler: Optional[NotificationHandler] = None,
+        kill_switch_handler: Optional[KillSwitchHandler] = None,
     ) -> None:
         self.config = config
         _configure_custom_endpoints(config.custom_endpoints, config.config_root)
@@ -140,6 +146,13 @@ class RealtimeDataFetcher:
         self._portfolio_stop_loss: Optional[Dict[str, Any]] = None
         self._last_portfolio_balance: Optional[float] = None
         self._conditional_stop_losses: list[Dict[str, Any]] = []
+        self._policy_evaluator: PolicyEvaluator = (
+            policy_evaluator if policy_evaluator is not None else self._evaluate_snapshot_policies
+        )
+        self._notification_handler: NotificationHandler = (
+            notification_handler if notification_handler is not None else self._dispatch_notifications
+        )
+        self._kill_switch_handler = kill_switch_handler
 
     def _extract_email_recipients(self) -> List[str]:
         recipients: List[str] = []
@@ -175,6 +188,14 @@ class RealtimeDataFetcher:
             if token and chat_id:
                 targets.append((token, chat_id))
         return targets
+
+    def _evaluate_snapshot_policies(self, snapshot: Mapping[str, Any]) -> List[RiskViolation]:
+        try:
+            _, accounts, thresholds, _ = parse_snapshot(dict(snapshot))
+            alerts = evaluate_alerts(accounts, thresholds)
+        except Exception:  # pragma: no cover - defensive fall back
+            return []
+        return [RiskViolation("alert_threshold", alert) for alert in alerts]
 
     async def fetch_snapshot(self) -> Dict[str, Any]:
         tasks = [client.fetch() for client in self._account_clients]
@@ -212,9 +233,18 @@ class RealtimeDataFetcher:
                         exc_info=_exception_info(result),
                     )
                 account_messages[account_config.name] = message
-                accounts_payload.append({"name": account_config.name, "balance": 0.0, "positions": []})
+                accounts_payload.append(
+                    {
+                        "name": account_config.name,
+                        "balance": 0.0,
+                        "positions": [],
+                        "exchange": account_config.exchange,
+                    }
+                )
             else:
-                accounts_payload.append(result)
+                account_payload = dict(result)
+                account_payload.setdefault("exchange", account_config.exchange)
+                accounts_payload.append(account_payload)
                 if account_config.name in self._last_auth_errors:
                     logger.info(
                         "Authentication for %s restored", account_config.name
@@ -242,8 +272,16 @@ class RealtimeDataFetcher:
         )
         if conditional_state:
             snapshot["conditional_stop_losses"] = conditional_state
+        violations = list(self._policy_evaluator(snapshot))
+        if violations:
+            snapshot["policy_violations"] = [violation.as_dict() for violation in violations]
         self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
-        self._dispatch_notifications(snapshot)
+        if self._kill_switch_handler is not None:
+            try:
+                await self._kill_switch_handler(violations, snapshot)
+            except Exception:
+                logger.exception("Kill switch handler failed", exc_info=True)
+        self._notification_handler(violations, snapshot)
         return snapshot
 
     async def close(self) -> None:
@@ -271,15 +309,12 @@ class RealtimeDataFetcher:
         logger.info("Kill switch completed for %s", scope)
         return results
 
-    def _dispatch_notifications(self, snapshot: Mapping[str, Any]) -> None:
+    def _dispatch_notifications(
+        self, violations: Sequence[RiskViolation], snapshot: Mapping[str, Any]
+    ) -> None:
         if not (self._email_sender or self._telegram_notifier):
             return
-        try:
-            _, accounts, thresholds, _ = parse_snapshot(dict(snapshot))
-            alerts = evaluate_alerts(accounts, thresholds)
-        except Exception as exc:  # pragma: no cover - snapshot parsing errors are logged for diagnostics
-            logger.debug("Skipping email alert dispatch due to parsing error: %s", exc, exc_info=True)
-            return
+        alerts = [violation.message for violation in violations]
         alerts_set = set(alerts)
         new_alerts = [alert for alert in alerts if alert not in self._active_alerts]
         self._active_alerts = alerts_set
@@ -769,3 +804,8 @@ def _first_float(*values: Any) -> Optional[float]:
         except (TypeError, ValueError):
             continue
     return None
+
+PolicyEvaluator = Callable[[Mapping[str, Any]], Sequence[RiskViolation]]
+NotificationHandler = Callable[[Sequence[RiskViolation], Mapping[str, Any]], None]
+KillSwitchHandler = Callable[[Sequence[RiskViolation], Mapping[str, Any]], Awaitable[None]]
+
