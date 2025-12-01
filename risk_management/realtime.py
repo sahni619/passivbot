@@ -8,7 +8,11 @@ import os
 from datetime import datetime, timezone, date, time
 from types import TracebackType
 from pathlib import Path
+
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
 from zoneinfo import ZoneInfo
 
 from custom_endpoint_overrides import (
@@ -33,6 +37,7 @@ from .configuration import CustomEndpointSettings, RealtimeConfig
 from .dashboard import evaluate_alerts, parse_snapshot
 from .email_notifications import EmailAlertSender
 from .telegram_notifications import TelegramNotifier
+from services.telemetry import ResiliencePolicy, Telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +107,18 @@ class RealtimeDataFetcher:
         self,
         config: RealtimeConfig,
         account_clients: Optional[Sequence[AccountClientProtocol]] = None,
+
+        telemetry: Optional[Telemetry] = None,
+
         *,
         policy_evaluator: Optional[PolicyEvaluator] = None,
         notification_handler: Optional[NotificationHandler] = None,
         kill_switch_handler: Optional[KillSwitchHandler] = None,
+
     ) -> None:
         self.config = config
+        self.telemetry = telemetry or Telemetry(policy=config.resilience)
+        self.resilience_policy: ResiliencePolicy = config.resilience
         _configure_custom_endpoints(config.custom_endpoints, config.config_root)
         if account_clients is None:
             clients: List[AccountClientProtocol] = []
@@ -154,6 +165,14 @@ class RealtimeDataFetcher:
         )
         self._kill_switch_handler = kill_switch_handler
 
+    async def _resilient_call(self, name: str, func: Callable[[], Any]) -> Any:
+        return await self.telemetry.execute_with_resilience(
+            name, func, policy=self.resilience_policy
+        )
+
+    async def _resilient_threaded_call(self, name: str, func: Callable[[], Any]) -> Any:
+        return await self._resilient_call(name, lambda: asyncio.to_thread(func))
+
     def _extract_email_recipients(self) -> List[str]:
         recipients: List[str] = []
         for channel in self.config.notification_channels:
@@ -198,7 +217,13 @@ class RealtimeDataFetcher:
         return [RiskViolation("alert_threshold", alert) for alert in alerts]
 
     async def fetch_snapshot(self) -> Dict[str, Any]:
-        tasks = [client.fetch() for client in self._account_clients]
+        tasks = [
+            self._resilient_call(
+                f"account:{client.config.name}:fetch",
+                lambda client=client: client.fetch(),
+            )
+            for client in self._account_clients
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         accounts_payload: List[Dict[str, Any]] = []
         account_messages: Dict[str, str] = dict(self.config.account_messages)
@@ -272,6 +297,10 @@ class RealtimeDataFetcher:
         )
         if conditional_state:
             snapshot["conditional_stop_losses"] = conditional_state
+
+        await self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
+        await self._dispatch_notifications(snapshot)
+
         violations = list(self._policy_evaluator(snapshot))
         if violations:
             snapshot["policy_violations"] = [violation.as_dict() for violation in violations]
@@ -282,6 +311,7 @@ class RealtimeDataFetcher:
             except Exception:
                 logger.exception("Kill switch handler failed", exc_info=True)
         self._notification_handler(violations, snapshot)
+
         return snapshot
 
     async def close(self) -> None:
@@ -302,16 +332,23 @@ class RealtimeDataFetcher:
         results: Dict[str, Any] = {}
         for client in targets:
             try:
-                results[client.config.name] = await client.kill_switch(symbol)
+                results[client.config.name] = await self._resilient_call(
+                    f"account:{client.config.name}:kill_switch",
+                    lambda client=client: client.kill_switch(symbol),
+                )
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.exception("Kill switch failed for %s", client.config.name, exc_info=True)
                 results[client.config.name] = {"error": str(exc)}
         logger.info("Kill switch completed for %s", scope)
         return results
 
+
+    async def _dispatch_notifications(self, snapshot: Mapping[str, Any]) -> None:
+
     def _dispatch_notifications(
         self, violations: Sequence[RiskViolation], snapshot: Mapping[str, Any]
     ) -> None:
+
         if not (self._email_sender or self._telegram_notifier):
             return
         alerts = [violation.message for violation in violations]
@@ -331,13 +368,21 @@ class RealtimeDataFetcher:
         body = "\n".join(lines)
         subject = "Risk alert: exposure threshold breached"
         if self._email_sender and self._email_recipients:
-            self._email_sender.send(subject, body, self._email_recipients)
+            await self._resilient_threaded_call(
+                "notification:email",
+                lambda: self._email_sender.send(subject, body, self._email_recipients),
+            )
         if self._telegram_notifier and self._telegram_targets:
             message = f"Exposure alert at {timestamp}\n" + "\n".join(new_alerts)
             for token, chat_id in self._telegram_targets:
-                self._telegram_notifier.send(token, chat_id, message)
+                await self._resilient_threaded_call(
+                    f"notification:telegram:{chat_id}",
+                    lambda token=token, chat_id=chat_id: self._telegram_notifier.send(
+                        token, chat_id, message
+                    ),
+                )
 
-    def _maybe_send_daily_balance_snapshot(
+    async def _maybe_send_daily_balance_snapshot(
         self, snapshot: Mapping[str, Any], portfolio_balance: float
     ) -> None:
         if not self._email_sender or not self._email_recipients:
@@ -368,7 +413,10 @@ class RealtimeDataFetcher:
             )
         body = "\n".join(lines)
         subject = "Daily portfolio balance snapshot"
-        self._email_sender.send(subject, body, self._email_recipients)
+        await self._resilient_threaded_call(
+            "notification:email.daily",
+            lambda: self._email_sender.send(subject, body, self._email_recipients),
+        )
         self._daily_snapshot_sent_date = current_date
 
     def _update_portfolio_stop_loss_state(
@@ -520,8 +568,11 @@ class RealtimeDataFetcher:
         client = self._resolve_account_client(account_name)
         normalized_amount = float(amount)
         normalized_price = float(price) if price is not None else None
-        return await client.create_order(
-            symbol, order_type, side, normalized_amount, normalized_price, params=params
+        return await self._resilient_call(
+            f"account:{account_name}:create_order",
+            lambda: client.create_order(
+                symbol, order_type, side, normalized_amount, normalized_price, params=params
+            ),
         )
 
     async def cancel_order(
@@ -534,15 +585,24 @@ class RealtimeDataFetcher:
     ) -> Mapping[str, Any]:
         client = self._resolve_account_client(account_name)
         normalized_id = str(order_id)
-        return await client.cancel_order(normalized_id, symbol, params=params)
+        return await self._resilient_call(
+            f"account:{account_name}:cancel_order",
+            lambda: client.cancel_order(normalized_id, symbol, params=params),
+        )
 
     async def close_position(self, account_name: str, symbol: str) -> Mapping[str, Any]:
         client = self._resolve_account_client(account_name)
-        return await client.close_position(symbol)
+        return await self._resilient_call(
+            f"account:{account_name}:close_position",
+            lambda: client.close_position(symbol),
+        )
 
     async def list_order_types(self, account_name: str) -> Sequence[str]:
         client = self._resolve_account_client(account_name)
-        return await client.list_order_types()
+        return await self._resilient_call(
+            f"account:{account_name}:list_order_types",
+            lambda: client.list_order_types(),
+        )
 
 
 def _extract_balance(balance: Mapping[str, Any], settle_currency: str) -> float:

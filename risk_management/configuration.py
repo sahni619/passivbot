@@ -19,6 +19,8 @@ from risk_management.config.models import (
     RealtimeConfig,
 )
 
+from services.telemetry import ResiliencePolicy
+
 
 @lru_cache(maxsize=1)
 def _passivbot_logging_configurator() -> Optional[Callable[..., Any]]:
@@ -38,6 +40,157 @@ def _passivbot_logging_configurator() -> Optional[Callable[..., Any]]:
     if not callable(configurator):  # pragma: no cover - defensive guard
         return None
     return configurator
+
+
+
+def _ensure_logger_level(logger: logging.Logger, level: int) -> None:
+    """Ensure ``logger`` and its handlers are set to at most ``level``."""
+
+    if logger.level in {logging.NOTSET} or logger.level > level:
+        logger.setLevel(level)
+    for handler in logger.handlers:
+        if handler.level in {logging.NOTSET} or handler.level > level:
+            handler.setLevel(level)
+
+
+def _configure_default_logging(debug_level: int = 1) -> bool:
+    """Provision Passivbot-style logging and enforce sensible defaults."""
+
+    root_logger = logging.getLogger()
+    already_configured = bool(root_logger.handlers)
+
+    if not already_configured:
+        configurator = _resolve_passivbot_logging_configurator()
+        if configurator is not None:
+            configurator(debug=debug_level)
+        else:
+            logging.basicConfig(level=_debug_to_logging_level(debug_level))
+
+    desired_level = _debug_to_logging_level(debug_level)
+    _ensure_logger_level(root_logger, desired_level)
+    risk_logger = logging.getLogger("risk_management")
+    _ensure_logger_level(risk_logger, desired_level)
+
+    return not already_configured
+
+
+def _ensure_debug_logging_enabled() -> None:
+    """Raise logging verbosity when debug API payloads are requested."""
+
+    _configure_default_logging(debug_level=2)
+
+    root_logger = logging.getLogger()
+    risk_logger = logging.getLogger("risk_management")
+    _ensure_logger_level(root_logger, logging.DEBUG)
+    _ensure_logger_level(risk_logger, logging.DEBUG)
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Return a boolean for ``value`` supporting common string representations."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "default", "auto"}:
+            return default
+        if lowered in {"1", "true", "yes", "on", "enabled", "enable"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled", "disable"}:
+            return False
+    return bool(value)
+
+
+@dataclass()
+class CustomEndpointSettings:
+    """Settings controlling how custom endpoint overrides are loaded."""
+
+    path: Optional[str] = None
+    autodiscover: bool = True
+
+
+@dataclass()
+class AccountConfig:
+    """Configuration for a single exchange account."""
+
+    name: str
+    exchange: str
+    settle_currency: str = "USDT"
+    api_key_id: Optional[str] = None
+    credentials: Dict[str, Any] = field(default_factory=dict)
+    symbols: Optional[List[str]] = None
+    params: Dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
+    debug_api_payloads: bool = False
+
+
+@dataclass()
+class AuthConfig:
+    """Settings for session authentication in the web dashboard."""
+
+    secret_key: str
+    users: Mapping[str, str]
+    session_cookie_name: str = "risk_dashboard_session"
+    https_only: bool = True
+
+
+@dataclass()
+class EmailSettings:
+    """SMTP configuration used to dispatch alert emails."""
+
+    host: str
+    port: int = 587
+    username: Optional[str] = None
+    password: Optional[str] = None
+    use_tls: bool = True
+    use_ssl: bool = False
+    sender: Optional[str] = None
+
+
+@dataclass()
+class GrafanaDashboardConfig:
+    """Description of a Grafana dashboard or panel to embed."""
+
+    title: str
+    url: str
+    description: Optional[str] = None
+    height: Optional[int] = None
+
+
+@dataclass()
+class GrafanaConfig:
+    """Settings for embedding Grafana dashboards in the web UI."""
+
+    dashboards: List[GrafanaDashboardConfig] = field(default_factory=list)
+    default_height: int = 600
+    theme: str = "dark"
+    base_url: Optional[str] = None
+    account_equity_template: Optional[str] = None
+
+
+@dataclass()
+class RealtimeConfig:
+    """Top level realtime configuration."""
+
+    accounts: List[AccountConfig]
+    alert_thresholds: Dict[str, float] = field(default_factory=dict)
+    notification_channels: List[str] = field(default_factory=list)
+    auth: Optional[AuthConfig] = None
+    account_messages: Dict[str, str] = field(default_factory=dict)
+    custom_endpoints: Optional[CustomEndpointSettings] = None
+    email: Optional[EmailSettings] = None
+    resilience: ResiliencePolicy = field(default_factory=ResiliencePolicy)
+    config_root: Optional[Path] = None
+    debug_api_payloads: bool = False
+    reports_dir: Optional[Path] = None
+    grafana: Optional[GrafanaConfig] = None
+    api_keys_path: Optional[Path] = None
+    config_path: Optional[Path] = None
+
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -488,6 +641,7 @@ def validate_realtime_config(
     auth = _parse_auth(config.get("auth"))
     custom_endpoints = _parse_custom_endpoints(config.get("custom_endpoints"), base_dir=base_dir)
     email_settings = _parse_email_settings(config.get("email"))
+    resilience = ResiliencePolicy.from_mapping(config.get("resilience"))
     grafana_settings = _parse_grafana_config(config.get("grafana"))
 
     reports_dir_value = config.get("reports_dir")
@@ -513,6 +667,7 @@ def validate_realtime_config(
         auth=auth,
         custom_endpoints=custom_endpoints,
         email=email_settings,
+        resilience=resilience,
         config_root=config_root,
         debug_api_payloads=debug_api_payloads_default,
         reports_dir=reports_dir,
