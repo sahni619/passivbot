@@ -344,6 +344,7 @@ backtests/
 !config/optimize/default.hjson
 !config/backtest/default.hjson
 config/
+!risk_management/config/
 historical_data/
 results*
 
