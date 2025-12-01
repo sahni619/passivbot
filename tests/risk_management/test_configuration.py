@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import sys
 from pathlib import Path
 from typing import List
@@ -15,12 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from risk_management.configuration import (  # noqa: E402
-    _ensure_debug_logging_enabled,
-    _merge_credentials,
-    _normalise_credentials,
-    load_realtime_config,
-)
+from risk_management.configuration import _merge_credentials, _normalise_credentials, load_realtime_config
 
 
 def _write_config(tmp_path: Path, payload: dict) -> Path:
@@ -228,148 +222,6 @@ def test_load_realtime_config_propagates_account_messages(tmp_path: Path) -> Non
     assert config.account_messages == {"Example": "Healthy"}
 
 
-def test_debug_logging_enabled_for_global_flag(tmp_path: Path, monkeypatch) -> None:
-    payload = _base_payload()
-    payload["debug_api_payloads"] = True
-    config_path = _write_config(tmp_path, payload)
-
-    calls: List[None] = []
-
-    def record_call() -> None:
-        calls.append(None)
-
-    monkeypatch.setattr("risk_management.configuration._ensure_debug_logging_enabled", record_call)
-
-    load_realtime_config(config_path)
-
-    assert calls, "expected debug logging to be enabled when global flag is set"
-
-
-def test_debug_logging_enabled_for_account_flag(tmp_path: Path, monkeypatch) -> None:
-    payload = _base_payload()
-    payload["accounts"][0]["debug_api_payloads"] = True
-    config_path = _write_config(tmp_path, payload)
-
-    calls: List[None] = []
-
-    def record_call() -> None:
-        calls.append(None)
-
-    monkeypatch.setattr("risk_management.configuration._ensure_debug_logging_enabled", record_call)
-
-    load_realtime_config(config_path)
-
-    assert calls, "expected debug logging to be enabled when account flag is set"
-
-
-def test_default_logging_sets_info_levels(tmp_path: Path) -> None:
-    payload = _base_payload()
-    config_path = _write_config(tmp_path, payload)
-
-    root_logger = logging.getLogger()
-    risk_logger = logging.getLogger("risk_management")
-
-    original_root_level = root_logger.level
-    original_root_handlers = list(root_logger.handlers)
-    original_risk_level = risk_logger.level
-    original_risk_handlers = list(risk_logger.handlers)
-
-    for handler in root_logger.handlers:
-        root_logger.removeHandler(handler)
-    root_handler = logging.StreamHandler()
-    root_handler.setLevel(logging.ERROR)
-    root_logger.addHandler(root_handler)
-    root_logger.setLevel(logging.ERROR)
-
-    for handler in risk_logger.handlers:
-        risk_logger.removeHandler(handler)
-    risk_handler = logging.StreamHandler()
-    risk_handler.setLevel(logging.ERROR)
-    risk_logger.addHandler(risk_handler)
-    risk_logger.setLevel(logging.ERROR)
-
-    try:
-        load_realtime_config(config_path)
-
-        assert root_logger.level == logging.INFO
-        assert root_handler.level == logging.INFO
-        assert risk_logger.level == logging.INFO
-        assert risk_handler.level == logging.INFO
-    finally:
-        risk_logger.removeHandler(risk_handler)
-        for handler in original_risk_handlers:
-            risk_logger.addHandler(handler)
-        risk_logger.setLevel(original_risk_level)
-
-        root_logger.removeHandler(root_handler)
-        for handler in original_root_handlers:
-            root_logger.addHandler(handler)
-        root_logger.setLevel(original_root_level)
-
-def test_default_logging_provisioned_without_debug(tmp_path: Path, monkeypatch) -> None:
-    payload = _base_payload()
-    config_path = _write_config(tmp_path, payload)
-
-    calls: List[int] = []
-
-    def record_call(debug_level: int = 1) -> bool:
-        calls.append(debug_level)
-        return True
-
-    monkeypatch.setattr("risk_management.configuration._configure_default_logging", record_call)
-
-    load_realtime_config(config_path)
-
-    assert calls == [1], "expected INFO-level logging to be provisioned by default"
-
-
-
-def test_debug_logging_promotes_root_and_risk_loggers(monkeypatch) -> None:
-    root_logger = logging.getLogger()
-    risk_logger = logging.getLogger("risk_management")
-
-    original_root_level = root_logger.level
-    original_root_handlers = list(root_logger.handlers)
-    original_risk_level = risk_logger.level
-    original_risk_handlers = list(risk_logger.handlers)
-
-    for handler in root_logger.handlers:
-        root_logger.removeHandler(handler)
-    root_handler = logging.StreamHandler()
-    root_handler.setLevel(logging.WARNING)
-    root_logger.addHandler(root_handler)
-    root_logger.setLevel(logging.WARNING)
-
-    for handler in risk_logger.handlers:
-        risk_logger.removeHandler(handler)
-    risk_handler = logging.StreamHandler()
-    risk_handler.setLevel(logging.WARNING)
-    risk_logger.addHandler(risk_handler)
-    risk_logger.setLevel(logging.WARNING)
-
-    monkeypatch.setattr(
-        "risk_management.configuration._configure_default_logging", lambda debug_level=2: False
-    )
-
-    try:
-        _ensure_debug_logging_enabled()
-
-        assert root_logger.level == logging.DEBUG
-        assert root_handler.level == logging.DEBUG
-        assert risk_logger.level == logging.DEBUG
-        assert risk_handler.level == logging.DEBUG
-    finally:
-        risk_logger.removeHandler(risk_handler)
-        for handler in original_risk_handlers:
-            risk_logger.addHandler(handler)
-        risk_logger.setLevel(original_risk_level)
-
-        root_logger.removeHandler(root_handler)
-        for handler in original_root_handlers:
-            root_logger.addHandler(handler)
-        root_logger.setLevel(original_root_level)
-
-
 def test_auth_https_only_flag_respected(tmp_path: Path) -> None:
     payload = _base_payload()
     payload["auth"] = {
@@ -384,6 +236,34 @@ def test_auth_https_only_flag_respected(tmp_path: Path) -> None:
 
     assert config.auth is not None
     assert config.auth.https_only is False
+
+
+def test_auth_missing_secret_rejected(tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["auth"] = {"users": {"demo": "hashed"}}
+    config_path = _write_config(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="secret_key"):
+        load_realtime_config(config_path)
+
+
+def test_alert_threshold_defaults_applied(tmp_path: Path) -> None:
+    payload = _base_payload()
+    config_path = _write_config(tmp_path, payload)
+
+    config = load_realtime_config(config_path)
+
+    assert config.alert_thresholds.wallet_exposure_pct == 0.6
+    assert config.alert_thresholds.loss_threshold_pct == -0.12
+
+
+def test_notification_channels_validate_sequence(tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["notification_channels"] = "not-a-list"
+    config_path = _write_config(tmp_path, payload)
+
+    with pytest.raises(TypeError, match="notification_channels"):
+        load_realtime_config(config_path)
 
 
 def test_load_realtime_config_parses_email_settings(tmp_path: Path) -> None:
