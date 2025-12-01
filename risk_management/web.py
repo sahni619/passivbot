@@ -23,11 +23,14 @@ from .api import AdminController, DashboardController
 from .configuration import RealtimeConfig, load_realtime_config
 from .realtime import RealtimeDataFetcher
 from .reporting import ReportManager
-from .history import PortfolioHistoryStore
 from .api_keys import load_api_keys, save_api_keys, validate_api_key_entry
 from .snapshot_utils import build_presentable_snapshot
 from services.telemetry import Telemetry
+
 from .view_helpers import api_keys_context, dashboard_context
+
+from services.persistence import PortfolioHistoryStore
+
 
 logger = logging.getLogger(__name__)
 

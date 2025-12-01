@@ -1,0 +1,17 @@
+{
+  "balance": {
+    "total": {"USDT": 2200.0},
+    "info": {"result": {"equity": "2200"}}
+  },
+  "positions": [
+    {
+      "symbol": "ETH/USDT:USDT",
+      "size": -2,
+      "entryPrice": "1800",
+      "markPrice": "1785",
+      "unrealizedPnl": "30",
+      "liquidationPrice": "2000",
+      "info": {"positionIdx": 0, "positionSide": "BOTH"}
+    }
+  ]
+}
