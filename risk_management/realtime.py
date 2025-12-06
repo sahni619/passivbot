@@ -137,6 +137,17 @@ class RealtimeDataFetcher:
             self._account_clients = clients
         else:
             self._account_clients = list(account_clients)
+            for account, client in zip(config.accounts, self._account_clients):
+                if not hasattr(client, "config"):
+                    client.config = account  # type: ignore[attr-defined]
+            self.resilience_policy = ResiliencePolicy(
+                request_timeout=config.resilience.request_timeout,
+                max_retries=0,
+                retry_backoff=0,
+                circuit_breaker_threshold=config.resilience.circuit_breaker_threshold,
+                circuit_breaker_reset_s=config.resilience.circuit_breaker_reset_s,
+            )
+            self.telemetry.policy = self.resilience_policy
         self._last_auth_errors: Dict[str, str] = {}
         if config.debug_api_payloads:
             logger.info(
@@ -308,7 +319,9 @@ class RealtimeDataFetcher:
                 await self._kill_switch_handler(violations, snapshot)
             except Exception:
                 logger.exception("Kill switch handler failed", exc_info=True)
-        self._notification_handler(violations, snapshot)
+        notification_result = self._notification_handler(violations, snapshot)
+        if asyncio.iscoroutine(notification_result):
+            await notification_result
 
         return snapshot
 

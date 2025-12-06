@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
-from pydantic import BaseModel, Field, root_validator, validator
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(value: Any) -> bool:
+    return bool(value)
 
 
 class ExchangeId(str, Enum):
@@ -24,171 +35,132 @@ class ExchangeId(str, Enum):
         return None
 
 
-class _Model(BaseModel):
-    class Config:
-        allow_population_by_field_name = True
-        extra = "ignore"
-
-
-class Balance(_Model):
-    total: float = Field(..., alias="balance")
+@dataclass
+class Balance:
+    total: float
     equity: Optional[float] = None
     available: Optional[float] = None
     currency: str = "USDT"
 
-    @validator("total", "equity", "available", pre=True)
-    def _coerce_numeric(cls, value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            return None
+    def __init__(
+        self,
+        balance: Any,
+        equity: Any | None = None,
+        available: Any | None = None,
+        currency: str = "USDT",
+    ) -> None:
+        self.total = float(balance) if balance not in (None, "") else 0.0
+        self.equity = _coerce_float(equity)
+        self.available = _coerce_float(available)
+        self.currency = str(currency or "USDT")
 
     def __float__(self) -> float:  # pragma: no cover - convenience
         return self.total
 
 
-class RiskLimits(_Model):
+@dataclass
+class RiskLimits:
     wallet_exposure_pct: float = 0.6
     position_wallet_exposure_pct: float = 0.25
     max_drawdown_pct: float = 0.3
     loss_threshold_pct: float = -0.12
 
 
-class PnLBreakdown(_Model):
+@dataclass
+class PnLBreakdown:
     unrealized: float = 0.0
     realized: float = 0.0
     daily_realized: float = 0.0
 
 
-class Order(_Model):
-    symbol: str
-    side: str
-    order_type: str = Field(..., alias="type")
-    price: Optional[float] = None
-    amount: Optional[float] = None
-    remaining: Optional[float] = None
-    status: str = ""
-    reduce_only: bool = False
-    stop_price: Optional[float] = None
-    notional: Optional[float] = None
-    order_id: Optional[str] = None
-    created_at: Optional[str] = None
-
-    @validator("side", pre=True)
-    def _normalize_side(cls, value: Any) -> str:
-        return str(value or "").lower()
-
-    @validator("order_type", pre=True)
-    def _normalize_type(cls, value: Any) -> str:
-        return str(value or "").lower()
-
-    @validator(
-        "price",
-        "amount",
-        "remaining",
-        "stop_price",
-        "notional",
-        pre=True,
-    )
-    def _coerce_float(cls, value: Any) -> Optional[float]:
-        if value in (None, ""):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            return None
-
-    @validator("reduce_only", pre=True)
-    def _coerce_bool(cls, value: Any) -> bool:
-        return bool(value)
-
-    @root_validator(pre=True)
-    def _handle_aliases(cls, values: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-        if "orderId" in values and "order_id" not in values:
-            values["order_id"] = values.get("orderId")
-        if "createdAt" in values and "created_at" not in values:
-            values["created_at"] = values.get("createdAt")
-        return values
+class Order:
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str | None = None,
+        price: Any = None,
+        amount: Any = None,
+        remaining: Any = None,
+        status: str = "",
+        reduce_only: Any = False,
+        stop_price: Any = None,
+        notional: Any = None,
+        order_id: str | None = None,
+        created_at: str | None = None,
+        type: str | None = None,
+        stopPrice: Any = None,
+        remaining_amount: Any = None,
+        orderId: Any = None,
+        createdAt: Any = None,
+    ) -> None:
+        self.symbol = str(symbol)
+        self.side = str(side or "").lower()
+        chosen_type = order_type if order_type not in (None, "") else type
+        self.order_type = str(chosen_type or "").lower()
+        self.price = _coerce_float(price)
+        self.amount = _coerce_float(amount)
+        remaining_value = remaining if remaining is not None else remaining_amount
+        self.remaining = _coerce_float(remaining_value)
+        self.status = str(status or "")
+        self.reduce_only = _coerce_bool(reduce_only)
+        stop_value = stop_price if stop_price is not None else stopPrice
+        self.stop_price = _coerce_float(stop_value)
+        self.notional = _coerce_float(notional)
+        if order_id is None and orderId is not None:
+            order_id = orderId
+        self.order_id = str(order_id) if order_id not in (None, "") else None
+        if created_at is None and createdAt is not None:
+            created_at = createdAt
+        self.created_at = str(created_at) if created_at not in (None, "") else None
 
 
-class Position(_Model):
-    symbol: str
-    side: str
-    notional: float
-    entry_price: float
-    mark_price: float
-    liquidation_price: Optional[float] = None
-    wallet_exposure_pct: Optional[float] = None
-    unrealized_pnl: float
-    max_drawdown_pct: Optional[float] = None
-    take_profit_price: Optional[float] = None
-    stop_loss_price: Optional[float] = None
-    size: Optional[float] = None
-    signed_notional: Optional[float] = None
-    volatility: Optional[Mapping[str, float]] = None
-    funding_rates: Optional[Mapping[str, float]] = None
-    daily_realized_pnl: float = 0.0
-    position_side: Optional[str] = Field(default=None, alias="positionSide")
-    position_idx: Optional[int] = Field(default=None, alias="positionIdx")
-
-    @root_validator(pre=True)
-    def _enforce_position_side(cls, values: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-        legacy = values.get("position_side")
-        alias = values.get("positionSide")
-        if legacy is not None and alias is None:
-            values["positionSide"] = legacy
-        elif legacy is not None and alias is not None:
-            if str(legacy).upper() != str(alias).upper():
-                raise ValueError("Conflicting positionSide and position_side provided")
-        return values
-
-    @validator("side", pre=True)
-    def _normalize_side(cls, value: Any) -> str:
-        return str(value or "").lower()
-
-    @validator(
-        "notional",
-        "entry_price",
-        "mark_price",
-        "liquidation_price",
-        "wallet_exposure_pct",
-        "max_drawdown_pct",
-        "take_profit_price",
-        "stop_loss_price",
-        "size",
-        "signed_notional",
-        "unrealized_pnl",
-        "daily_realized_pnl",
-        pre=True,
-    )
-    def _coerce_float(cls, value: Any) -> Optional[float]:
-        if value in (None, ""):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            return None
-
-    @validator("position_side", pre=True)
-    def _normalize_position_side(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        candidate = str(value).strip().upper()
-        if candidate not in {"LONG", "SHORT", "BOTH"}:
-            raise ValueError("positionSide must be LONG, SHORT, BOTH, or omitted")
-        return candidate
-
-    @validator("position_idx", pre=True)
-    def _coerce_idx(cls, value: Any) -> Optional[int]:
-        if value in (None, ""):
-            return None
-        try:
-            idx = int(float(value))
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            return None
-        return idx
+class Position:
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        notional: Any,
+        entry_price: Any,
+        mark_price: Any,
+        liquidation_price: Any | None = None,
+        wallet_exposure_pct: Any | None = None,
+        unrealized_pnl: Any = 0.0,
+        max_drawdown_pct: Any | None = None,
+        take_profit_price: Any | None = None,
+        stop_loss_price: Any | None = None,
+        size: Any | None = None,
+        signed_notional: Any | None = None,
+        volatility: Mapping[str, float] | None = None,
+        funding_rates: Mapping[str, float] | None = None,
+        daily_realized_pnl: Any = 0.0,
+        position_side: str | None = None,
+        position_idx: Any | None = None,
+        positionSide: str | None = None,
+        positionIdx: Any | None = None,
+    ) -> None:
+        self.symbol = str(symbol)
+        self.side = str(side or "").lower()
+        self.notional = float(notional)
+        self.entry_price = float(entry_price)
+        self.mark_price = float(mark_price)
+        self.liquidation_price = _coerce_float(liquidation_price)
+        self.wallet_exposure_pct = _coerce_float(wallet_exposure_pct)
+        self.unrealized_pnl = float(unrealized_pnl)
+        self.max_drawdown_pct = _coerce_float(max_drawdown_pct)
+        self.take_profit_price = _coerce_float(take_profit_price)
+        self.stop_loss_price = _coerce_float(stop_loss_price)
+        self.size = _coerce_float(size)
+        self.signed_notional = _coerce_float(signed_notional)
+        self.volatility = volatility
+        self.funding_rates = funding_rates
+        self.daily_realized_pnl = float(daily_realized_pnl)
+        side_value = position_side if position_side is not None else positionSide
+        self.position_side = side_value.upper() if side_value else None
+        idx_value = position_idx if position_idx is not None else positionIdx
+        self.position_idx = int(idx_value) if idx_value not in (None, "") else None
 
     def exposure_relative_to(self, balance: float) -> float:
         if balance == 0:
@@ -201,30 +173,46 @@ class Position(_Model):
         return self.unrealized_pnl / balance
 
 
-@dataclass
-class AccountState(_Model):  # type: ignore[misc]
-    name: str
-    balance: Balance
-    positions: Sequence[Position]
-    orders: Sequence[Order] = ()
-    pnl: Optional[PnLBreakdown] = None
-    risk_limits: Optional[RiskLimits] = None
-    exchange: Optional[ExchangeId] = None
+class AccountState:
+    def __init__(
+        self,
+        *,
+        name: str,
+        balance: Any,
+        positions: Sequence[Position] | Sequence[Mapping[str, Any]],
+        orders: Sequence[Order] | Sequence[Mapping[str, Any]] = (),
+        pnl: PnLBreakdown | Mapping[str, Any] | None = None,
+        risk_limits: RiskLimits | Mapping[str, Any] | None = None,
+        exchange: ExchangeId | str | None = None,
+    ) -> None:
+        self.name = str(name)
+        self.balance = self._coerce_balance(balance)
+        self.positions = tuple(
+            pos if isinstance(pos, Position) else Position(**pos) for pos in positions or []
+        )
+        self.orders = tuple(order if isinstance(order, Order) else Order(**order) for order in orders or [])
+        if isinstance(pnl, PnLBreakdown):
+            self.pnl = pnl
+        elif isinstance(pnl, Mapping):
+            self.pnl = PnLBreakdown(
+                unrealized=float(pnl.get("unrealized", 0.0)),
+                realized=float(pnl.get("realized", 0.0)),
+                daily_realized=float(pnl.get("daily_realized", 0.0)),
+            )
+        else:
+            self.pnl = None
+        if isinstance(risk_limits, RiskLimits):
+            self.risk_limits = risk_limits
+        elif isinstance(risk_limits, Mapping):
+            self.risk_limits = RiskLimits(**risk_limits)
+        else:
+            self.risk_limits = None
+        self.exchange = ExchangeId(exchange) if exchange else None
 
-    def __init__(self, **data: Any) -> None:  # type: ignore[override]
-        super().__init__(**data)
-
-    @validator("exchange", pre=True)
-    def _coerce_exchange(cls, value: Any) -> Optional[ExchangeId]:
-        if value is None:
-            return None
-        try:
-            return ExchangeId(value)
-        except ValueError:
-            return ExchangeId.OTHER
-
-    @validator("balance", pre=True)
-    def _coerce_balance(cls, value: Any) -> Balance:
+    @staticmethod
+    def _coerce_balance(value: Any) -> Balance:
+        if isinstance(value, Balance):
+            return value
         if isinstance(value, Mapping):
             if "balance" in value and "total" not in value:
                 return Balance(**value)
@@ -240,14 +228,6 @@ class AccountState(_Model):  # type: ignore[misc]
         except (TypeError, ValueError):
             total = 0.0
         return Balance(balance=total)
-
-    @validator("positions", pre=True)
-    def _coerce_positions(cls, value: Any) -> Sequence[Position]:
-        return tuple(Position(**item) if not isinstance(item, Position) else item for item in value or [])
-
-    @validator("orders", pre=True)
-    def _coerce_orders(cls, value: Any) -> Sequence[Order]:
-        return tuple(Order(**item) if not isinstance(item, Order) else item for item in value or [])
 
     def total_abs_notional(self) -> float:
         return sum(abs(p.notional) for p in self.positions)
@@ -298,3 +278,14 @@ class AccountState(_Model):  # type: ignore[misc]
         if self.pnl is not None:
             return self.pnl.daily_realized
         return self.total_daily_realized()
+
+
+__all__ = [
+    "AccountState",
+    "Balance",
+    "ExchangeId",
+    "Order",
+    "PnLBreakdown",
+    "Position",
+    "RiskLimits",
+]
