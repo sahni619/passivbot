@@ -7,10 +7,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install -e .[dev] ruff black mypy coverage
-      - run: ruff check .
-      - run: black --check .
-      - run: mypy .
-      - run: coverage run -m pytest && coverage xml
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -e .[dev] ruff black mypy coverage
+      - name: Lint
+        run: ruff check .
+      - name: Format
+        run: black --check .
+      - name: Type check
+        run: mypy .
+      - name: Test with coverage
+        run: |
+          coverage run -m pytest
+          coverage report --include="risk_management/email_notifications.py,risk_management/telegram_notifications.py,risk_management/reporting.py,risk_management/snapshot_utils.py,risk_management/view_helpers.py,risk_management/history.py" --fail-under=100
+          coverage xml
       - uses: codecov/codecov-action@v4
