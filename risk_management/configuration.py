@@ -62,7 +62,7 @@ def _configure_default_logging(debug_level: int = 1) -> bool:
     already_configured = bool(root_logger.handlers)
 
     if not already_configured:
-        configurator = _resolve_passivbot_logging_configurator()
+        configurator = _passivbot_logging_configurator()
         if configurator is not None:
             configurator(debug=debug_level)
         else:
@@ -87,24 +87,14 @@ def _ensure_debug_logging_enabled() -> None:
     _ensure_logger_level(risk_logger, logging.DEBUG)
 
 
-def _coerce_bool(value: Any, default: bool = False) -> bool:
-    """Return a boolean for ``value`` supporting common string representations."""
+def _debug_to_logging_level(debug_level: int) -> int:
+    """Map a debug verbosity integer to a logging level."""
 
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"", "default", "auto"}:
-            return default
-        if lowered in {"1", "true", "yes", "on", "enabled", "enable"}:
-            return True
-        if lowered in {"0", "false", "no", "off", "disabled", "disable"}:
-            return False
-    return bool(value)
+    if debug_level <= 0:
+        return logging.WARNING
+    if debug_level == 1:
+        return logging.INFO
+    return logging.DEBUG
 
 
 @dataclass()
