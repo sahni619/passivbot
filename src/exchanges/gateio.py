@@ -140,18 +140,10 @@ class GateIOBot(Passivbot):
             traceback.print_exc()
             return False
 
-    async def fetch_positions(self) -> ([dict], float):
-        positions, balance = None, None
+    async def fetch_positions(self):
+        positions_fetched = None
         try:
-            positions_fetched, balance = await asyncio.gather(
-                self.cca.fetch_positions(), self.cca.fetch_balance()
-            )
-            if not hasattr(self, "uid") or not self.uid:
-                self.uid = balance["info"][0]["user"]
-                self.cca.uid = self.uid
-                if self.ccp is not None:
-                    self.ccp.uid = self.uid
-            balance = balance[self.quote]["total"]
+            positions_fetched = await self.cca.fetch_positions()
             positions = []
             for x in positions_fetched:
                 if x["contracts"] != 0.0:
@@ -159,11 +151,34 @@ class GateIOBot(Passivbot):
                     x["price"] = x["entryPrice"]
                     x["position_side"] = x["side"]
                     positions.append(x)
-            return positions, balance
+            return positions
         except Exception as e:
-            logging.error(f"error fetching positions and balance {e}")
-            print_async_exception(positions)
-            print_async_exception(balance)
+            logging.error(f"error fetching positions {e}")
+            print_async_exception(positions_fetched)
+            traceback.print_exc()
+            return False
+
+    async def fetch_balance(self):
+        balance_fetched = None
+        try:
+            balance_fetched = await self.cca.fetch_balance()
+            if not hasattr(self, "uid") or not self.uid:
+                self.uid = balance_fetched["info"][0]["user"]
+                self.cca.uid = self.uid
+                if self.ccp is not None:
+                    self.ccp.uid = self.uid
+            margin_mode_name = balance_fetched["info"][0]["margin_mode_name"]
+            self.log_once(f"account margin mode: {margin_mode_name}")
+            if margin_mode_name == "classic":
+                balance = float(balance_fetched[self.quote]["total"])
+            elif margin_mode_name == "multi_currency":
+                balance = float(balance_fetched["info"][0]["cross_available"])
+            else:
+                raise Exception(f"unknown margin_mode_name {balance_fetched}")
+            return balance
+        except Exception as e:
+            logging.error(f"error fetching balance {e}")
+            print_async_exception(balance_fetched)
             traceback.print_exc()
             return False
 
@@ -327,8 +342,6 @@ class GateIOBot(Passivbot):
                         )
                     )
                 }
-                if self.user_info["is_vault"]:
-                    params["vaultAddress"] = self.user_info["wallet_address"]
                 coros_to_call_margin_mode[symbol] = asyncio.create_task(
                     self.cca.set_margin_mode("cross", symbol=symbol, params=params)
                 )

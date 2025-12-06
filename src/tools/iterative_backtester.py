@@ -41,8 +41,9 @@ from config_utils import (  # noqa: E402
     parse_overrides,
     require_config_value,
     get_optional_config_value,
+    normalize_limit_entries,
 )
-from logging_setup import configure_logging  # noqa: E402
+from logging_setup import configure_logging, resolve_log_level  # noqa: E402
 from pure_funcs import calc_hash, denumpyize  # noqa: E402
 from utils import (  # noqa: E402
     format_approved_ignored_coins,
@@ -51,8 +52,8 @@ from utils import (  # noqa: E402
     ts_to_date,
     utc_ms,
 )
-from main import manage_rust_compilation  # noqa: E402
 from metrics_schema import build_scenario_metrics, flatten_metric_stats  # noqa: E402
+from limit_utils import expand_limit_checks, compute_limit_violation  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +140,13 @@ class MetricInfo:
 
 @dataclass
 class LimitInfo:
-    value: Optional[float]
-    bound: float
-    penalize_if: str
+    metric: str
+    stat: str
+    mode: str
     metric_key: str
+    value: Optional[float]
+    bound: Optional[float] = None
+    range: Optional[Tuple[float, float]] = None
 
 
 @dataclass
@@ -154,7 +158,7 @@ class RunSummary:
     combined_analysis: Dict[str, Any]
     analyses_per_exchange: Dict[str, Dict[str, Any]]
     scoring_metrics: Dict[str, MetricInfo]
-    limit_metrics: Dict[str, LimitInfo]
+    limit_metrics: List[LimitInfo]
     results_path: Path
     bot_hash: str
     bot_flat: Dict[str, Any] = field(default_factory=dict)
@@ -194,6 +198,54 @@ def format_number(value: Optional[float]) -> str:
     if abs(value) >= 1e4 or (abs(value) > 0 and abs(value) < 1e-4):
         return f"{value:.6g}"
     return f"{value:.6f}"
+
+
+def summarize_limit(info: LimitInfo) -> Tuple[str, str, str]:
+    """
+    Returns (constraint, delta, status) for display purposes.
+    """
+    if info.mode == "greater_than":
+        constraint = f"≤ {format_number(info.bound)}"
+        if info.value is None or info.bound is None:
+            return constraint, "-", "-"
+        diff = info.value - info.bound
+        status = "VIOL" if diff > 0 else "OK"
+        return constraint, format_number(diff), status
+    if info.mode == "less_than":
+        constraint = f"≥ {format_number(info.bound)}"
+        if info.value is None or info.bound is None:
+            return constraint, "-", "-"
+        diff = info.bound - info.value
+        status = "VIOL" if diff > 0 else "OK"
+        return constraint, format_number(diff), status
+    if info.mode == "outside_range":
+        low, high = info.range or (None, None)
+        constraint = f"[{format_number(low)}, {format_number(high)}]"
+        if info.value is None or low is None or high is None:
+            return constraint, "-", "-"
+        if info.value < low:
+            diff = low - info.value
+            return constraint, format_number(diff), "VIOL"
+        if info.value > high:
+            diff = info.value - high
+            return constraint, format_number(diff), "VIOL"
+        diff = min(info.value - low, high - info.value)
+        return constraint, format_number(diff), "OK"
+    if info.mode == "inside_range":
+        low, high = info.range or (None, None)
+        constraint = f"outside [{format_number(low)}, {format_number(high)}]"
+        if info.value is None or low is None or high is None:
+            return constraint, "-", "-"
+        if low <= info.value <= high:
+            diff = min(info.value - low, high - info.value)
+            return constraint, format_number(diff), "VIOL"
+        # outside the forbidden band
+        if info.value < low:
+            diff = low - info.value
+        else:
+            diff = info.value - high
+        return constraint, format_number(diff), "OK"
+    return "-", "-", "-"
 
 
 def format_diff(current: Optional[float], reference: Optional[float]) -> str:
@@ -241,34 +293,17 @@ def combine_analyses(analyses: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def build_limit_checks(
-    limits: Dict[str, float], scoring_weights: Dict[str, float]
+    limits: Any,
+    scoring_weights: Dict[str, float],
+    scoring_index_map: Optional[Dict[str, List[int]]] = None,
 ) -> List[Dict[str, Any]]:
-    checks = []
-    for full_key, bound in sorted(limits.items()):
-        if full_key.startswith("penalize_if_greater_than_"):
-            metric = full_key[len("penalize_if_greater_than_") :]
-            penalize_if = "greater"
-            suffix = "max"
-        elif full_key.startswith("penalize_if_lower_than_"):
-            metric = full_key[len("penalize_if_lower_than_") :]
-            penalize_if = "lower"
-            suffix = "min"
-        else:
-            metric = full_key
-            weight = scoring_weights.get(metric)
-            if weight is None:
-                continue
-            penalize_if = "lower" if weight < 0 else "greater"
-            suffix = "min" if penalize_if == "lower" else "max"
-        checks.append(
-            {
-                "metric": metric,
-                "metric_key": f"{metric}_{suffix}",
-                "penalize_if": penalize_if,
-                "bound": float(bound),
-            }
-        )
-    return checks
+    normalized_limits = normalize_limit_entries(limits)
+    return expand_limit_checks(
+        normalized_limits,
+        scoring_weights,
+        penalty_weight=PENALTY_WEIGHT,
+        objective_index_map=scoring_index_map,
+    )
 
 
 def resolve_metric_value(
@@ -319,30 +354,39 @@ def calc_score_vector(
     scoring_weights: Dict[str, float],
     limit_checks: List[Dict[str, Any]],
 ) -> Tuple[Tuple[float, ...], float]:
+    scoring_keys = list(scoring_keys)
+    per_objective_modifier = [0.0] * len(scoring_keys)
     modifier = 0.0
     for check in limit_checks:
         val = ensure_float(combined.get(check["metric_key"]))
-        if val is None:
+        penalty = compute_limit_violation(check, val)
+        if not penalty:
             continue
-        if check["penalize_if"] == "greater" and val > check["bound"]:
-            modifier += (val - check["bound"]) * PENALTY_WEIGHT
-        elif check["penalize_if"] == "lower" and val < check["bound"]:
-            modifier += (check["bound"] - val) * PENALTY_WEIGHT
+        targets = check.get("objective_indexes") or []
+        if targets:
+            for idx in targets:
+                if 0 <= idx < len(per_objective_modifier):
+                    per_objective_modifier[idx] += penalty
+        else:
+            modifier += penalty
 
     scores: List[float] = []
-    for key in scoring_keys:
-        if modifier:
-            scores.append(modifier)
+    for idx, key in enumerate(scoring_keys):
+        penalty_total = modifier + per_objective_modifier[idx]
+        if penalty_total:
+            scores.append(penalty_total)
             continue
         value, resolved = resolve_metric_value(key, combined)
-        if resolved is not None and resolved in scoring_weights:
-            weight = scoring_weights[resolved]
+        if value is None:
+            scores.append(float("inf"))
+            continue
+        weight = scoring_weights.get(resolved or key)
+        if weight is None:
+            scores.append(value)
+        elif weight < 0:
+            scores.append(-value)
         else:
-            weight = scoring_weights.get(key)
-        if value is None or weight is None:
-            scores.append(0.0)
-        else:
-            scores.append(value * weight)
+            scores.append(value)
     return tuple(scores), modifier
 
 
@@ -361,9 +405,9 @@ def format_timestamp(ms: float) -> str:
 # Core session class
 # ---------------------------------------------------------------------------
 class IterativeBacktestSession:
-    def __init__(self, config_path: Path, debug: Optional[int], auto_run: bool) -> None:
+    def __init__(self, config_path: Path, log_level: Optional[str], auto_run: bool) -> None:
         self.config_path = config_path
-        self.debug = debug
+        self.log_level = log_level
         self.auto_run = auto_run
         self.datasets: Dict[str, ExchangeDataset] = {}
         self.backtest_exchanges: List[str] = []
@@ -381,7 +425,6 @@ class IterativeBacktestSession:
 
     # ------------------------------------------------------------------
     async def initialize(self) -> None:
-        manage_rust_compilation()
         config = await self._load_config()
         self.backtest_exchanges = list(require_config_value(config, "backtest.exchanges"))
         self.combine_ohlcvs = bool(require_config_value(config, "backtest.combine_ohlcvs"))
@@ -401,14 +444,12 @@ class IterativeBacktestSession:
         config = format_config(config, verbose=False)
         config = parse_overrides(config, verbose=False)
         # Configure logging lazily based on CLI/debug preference
-        level = self.debug
-        if level is None:
-            level = get_optional_config_value(config, "logging.level", 1)
-        try:
-            level = int(float(level))
-        except Exception:
-            level = 1
+        level = resolve_log_level(
+            self.log_level, get_optional_config_value(config, "logging.level", None), fallback=1
+        )
         configure_logging(debug=level)
+        config.setdefault("logging", {})
+        config["logging"]["level"] = level
         # Ensure exchanges have markets loaded and live coin lists expanded
         for ex in require_config_value(config, "backtest.exchanges"):
             await load_markets(ex, verbose=False)
@@ -542,9 +583,16 @@ class IterativeBacktestSession:
         combined = combine_analyses(analyses)
         combined_flat = flatten_metric_stats(combined.get("stats", {}))
         scoring_keys = list(config.get("optimize", {}).get("scoring", []))
+        scoring_index_map: Dict[str, List[int]] = {}
+        for idx, key in enumerate(scoring_keys):
+            scoring_index_map.setdefault(key, []).append(idx)
         self.scoring_keys = scoring_keys
-        limits_cfg = dict(config.get("optimize", {}).get("limits", {}))
-        limit_checks = build_limit_checks(limits_cfg, self.scoring_weights)
+        limits_cfg = config.get("optimize", {}).get("limits", [])
+        limit_checks = build_limit_checks(
+            limits_cfg,
+            self.scoring_weights,
+            scoring_index_map,
+        )
         score_vector, modifier = calc_score_vector(
             scoring_keys, combined_flat, self.scoring_weights, limit_checks
         )
@@ -559,14 +607,19 @@ class IterativeBacktestSession:
                 weight=weight,
             )
 
-        limit_metrics: Dict[str, LimitInfo] = {}
+        limit_metrics: List[LimitInfo] = []
         for check in limit_checks:
             val = ensure_float(combined_flat.get(check["metric_key"]))
-            limit_metrics[check["metric"]] = LimitInfo(
-                value=val,
-                bound=check["bound"],
-                penalize_if=check["penalize_if"],
-                metric_key=check["metric_key"],
+            limit_metrics.append(
+                LimitInfo(
+                    metric=check["metric"],
+                    stat=check.get("stat", ""),
+                    mode=check["mode"],
+                    metric_key=check["metric_key"],
+                    value=val,
+                    bound=check.get("bound"),
+                    range=check.get("range"),
+                )
             )
 
         current_bot_flat = flatten_bot_config(bot_section)
@@ -752,15 +805,18 @@ class IterativeBacktestSession:
                 else True
             ),
         }
-        payload["limits"] = {
-            name: {
+        payload["limits"] = [
+            {
+                "metric": info.metric,
+                "stat": info.stat,
+                "mode": info.mode,
+                "metric_key": info.metric_key,
                 "value": info.value,
                 "bound": info.bound,
-                "penalize_if": info.penalize_if,
-                "metric_key": info.metric_key,
+                "range": list(info.range) if info.range else None,
             }
-            for name, info in run.limit_metrics.items()
-        }
+            for info in run.limit_metrics
+        ]
         payload["scoring"] = {
             name: {
                 "value": info.value,
@@ -932,28 +988,22 @@ class IterativeBacktestSession:
         # Limit checks table
         if run.limit_metrics:
             table = PrettyTable()
-            table.field_names = ["Limit", "Value", "Bound", "Δ", "Status"]
+            table.field_names = ["Limit", "Value", "Constraint", "Δ", "Status"]
             rows: List[Tuple[int, List[str]]] = []
-            for metric, info in run.limit_metrics.items():
-                delta = ""
-                status = "OK"
-                if info.value is not None:
-                    if info.penalize_if == "greater":
-                        diff = info.value - info.bound
-                        delta = format_number(diff)
-                        status = "VIOL" if diff > 0 else "OK"
-                    else:
-                        diff = info.bound - info.value
-                        delta = format_number(diff)
-                        status = "VIOL" if diff > 0 else "OK"
+            for info in run.limit_metrics:
+                label = info.metric
+                if info.stat:
+                    label = f"{label} ({info.stat})"
+                constraint, delta, status = summarize_limit(info)
                 row = [
-                    metric,
+                    label,
                     format_number(info.value),
-                    format_number(info.bound),
+                    constraint,
                     delta or "-",
-                    status,
+                    status or "-",
                 ]
-                rows.append((0 if status == "VIOL" else 1, row))
+                priority = 0 if status == "VIOL" else 1
+                rows.append((priority, row))
             for _priority, row in sorted(rows, key=lambda item: (item[0], item[1][0])):
                 table.add_row(row)
             print("\nLimit checks:")
@@ -1024,10 +1074,10 @@ async def async_main() -> None:
     parser = argparse.ArgumentParser(description="Interactive iterative backtester")
     parser.add_argument("config_path", type=Path, help="Path to bot config (json/hjson)")
     parser.add_argument(
-        "--debug-level",
-        type=int,
+        "--log-level",
+        dest="log_level",
         default=None,
-        help="Override logging verbosity (0=warn, 1=info, 2=debug, 3=trace)",
+        help="Override logging verbosity (warning, info, debug, trace or 0-3)",
     )
     parser.add_argument(
         "--auto-run",
@@ -1036,7 +1086,7 @@ async def async_main() -> None:
     )
     args = parser.parse_args()
 
-    session = IterativeBacktestSession(args.config_path, args.debug_level, args.auto_run)
+    session = IterativeBacktestSession(args.config_path, args.log_level, args.auto_run)
     await session.initialize()
     await session.interactive_loop()
 

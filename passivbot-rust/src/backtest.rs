@@ -1,6 +1,7 @@
 use crate::closes::{
     calc_closes_long, calc_closes_short, calc_next_close_long, calc_next_close_short,
 };
+use crate::coin_selection::{select_coins, CoinFeature, SelectionConfig};
 use crate::constants::{CLOSE, HIGH, LONG, LOW, NO_POS, SHORT, VOLUME};
 use crate::entries::{
     calc_entries_long, calc_entries_short, calc_next_entry_long, calc_next_entry_short,
@@ -188,8 +189,9 @@ pub struct TradingEnabled {
 // RollingSum (SMA) removed — volume & log range are now tracked via EMAs in `EMAs`.
 
 pub struct Backtest<'a> {
-    hlcvs: &'a ArrayView3<'a, f64>,
-    btc_usd_prices: &'a ArrayView1<'a, f64>, // Change to ArrayView1 (1D view)
+    hlcvs: ArrayView3<'a, f64>,
+    btc_usd_prices: ArrayView1<'a, f64>, // Change to ArrayView1 (1D view)
+    active_coin_indices: Vec<usize>,
     bot_params_master: BotParamsPair,
     bot_params: Vec<BotParamsPair>,
     bot_params_original: Vec<BotParamsPair>,
@@ -217,6 +219,7 @@ pub struct Backtest<'a> {
     // Latest 1h bucket per coin (overwritten each new hour)
     latest_hour: Vec<HourBucket>,
     warmup_bars: usize,
+    current_step: usize,
     positions: Positions,
     open_orders: OpenOrders,
     trailing_prices: TrailingPrices,
@@ -233,16 +236,35 @@ pub struct Backtest<'a> {
     first_valid_timestamps: HashMap<usize, usize>,
     did_fill_long: HashSet<usize>,
     did_fill_short: HashSet<usize>,
-    n_eligible_long: usize,
-    n_eligible_short: usize,
     pub total_wallet_exposures: Vec<f64>,
     // removed rolling_volume_sum & buffer — replaced by per-coin EMAs in `emas`
+    equity_tracking_active: bool,
+}
+
+fn calc_entry_balance_pct(params: &BotParams, effective_n_positions: usize) -> f64 {
+    if effective_n_positions == 0 {
+        return 0.0;
+    }
+    let allowance_multiplier = 1.0 + params.risk_we_excess_allowance_pct.max(0.0);
+    params.total_wallet_exposure_limit * params.entry_initial_qty_pct * allowance_multiplier
+        / effective_n_positions as f64
 }
 
 impl<'a> Backtest<'a> {
+    #[inline(always)]
+    fn col(&self, idx: usize) -> usize {
+        self.active_coin_indices[idx]
+    }
+
+    #[inline(always)]
+    fn hlcvs_value(&self, row: usize, coin_idx: usize, feature: usize) -> f64 {
+        let col = self.col(coin_idx);
+        self.hlcvs[[row, col, feature]]
+    }
+
     pub fn new(
-        hlcvs: &'a ArrayView3<'a, f64>,
-        btc_usd_prices: &'a ArrayView1<'a, f64>,
+        hlcvs: ArrayView3<'a, f64>,
+        btc_usd_prices: ArrayView1<'a, f64>,
         bot_params: Vec<BotParamsPair>,
         exchange_params_list: Vec<ExchangeParams>,
         backtest_params: &BacktestParams,
@@ -273,7 +295,30 @@ impl<'a> Backtest<'a> {
         balance.usd_total_balance_rounded = balance.usd_total_balance;
 
         let n_timesteps = hlcvs.shape()[0];
-        let n_coins = hlcvs.shape()[1];
+        let total_cols = hlcvs.shape()[1];
+        let mut active_coin_indices = backtest_params
+            .active_coin_indices
+            .clone()
+            .unwrap_or_else(|| (0..bot_params.len()).collect());
+        if active_coin_indices.len() != bot_params.len() {
+            active_coin_indices = (0..bot_params.len()).collect();
+        }
+        for &col in &active_coin_indices {
+            assert!(
+                col < total_cols,
+                "active coin index {} exceeds available columns {}",
+                col,
+                total_cols
+            );
+        }
+        let n_coins = active_coin_indices.len();
+        assert_eq!(
+            bot_params.len(),
+            n_coins,
+            "bot params length ({}) does not match active coin indices ({})",
+            bot_params.len(),
+            n_coins
+        );
         let mut first_valid_idx = backtest_params.first_valid_indices.clone();
         if first_valid_idx.len() != n_coins {
             first_valid_idx = vec![0usize; n_coins];
@@ -331,13 +376,14 @@ impl<'a> Backtest<'a> {
                     .copied()
                     .unwrap_or(0)
                     .min(n_timesteps.saturating_sub(1));
-                let close_price = hlcvs[[start_idx, i, CLOSE]];
+                let col = active_coin_indices[i];
+                let close_price = hlcvs[[start_idx, col, CLOSE]];
                 let base_close = if close_price.is_finite() {
                     close_price
                 } else {
                     0.0
                 };
-                let volume = hlcvs[[start_idx, i, VOLUME]];
+                let volume = hlcvs[[start_idx, col, VOLUME]];
                 let base_volume = if volume.is_finite() {
                     volume.max(0.0)
                 } else {
@@ -381,17 +427,9 @@ impl<'a> Backtest<'a> {
         // Store original bot params to preserve dynamic WEL indicators
         let bot_params_original = bot_params.clone();
 
-        let n_eligible_long = bot_params_master.long.n_positions.max(
-            (n_coins as f64 * (1.0 - bot_params_master.long.filter_volume_drop_pct)).round()
-                as usize,
-        );
-        let n_eligible_short = bot_params_master.short.n_positions.max(
-            (n_coins as f64 * (1.0 - bot_params_master.short.filter_volume_drop_pct)).round()
-                as usize,
-        );
         let effective_n_positions = EffectiveNPositions {
-            long: n_eligible_long,
-            short: n_eligible_short,
+            long: bot_params_master.long.n_positions,
+            short: bot_params_master.short.n_positions,
         };
 
         // Calculate EMA alphas for each coin
@@ -416,6 +454,7 @@ impl<'a> Backtest<'a> {
         Backtest {
             hlcvs,
             btc_usd_prices,
+            active_coin_indices,
             bot_params_master: bot_params_master.clone(),
             bot_params: bot_params.clone(),
             bot_params_original,
@@ -433,23 +472,23 @@ impl<'a> Backtest<'a> {
                 .iter()
                 .any(|bp| bp.short.filter_volume_drop_pct != 0.0),
             needs_log_range_long: bot_params.iter().any(|bp| {
-                bp.long.entry_grid_spacing_log_weight != 0.0
-                    || bp.long.entry_trailing_threshold_log_weight != 0.0
-                    || bp.long.entry_trailing_retracement_log_weight != 0.0
+                bp.long.entry_grid_spacing_volatility_weight != 0.0
+                    || bp.long.entry_trailing_threshold_volatility_weight != 0.0
+                    || bp.long.entry_trailing_retracement_volatility_weight != 0.0
                     || bp.long.entry_trailing_grid_ratio != 0.0
             }),
             needs_log_range_short: bot_params.iter().any(|bp| {
-                bp.short.entry_grid_spacing_log_weight != 0.0
-                    || bp.short.entry_trailing_threshold_log_weight != 0.0
-                    || bp.short.entry_trailing_retracement_log_weight != 0.0
+                bp.short.entry_grid_spacing_volatility_weight != 0.0
+                    || bp.short.entry_trailing_threshold_volatility_weight != 0.0
+                    || bp.short.entry_trailing_retracement_volatility_weight != 0.0
                     || bp.short.entry_trailing_grid_ratio != 0.0
             }),
             needs_grid_log_range_long: bot_params
                 .iter()
-                .any(|bp| bp.long.entry_log_range_ema_span_hours > 0.0),
+                .any(|bp| bp.long.entry_volatility_ema_span_hours > 0.0),
             needs_grid_log_range_short: bot_params
                 .iter()
-                .any(|bp| bp.short.entry_log_range_ema_span_hours > 0.0),
+                .any(|bp| bp.short.entry_volatility_ema_span_hours > 0.0),
             coin_first_valid_idx: first_valid_idx,
             coin_last_valid_idx: last_valid_idx,
             coin_trade_start_idx: trade_start_idx,
@@ -459,6 +498,7 @@ impl<'a> Backtest<'a> {
             last_hour_boundary_ms: (backtest_params.first_timestamp_ms / 3_600_000) * 3_600_000,
             latest_hour: vec![HourBucket::default(); n_coins],
             warmup_bars,
+            current_step: 0,
             open_orders: OpenOrders::default(),
             trailing_prices: TrailingPrices::default(),
             actives: Actives::default(),
@@ -483,9 +523,8 @@ impl<'a> Backtest<'a> {
             first_valid_timestamps: HashMap::new(),
             did_fill_long: HashSet::new(),
             did_fill_short: HashSet::new(),
-            n_eligible_long,
-            n_eligible_short,
             total_wallet_exposures: Vec::with_capacity(n_timesteps),
+            equity_tracking_active: false,
             // EMAs already initialized in `emas`; no rolling buffers needed
         }
     }
@@ -518,6 +557,7 @@ impl<'a> Backtest<'a> {
             .requested_start_timestamp_ms
             .max(self.first_timestamp_ms);
         for k in 1..(n_timesteps - 1) {
+            self.current_step = k;
             for idx in 0..self.n_coins {
                 if !self.trade_activation_logged[idx] && self.coin_is_tradeable_at(idx, k) {
                     self.trade_activation_logged[idx] = true;
@@ -538,24 +578,28 @@ impl<'a> Backtest<'a> {
             self.update_trailing_prices(k);
             let current_ts = self.first_timestamp_ms + (k as u64) * 60_000u64;
             if k > warmup_bars && current_ts >= guard_timestamp_ms {
-                self.update_n_positions_and_wallet_exposure_limits(k);
+                if self.update_n_positions_and_wallet_exposure_limits(k) {
+                    self.equity_tracking_active = true;
+                }
                 self.update_open_orders_all(k);
             }
-            self.update_equities(k);
-            self.record_total_wallet_exposure();
+            if self.equity_tracking_active {
+                self.update_equities(k);
+                self.record_total_wallet_exposure();
+            }
         }
         let fills = std::mem::take(&mut self.fills);
         let equities = std::mem::take(&mut self.equities);
         (fills, equities)
     }
 
-    fn update_n_positions_and_wallet_exposure_limits(&mut self, k: usize) {
+    fn update_n_positions_and_wallet_exposure_limits(&mut self, k: usize) -> bool {
         let eligible: Vec<usize> = (0..self.n_coins)
             .filter(|&idx| self.coin_is_tradeable_at(idx, k))
             .collect();
 
         if eligible.is_empty() {
-            return; // nothing tradable right now
+            return false; // nothing tradable right now
         }
 
         // ---------- 2. effective position counts ----------
@@ -566,7 +610,7 @@ impl<'a> Backtest<'a> {
 
         // avoid division by zero (possible directly after a delisting)
         if self.effective_n_positions.long == 0 && self.effective_n_positions.short == 0 {
-            return;
+            return false;
         }
 
         // ---------- 3. dynamic WELs ----------
@@ -594,6 +638,7 @@ impl<'a> Backtest<'a> {
                 self.bot_params[idx].short.wallet_exposure_limit = dyn_wel_short_base;
             }
         }
+        true
     }
 
     #[inline(always)]
@@ -655,82 +700,90 @@ impl<'a> Backtest<'a> {
     }
 
     pub fn calc_preferred_coins(&mut self, pside: usize) -> Vec<usize> {
-        let n_positions = match pside {
+        let max_positions = match pside {
             LONG => self.effective_n_positions.long,
             SHORT => self.effective_n_positions.short,
-            _ => panic!("Invalid pside"),
+            _ => 0,
         };
-
-        if self.n_coins <= n_positions {
-            return (0..self.n_coins).collect();
-        }
-        let volume_filtered = self.filter_by_relative_volume(pside);
-        self.rank_by_log_range(&volume_filtered, pside)
-    }
-
-    fn filter_by_relative_volume(&mut self, pside: usize) -> Vec<usize> {
-        // Use EMA volume (alpha precomputed in `calc_ema_alphas`) to rank coins by
-        // recent activity and return the top n eligible symbols.
-        let mut volume_indices: Vec<(f64, usize)> = (0..self.n_coins)
-            .map(|idx| {
-                let vol = match pside {
-                    LONG => self.emas[idx].vol_long,
-                    SHORT => self.emas[idx].vol_short,
-                    _ => panic!("Invalid pside"),
-                };
-                (vol, idx)
-            })
-            .collect();
-        let n_eligible = match pside {
-            LONG => self.n_eligible_long,
-            SHORT => self.n_eligible_short,
-            _ => panic!("Invalid pside"),
-        };
-        let take = n_eligible.min(self.n_coins);
-        if take == 0 {
+        if max_positions == 0 {
             return Vec::new();
         }
-        let cmp = |a: &(f64, usize), b: &(f64, usize)| -> Ordering {
-            match b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal) {
-                Ordering::Equal => a.1.cmp(&b.1),
-                ord => ord,
-            }
-        };
-        volume_indices.sort_unstable_by(|a, b| cmp(a, b));
-        let take = take.min(volume_indices.len());
-        volume_indices
-            .into_iter()
-            .take(take)
-            .map(|(_, idx)| idx)
-            .collect()
-    }
 
-    fn rank_by_log_range(&self, candidates: &[usize], pside: usize) -> Vec<usize> {
-        // Use the EMA log range values computed in `update_emas` to prioritise the
-        // most volatile coins among the remaining candidates.
-        let mut log_ranges: Vec<(f64, usize)> = candidates
-            .iter()
-            .map(|&idx| {
-                let lr = match pside {
+        if self.n_coins <= max_positions && !self.backtest_params.filter_by_min_effective_cost {
+            return (0..self.n_coins).collect();
+        }
+
+        let volume_drop_pct = match pside {
+            LONG => self.bot_params_master.long.filter_volume_drop_pct,
+            SHORT => self.bot_params_master.short.filter_volume_drop_pct,
+            _ => 0.0,
+        };
+        let volatility_drop_pct = match pside {
+            LONG => self.bot_params_master.long.filter_volatility_drop_pct,
+            SHORT => self.bot_params_master.short.filter_volatility_drop_pct,
+            _ => 0.0,
+        };
+
+        let features: Vec<CoinFeature> = (0..self.n_coins)
+            .map(|idx| CoinFeature {
+                index: idx,
+                enabled: self.coin_passes_min_effective_cost(idx, pside),
+                volume_score: match pside {
+                    LONG => self.emas[idx].vol_long,
+                    SHORT => self.emas[idx].vol_short,
+                    _ => 0.0,
+                },
+                volatility_score: match pside {
                     LONG => self.emas[idx].log_range_long,
                     SHORT => self.emas[idx].log_range_short,
                     _ => 0.0,
-                };
-                (lr, idx)
+                },
             })
             .collect();
 
-        log_ranges.sort_unstable_by(|a, b| {
-            match b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal) {
-                Ordering::Equal => a.1.cmp(&b.1),
-                ord => ord,
-            }
-        });
-        log_ranges.into_iter().map(|(_, idx)| idx).collect()
+        let config = SelectionConfig {
+            max_positions,
+            volume_drop_pct,
+            volatility_drop_pct,
+            require_forager: true,
+        };
+
+        select_coins(&features, &config)
+    }
+
+    fn coin_passes_min_effective_cost(&self, idx: usize, pside: usize) -> bool {
+        if !self.backtest_params.filter_by_min_effective_cost {
+            return true;
+        }
+        if idx >= self.exchange_params_list.len() {
+            return false;
+        }
+        let price_idx = self
+            .current_step
+            .min(self.hlcvs.shape()[0].saturating_sub(1));
+        let price = self.hlcvs_value(price_idx, idx, CLOSE);
+        if !price.is_finite() || price <= 0.0 {
+            return false;
+        }
+        let exchange = &self.exchange_params_list[idx];
+        let min_cost = qty_to_cost(exchange.min_qty, price, exchange.c_mult).max(exchange.min_cost);
+        let bot = self.bp(idx, pside);
+        if bot.entry_initial_qty_pct <= 0.0 {
+            return false;
+        }
+        let base_limit = bot.wallet_exposure_limit;
+        if base_limit <= 0.0 {
+            return false;
+        }
+        let allowance_multiplier = 1.0 + bot.risk_we_excess_allowance_pct.max(0.0);
+        let effective_limit = base_limit * allowance_multiplier;
+        let projected_cost =
+            self.balance.usd_total_balance * effective_limit * bot.entry_initial_qty_pct;
+        projected_cost >= min_cost
     }
 
     fn create_state_params(&self, k: usize, idx: usize, pside: usize) -> StateParams {
-        let mut close_price = self.hlcvs[[k, idx, CLOSE]];
+        let mut close_price = self.hlcvs_value(k, idx, CLOSE);
         if !close_price.is_finite() {
             close_price = 0.0;
         }
@@ -834,7 +887,7 @@ impl<'a> Backtest<'a> {
             if !self.coin_is_valid_at(idx, k) {
                 continue;
             }
-            let current_price = self.hlcvs[[k, idx, CLOSE]];
+            let current_price = self.hlcvs_value(k, idx, CLOSE);
             if !current_price.is_finite() {
                 continue;
             }
@@ -855,7 +908,7 @@ impl<'a> Backtest<'a> {
             if !self.coin_is_valid_at(idx, k) {
                 continue;
             }
-            let current_price = self.hlcvs[[k, idx, CLOSE]];
+            let current_price = self.hlcvs_value(k, idx, CLOSE);
             if !current_price.is_finite() {
                 continue;
             }
@@ -1307,14 +1360,15 @@ impl<'a> Backtest<'a> {
                 if !self.coin_is_valid_at(idx, k) {
                     continue;
                 }
+                let fill_long = self.did_fill_long.contains(&idx);
+                let col = self.active_coin_indices[idx];
+                let low = self.hlcvs[[k, col, LOW]];
+                let high = self.hlcvs[[k, col, HIGH]];
+                let close = self.hlcvs[[k, col, CLOSE]];
                 let bundle = self.trailing_prices.long.entry(idx).or_default();
-                if self.did_fill_long.contains(&idx) {
+                if fill_long {
                     reset_trailing_bundle(bundle);
                 } else {
-                    let low = self.hlcvs[[k, idx, LOW]];
-                    let high = self.hlcvs[[k, idx, HIGH]];
-                    let close = self.hlcvs[[k, idx, CLOSE]];
-
                     update_trailing_bundle_with_candle(bundle, high, low, close);
                 }
             }
@@ -1329,14 +1383,15 @@ impl<'a> Backtest<'a> {
                 if !self.coin_is_valid_at(idx, k) {
                     continue;
                 }
+                let fill_short = self.did_fill_short.contains(&idx);
+                let col = self.col(idx);
+                let low = self.hlcvs[[k, col, LOW]];
+                let high = self.hlcvs[[k, col, HIGH]];
+                let close = self.hlcvs[[k, col, CLOSE]];
                 let bundle = self.trailing_prices.short.entry(idx).or_default();
-                if self.did_fill_short.contains(&idx) {
+                if fill_short {
                     reset_trailing_bundle(bundle);
                 } else {
-                    let low = self.hlcvs[[k, idx, LOW]];
-                    let high = self.hlcvs[[k, idx, HIGH]];
-                    let close = self.hlcvs[[k, idx, CLOSE]];
-
                     update_trailing_bundle_with_candle(bundle, high, low, close);
                 }
             }
@@ -1363,7 +1418,7 @@ impl<'a> Backtest<'a> {
                         qty: -self.positions.long[&idx].size,
                         price: round_(
                             f64::min(
-                                self.hlcvs[[k, idx, HIGH]]
+                                self.hlcvs_value(k, idx, HIGH)
                                     - self.exchange_params_list[idx].price_step,
                                 self.positions.long[&idx].price,
                             ),
@@ -1443,7 +1498,7 @@ impl<'a> Backtest<'a> {
                         qty: self.positions.short[&idx].size.abs(),
                         price: round_(
                             f64::max(
-                                self.hlcvs[[k, idx, LOW]]
+                                self.hlcvs_value(k, idx, LOW)
                                     + self.exchange_params_list[idx].price_step,
                                 self.positions.short[&idx].price,
                             ),
@@ -1508,9 +1563,9 @@ impl<'a> Backtest<'a> {
         }
         // check if filled in current candle (pass k+1 to check if will fill in next candle)
         if order.qty > 0.0 {
-            self.hlcvs[[k, idx, LOW]] < order.price
+            self.hlcvs_value(k, idx, LOW) < order.price
         } else if order.qty < 0.0 {
-            self.hlcvs[[k, idx, HIGH]] > order.price
+            self.hlcvs_value(k, idx, HIGH) > order.price
         } else {
             false
         }
@@ -1561,7 +1616,7 @@ impl<'a> Backtest<'a> {
                 }
                 if let Some(position) = self.positions.long.get(&idx) {
                     let ema_bands = self.emas[idx].compute_bands(LONG);
-                    let current_price = self.hlcvs[[k, idx, CLOSE]];
+                    let current_price = self.hlcvs_value(k, idx, CLOSE);
                     inputs.push(UnstuckPositionInput {
                         idx,
                         side: LONG,
@@ -1596,7 +1651,7 @@ impl<'a> Backtest<'a> {
                 }
                 if let Some(position) = self.positions.short.get(&idx) {
                     let ema_bands = self.emas[idx].compute_bands(SHORT);
-                    let current_price = self.hlcvs[[k, idx, CLOSE]];
+                    let current_price = self.hlcvs_value(k, idx, CLOSE);
                     inputs.push(UnstuckPositionInput {
                         idx,
                         side: SHORT,
@@ -1694,7 +1749,7 @@ impl<'a> Backtest<'a> {
                         continue;
                     }
                     if let Some(position) = self.positions.long.get(&idx) {
-                        let market_price = self.hlcvs[[k, idx, CLOSE]];
+                        let market_price = self.hlcvs_value(k, idx, CLOSE);
                         inputs.push(TwelEnforcerInputPosition {
                             idx,
                             position_size: position.size,
@@ -1705,6 +1760,7 @@ impl<'a> Backtest<'a> {
                             qty_step: self.exchange_params_list[idx].qty_step,
                             price_step: self.exchange_params_list[idx].price_step,
                             min_qty: self.exchange_params_list[idx].min_qty,
+                            min_cost: self.exchange_params_list[idx].min_cost,
                         });
                     }
                 }
@@ -1740,7 +1796,7 @@ impl<'a> Backtest<'a> {
                         continue;
                     }
                     if let Some(position) = self.positions.short.get(&idx) {
-                        let market_price = self.hlcvs[[k, idx, CLOSE]];
+                        let market_price = self.hlcvs_value(k, idx, CLOSE);
                         inputs.push(TwelEnforcerInputPosition {
                             idx,
                             position_size: position.size,
@@ -1751,6 +1807,7 @@ impl<'a> Backtest<'a> {
                             qty_step: self.exchange_params_list[idx].qty_step,
                             price_step: self.exchange_params_list[idx].price_step,
                             min_qty: self.exchange_params_list[idx].min_qty,
+                            min_cost: self.exchange_params_list[idx].min_cost,
                         });
                     }
                 }
@@ -2006,6 +2063,8 @@ impl<'a> Backtest<'a> {
             let mut order_indices: Vec<usize> = open_orders_side.keys().cloned().collect();
             order_indices.sort_unstable();
             for idx in order_indices {
+                let col = self.active_coin_indices[idx];
+                let raw_market_price = self.hlcvs[[k, col, CLOSE]];
                 let bundle = match open_orders_side.get(&idx) {
                     Some(bundle) => bundle,
                     None => continue,
@@ -2014,7 +2073,6 @@ impl<'a> Backtest<'a> {
                     continue;
                 }
                 let params = &self.exchange_params_list[idx];
-                let raw_market_price = self.hlcvs[[k, idx, CLOSE]];
                 for order in &bundle.entries {
                     let qty = order.qty.abs();
                     if qty <= 0.0 || order.price <= 0.0 {
@@ -2155,8 +2213,8 @@ impl<'a> Backtest<'a> {
                             let mut l = f64::MAX;
                             let mut seen = false;
                             for j in start..=end {
-                                let high = self.hlcvs[[j, i, HIGH]];
-                                let low = self.hlcvs[[j, i, LOW]];
+                                let high = self.hlcvs_value(j, i, HIGH);
+                                let low = self.hlcvs_value(j, i, LOW);
                                 if !(high.is_finite() && low.is_finite()) {
                                     continue;
                                 }
@@ -2219,18 +2277,18 @@ impl<'a> Backtest<'a> {
             if !self.coin_is_valid_at(i, k) {
                 continue;
             }
-            let close_price = self.hlcvs[[k, i, CLOSE]];
+            let close_price = self.hlcvs_value(k, i, CLOSE);
             if !close_price.is_finite() {
                 continue;
             }
-            let vol_raw = self.hlcvs[[k, i, VOLUME]];
+            let vol_raw = self.hlcvs_value(k, i, VOLUME);
             let vol = if vol_raw.is_finite() {
                 f64::max(0.0, vol_raw)
             } else {
                 0.0
             };
-            let high = self.hlcvs[[k, i, HIGH]];
-            let low = self.hlcvs[[k, i, LOW]];
+            let high = self.hlcvs_value(k, i, HIGH);
+            let low = self.hlcvs_value(k, i, LOW);
             if !high.is_finite() || !low.is_finite() {
                 continue;
             }
@@ -2304,6 +2362,18 @@ impl<'a> Backtest<'a> {
             }
         }
     }
+
+    pub fn initial_entry_balance_pct(&self) -> (f64, f64) {
+        let long = calc_entry_balance_pct(
+            &self.bot_params_master.long,
+            self.effective_n_positions.long,
+        );
+        let short = calc_entry_balance_pct(
+            &self.bot_params_master.short,
+            self.effective_n_positions.short,
+        );
+        (long, short)
+    }
 }
 
 fn calc_ema_alphas(bot_params_pair: &BotParamsPair) -> EmaAlphas {
@@ -2335,10 +2405,11 @@ fn calc_ema_alphas(bot_params_pair: &BotParamsPair) -> EmaAlphas {
         // EMA spans for the volume/log range filters (alphas precomputed from spans)
         vol_alpha_long: 2.0 / (bot_params_pair.long.filter_volume_ema_span as f64 + 1.0),
         vol_alpha_short: 2.0 / (bot_params_pair.short.filter_volume_ema_span as f64 + 1.0),
-        log_range_alpha_long: 2.0 / (bot_params_pair.long.filter_log_range_ema_span as f64 + 1.0),
-        log_range_alpha_short: 2.0 / (bot_params_pair.short.filter_log_range_ema_span as f64 + 1.0),
+        log_range_alpha_long: 2.0 / (bot_params_pair.long.filter_volatility_ema_span as f64 + 1.0),
+        log_range_alpha_short: 2.0
+            / (bot_params_pair.short.filter_volatility_ema_span as f64 + 1.0),
         grid_log_range_alpha_long: {
-            let span = bot_params_pair.long.entry_log_range_ema_span_hours;
+            let span = bot_params_pair.long.entry_volatility_ema_span_hours;
             if span > 0.0 {
                 2.0 / (span + 1.0)
             } else {
@@ -2346,7 +2417,7 @@ fn calc_ema_alphas(bot_params_pair: &BotParamsPair) -> EmaAlphas {
             }
         },
         grid_log_range_alpha_short: {
-            let span = bot_params_pair.short.entry_log_range_ema_span_hours;
+            let span = bot_params_pair.short.entry_volatility_ema_span_hours;
             if span > 0.0 {
                 2.0 / (span + 1.0)
             } else {
@@ -2364,15 +2435,15 @@ fn calc_warmup_bars(bot_params: &[BotParamsPair]) -> usize {
             pair.long.ema_span_0,
             pair.long.ema_span_1,
             pair.long.filter_volume_ema_span as f64,
-            pair.long.filter_log_range_ema_span as f64,
-            pair.long.entry_log_range_ema_span_hours * 60.0,
+            pair.long.filter_volatility_ema_span as f64,
+            pair.long.entry_volatility_ema_span_hours * 60.0,
         ];
         let spans_short = [
             pair.short.ema_span_0,
             pair.short.ema_span_1,
             pair.short.filter_volume_ema_span as f64,
-            pair.short.filter_log_range_ema_span as f64,
-            pair.short.entry_log_range_ema_span_hours * 60.0,
+            pair.short.filter_volatility_ema_span as f64,
+            pair.short.entry_volatility_ema_span_hours * 60.0,
         ];
         for span in spans_long.iter().chain(spans_short.iter()) {
             if span.is_finite() {

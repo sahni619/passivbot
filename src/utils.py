@@ -13,10 +13,12 @@ from typing import Dict, Any, List, Union, Optional
 import re
 import logging
 from copy import deepcopy
+from pathlib import Path
 from custom_endpoint_overrides import (
     apply_rest_overrides_to_ccxt,
     resolve_custom_endpoint_override,
 )
+from config_transform import record_transform
 
 
 logging.basicConfig(
@@ -28,6 +30,57 @@ logging.basicConfig(
 # In-memory caches for symbol/coin maps with on-disk change detection
 _COIN_TO_SYMBOL_CACHE = {}  # {exchange: {"map": dict, "mtime_ns": int, "size": int}}
 _SYMBOL_TO_COIN_CACHE = {"map": None, "mtime_ns": None, "size": None}
+_SYMBOL_TO_COIN_WARNINGS: set[str] = set()
+_COIN_TO_SYMBOL_FALLBACKS: set[tuple[str, str]] = set()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LEGACY_COINS_FILE_ALIASES = {
+    "approved_coins_topmcap.json": Path("configs/approved_coins.json"),
+    "approved_coins_topmcap.txt": Path("configs/approved_coins.json"),
+}
+
+
+def _resolve_coins_file_path(value: str) -> Optional[Path]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw_path = Path(value.strip())
+    candidates: List[Path] = []
+
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+    else:
+        candidates.extend(
+            [
+                PROJECT_ROOT / raw_path,
+                Path.cwd() / raw_path,
+            ]
+        )
+
+    alias = LEGACY_COINS_FILE_ALIASES.get(raw_path.name)
+    if alias is not None:
+        if not alias.is_absolute():
+            candidates.append(PROJECT_ROOT / alias)
+        else:
+            candidates.append(alias)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            if candidate.name != raw_path.name and raw_path.name in LEGACY_COINS_FILE_ALIASES:
+                try:
+                    rel = candidate.relative_to(PROJECT_ROOT)
+                except ValueError:
+                    rel = candidate
+                logging.warning(
+                    "Resolved legacy coins file '%s' to '%s'. Update your config to the new path.",
+                    raw_path,
+                    rel,
+                )
+            return candidate
+    return None
 
 
 def _require_live_value(config: Dict[str, Any], key: str):
@@ -363,7 +416,12 @@ def filter_markets(markets: dict, exchange: str, verbose=False) -> (dict, dict, 
     return eligible, ineligible, reasons
 
 
-async def load_markets(exchange: str, max_age_ms: int = 1000 * 60 * 60 * 24, verbose=True) -> dict:
+async def load_markets(
+    exchange: str,
+    max_age_ms: int = 1000 * 60 * 60 * 24,
+    verbose=True,
+    cc=None,
+) -> dict:
     """
     Standalone helper to load and cache CCXT markets for a given exchange.
 
@@ -373,7 +431,8 @@ async def load_markets(exchange: str, max_age_ms: int = 1000 * 60 * 60 * 24, ver
 
     Returns a markets dictionary as provided by ccxt.
     """
-    ex = normalize_exchange_name(exchange)
+    # Prefer cc.id when a ccxt instance is supplied, otherwise use the provided exchange string.
+    ex = normalize_exchange_name(getattr(cc, "id", None) or exchange)
     markets_path = os.path.join("caches", ex, "markets.json")
 
     # Try cache first
@@ -390,17 +449,21 @@ async def load_markets(exchange: str, max_age_ms: int = 1000 * 60 * 60 * 24, ver
         logging.error("Error loading %s: %s", markets_path, e)
 
     # Fetch from exchange via ccxt
-    cc = load_ccxt_instance(ex, enable_rate_limit=True)
+    owned_cc = cc is None
+    if owned_cc:
+        cc = load_ccxt_instance(ex, enable_rate_limit=True)
     try:
         markets = await cc.load_markets(True)
     except Exception as e:
         logging.error(f"Error loading markets from {ex}: {e}")
         raise
     finally:
-        try:
-            await cc.close()
-        except Exception:
-            pass
+        # Only close the ccxt client if we created it here.
+        if owned_cc:
+            try:
+                await cc.close()
+            except Exception:
+                pass
 
     # Dump to cache
     try:
@@ -682,21 +745,27 @@ def coin_to_symbol(coin, exchange):
             return candidates[0]
         if loaded:
             # map present but coin missing
-            logging.info(
-                "No mapping for %s (raw=%s) on %s; using fallback %s",
-                coin_sanitized,
-                coin,
-                ex,
-                fallback,
-            )
+            warn_key = (ex, coin_sanitized)
+            if warn_key not in _COIN_TO_SYMBOL_FALLBACKS:
+                logging.warning(
+                    "No mapping for %s (raw=%s) on %s; using fallback %s",
+                    coin_sanitized,
+                    coin,
+                    ex,
+                    fallback,
+                )
+                _COIN_TO_SYMBOL_FALLBACKS.add(warn_key)
         else:
-            logging.info(
-                "coin_to_symbol map for %s missing; using fallback for %s (raw=%s) -> %s",
-                ex,
-                coin_sanitized,
-                coin,
-                fallback,
-            )
+            warn_key = (ex, coin_sanitized)
+            if warn_key not in _COIN_TO_SYMBOL_FALLBACKS:
+                logging.warning(
+                    "coin_to_symbol map for %s missing; using fallback for %s (raw=%s) -> %s",
+                    ex,
+                    coin_sanitized,
+                    coin,
+                    fallback,
+                )
+                _COIN_TO_SYMBOL_FALLBACKS.add(warn_key)
     except Exception as e:
         logging.error(
             "error with coin_to_symbol %s (raw=%s) %s: %s", coin_sanitized, coin, exchange, e
@@ -742,13 +811,37 @@ def symbol_to_coin(symbol, verbose=True):
     if coin:
         msg += f". Using heuristics to guess coin: {coin}"
     if verbose:
-        logging.warning(msg)
+        warn_key = str(symbol)
+        if warn_key not in _SYMBOL_TO_COIN_WARNINGS:
+            logging.warning(msg)
+            _SYMBOL_TO_COIN_WARNINGS.add(warn_key)
     return coin
+
+
+def coin_symbol_warning_counts() -> dict[str, int]:
+    """Return counts of fallback conversions for summary logging."""
+    return {
+        "coin_to_symbol_fallbacks": len(_COIN_TO_SYMBOL_FALLBACKS),
+        "symbol_to_coin_fallbacks": len(_SYMBOL_TO_COIN_WARNINGS),
+    }
+
+
+def _snapshot(value):
+    return deepcopy(value) if isinstance(value, (dict, list)) else value
+
+
+def _diff_snapshot(before, after):
+    if before == after:
+        return None
+    return {"old": _snapshot(before), "new": _snapshot(after)}
 
 
 async def format_approved_ignored_coins(config, exchanges: [str], verbose=True):
     if isinstance(exchanges, str):
         exchanges = [exchanges]
+    before_approved = deepcopy(config.get("live", {}).get("approved_coins"))
+    before_ignored = deepcopy(config.get("live", {}).get("ignored_coins"))
+    before_sources = deepcopy(config.get("_coins_sources", {}))
     coin_sources = config.setdefault("_coins_sources", {})
     approved_source = coin_sources.get("approved_coins", config.get("live", {}).get("approved_coins"))
     if approved_source is None:
@@ -795,6 +888,19 @@ async def format_approved_ignored_coins(config, exchanges: [str], verbose=True):
         pside: [cf for x in ic[pside] if (cf := symbol_to_coin(x))] for pside in ic
     }
 
+    approved_diff = _diff_snapshot(before_approved, config["live"]["approved_coins"])
+    ignored_diff = _diff_snapshot(before_ignored, config["live"]["ignored_coins"])
+    sources_diff = _diff_snapshot(before_sources, config.get("_coins_sources", {}))
+    if approved_diff or ignored_diff or sources_diff:
+        details = {"exchanges": list(exchanges)}
+        if approved_diff:
+            details["approved_coins"] = approved_diff
+        if ignored_diff:
+            details["ignored_coins"] = ignored_diff
+        if sources_diff:
+            details["coin_sources"] = sources_diff
+        record_transform(config, "format_approved_ignored_coins", details)
+
 
 def normalize_coins_source(src):
     """
@@ -827,17 +933,21 @@ def normalize_coins_source(src):
         readable file path, load it with `read_external_coins_lists`.
         Otherwise just return *x* unchanged.
         """
-        if isinstance(x, str) and os.path.exists(x):
-            return read_external_coins_lists(x)
 
-        if (
-            isinstance(x, (list, tuple))
-            and len(x) == 1
-            and isinstance(x[0], str)
-            and os.path.exists(x[0])
-        ):
-            return read_external_coins_lists(x[0])
+        def _maybe_read(path_candidate):
+            resolved = _resolve_coins_file_path(path_candidate)
+            if resolved is not None:
+                return read_external_coins_lists(str(resolved))
+            return None
 
+        if isinstance(x, str):
+            loaded = _maybe_read(x)
+            if loaded is not None:
+                return loaded
+        if isinstance(x, (list, tuple)) and len(x) == 1 and isinstance(x[0], str):
+            loaded = _maybe_read(x[0])
+            if loaded is not None:
+                return loaded
         return x
 
     def _normalize_side(value, side):

@@ -110,7 +110,7 @@ class IdealOrdersBot(Passivbot):
         )
         self._bp_defaults = {
             "entry_grid_double_down_factor": 0.0,
-            "entry_grid_spacing_log_weight": 0.0,
+            "entry_grid_spacing_volatility_weight": 0.0,
             "entry_grid_spacing_we_weight": 0.0,
             "entry_grid_spacing_pct": 0.0,
             "entry_initial_ema_dist": 0.0,
@@ -119,10 +119,10 @@ class IdealOrdersBot(Passivbot):
             "entry_trailing_grid_ratio": 0.0,
             "entry_trailing_retracement_pct": 0.0,
             "entry_trailing_retracement_we_weight": 0.0,
-            "entry_trailing_retracement_log_weight": 0.0,
+            "entry_trailing_retracement_volatility_weight": 0.0,
             "entry_trailing_threshold_pct": 0.0,
             "entry_trailing_threshold_we_weight": 0.0,
-            "entry_trailing_threshold_log_weight": 0.0,
+            "entry_trailing_threshold_volatility_weight": 0.0,
             "wallet_exposure_limit": 1.0,
             "risk_we_excess_allowance_pct": 0.0,
             "close_grid_markup_end": 0.0,
@@ -133,7 +133,7 @@ class IdealOrdersBot(Passivbot):
             "close_trailing_retracement_pct": 0.0,
             "close_trailing_threshold_pct": 0.0,
             "risk_wel_enforcer_threshold": 0.0,
-            "entry_log_range_ema_span_hours": 0.0,
+            "entry_volatility_ema_span_hours": 0.0,
         }
         self._bp_overrides: dict[tuple[str, str, str], float] = {}
         self._bot_value_overrides: dict[tuple[str, str], float] = {}
@@ -255,6 +255,46 @@ async def test_calc_orders_to_cancel_and_create_reconciles_orders(monkeypatch):
     assert [order["custom_id"] for order in to_create] == [
         f"order-0x{pbr.order_type_snake_to_id(new_type):04x}"
     ]
+
+
+@pytest.mark.asyncio
+async def test_order_hysteresis_skips_near_identical_cancel_create(monkeypatch):
+    symbol = "BTC/USDT"
+    bot = OrchestrationBot({symbol: 100.0})
+    bot.register_symbol(symbol)
+    bot._live_values["order_match_tolerance_pct"] = 0.001  # 0.1%
+
+    bot.open_orders[symbol] = [
+        {
+            "symbol": symbol,
+            "side": "buy",
+            "position_side": "long",
+            "qty": 1.0,
+            "price": 100.0,
+            "custom_id": f"order-0x{pbr.order_type_snake_to_id('entry_grid_normal_long'):04x}",
+        }
+    ]
+
+    ideal = {
+        symbol: [
+            _make_order(
+                symbol,
+                "buy",
+                "long",
+                1.0,
+                100.05,  # within 0.1% tolerance, so should not churn
+                "entry_grid_normal_long",
+            )
+        ]
+    }
+
+    async def fake_calc_ideal_orders(self, allow_unstuck=True):
+        return ideal
+
+    bot.calc_ideal_orders = types.MethodType(fake_calc_ideal_orders, bot)
+    to_cancel, to_create = await bot.calc_orders_to_cancel_and_create()
+    assert not to_cancel
+    assert not to_create
 
 
 @pytest.mark.asyncio

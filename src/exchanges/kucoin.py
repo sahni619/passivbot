@@ -20,6 +20,8 @@ import hmac
 import hashlib
 import base64
 
+calc_order_price_diff = pbr.calc_order_price_diff
+
 # ---------------------------------------------------------------------------
 # Broker mixin classes for injecting KC-BROKER-NAME on KuCoin futures requests.
 #
@@ -96,11 +98,13 @@ assert_correct_ccxt_version(ccxt=ccxt_async)
 
 
 class KucoinBot(Passivbot):
+    MAX_OPEN_ORDERS = 150
+
     def __init__(self, config: dict):
         super().__init__(config)
         self.custom_id_max_length = 40
         self.quote = "USDT"
-        self.hedge_mode = False
+        self.hedge_mode = True
 
     def _get_partner_signature(self, timestamp: str) -> str:
         prehash = f"{timestamp}{self.partner}{self.api_key}"
@@ -221,12 +225,24 @@ class KucoinBot(Passivbot):
     async def fetch_open_orders(self, symbol: str = None):
         fetched = None
         open_orders = []
+        page_size = 100
+        current_page = 1
         try:
-            fetched = await self.cca.fetch_open_orders(symbol=symbol)
-            for order in fetched:
-                order["position_side"] = self.determine_pos_side(order)
-                order["qty"] = order["amount"]
-            return sorted(fetched, key=lambda x: x["timestamp"])
+            while True:
+                params = {"pageSize": page_size, "currentPage": current_page}
+                fetched = await self.cca.fetch_open_orders(symbol=symbol, params=params)
+                if not fetched:
+                    break
+                for order in fetched:
+                    order["position_side"] = self.determine_pos_side(order)
+                    order["qty"] = order["amount"]
+                open_orders.extend(fetched)
+                if len(fetched) < page_size:
+                    break
+                if len(open_orders) >= self.MAX_OPEN_ORDERS:
+                    break
+                current_page += 1
+            return sorted(open_orders, key=lambda x: x["timestamp"])
         except Exception as e:
             logging.error(f"error fetching open orders {e}")
             print_async_exception(fetched)
@@ -234,12 +250,9 @@ class KucoinBot(Passivbot):
             return False
 
     async def fetch_positions(self):
-        fetched_positions, fetched_balance = None, None
+        fetched_positions = None
         try:
-            fetched_positions, fetched_balance = await asyncio.gather(
-                self.cca.fetch_positions(),
-                self.cca.fetch_balance(),
-            )
+            fetched_positions = await self.cca.fetch_positions()
             positions = []
             for p in fetched_positions:
                 positions.append(
@@ -253,14 +266,44 @@ class KucoinBot(Passivbot):
                         },
                     }
                 )
-            balance = fetched_balance["info"]["data"]["marginBalance"]
-            return positions, balance
+            return positions
         except Exception as e:
-            logging.error(f"error fetching positions and balance {e}")
+            logging.error(f"error fetching positions {e}")
             print_async_exception(fetched_positions)
+            traceback.print_exc()
+            return False
+
+    async def fetch_balance(self):
+        fetched_balance = None
+        try:
+            fetched_balance = await self.cca.fetch_balance()
+            return fetched_balance["info"]["data"]["marginBalance"]
+        except Exception as e:
+            logging.error(f"error fetching balance {e}")
             print_async_exception(fetched_balance)
             traceback.print_exc()
             return False
+
+    async def calc_ideal_orders(self, allow_unstuck: bool = True):
+        # KuCoin enforces a 150 open-order cap; keep only the closest price targets.
+        ideal_orders = await super().calc_ideal_orders(allow_unstuck=allow_unstuck)
+        flattened = []
+        for symbol, orders in ideal_orders.items():
+            if not orders:
+                continue
+            market_price = await self.cm.get_current_close(symbol, max_age_ms=10_000)
+            for order in orders:
+                price_diff = calc_order_price_diff(order["side"], order["price"], market_price)
+                flattened.append((price_diff, symbol, order))
+        limit = getattr(self, "MAX_OPEN_ORDERS", 150)
+        flattened.sort(key=lambda x: x[0])
+        trimmed = flattened[:limit] if limit and limit > 0 else flattened
+        filtered: dict[str, list] = {symbol: [] for symbol in self.active_symbols}
+        for _, symbol, order in trimmed:
+            filtered.setdefault(symbol, []).append(order)
+        for symbol in ideal_orders:
+            filtered.setdefault(symbol, ideal_orders[symbol])
+        return filtered
 
     async def fetch_tickers(self):
         fetched = None
@@ -456,6 +499,7 @@ class KucoinBot(Passivbot):
             "reduceOnly": order.get("reduce_only", False),
             "marginMode": "CROSS",
             "clientOid": order.get("custom_id", None),
+            "positionSide": order.get("position_side", "").upper(),
         }
 
     def did_cancel_order(self, executed, order=None) -> bool:
@@ -479,6 +523,18 @@ class KucoinBot(Passivbot):
         )
         if verbose:
             logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
+
+    async def update_exchange_config(self):
+        """Ensure account-level settings (hedge mode) are applied."""
+        try:
+            # Hedge mode enabled so both long/short can coexist.
+            if hasattr(self.cca, "set_position_mode"):
+                res = await self.cca.set_position_mode(True)
+                logging.info(f"set_position_mode hedged=True {res}")
+            else:
+                logging.info("set_position_mode not supported by current KuCoin client; continuing")
+        except Exception as e:
+            logging.warning(f"set_position_mode hedged=True not applied: {e}")
 
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call = []

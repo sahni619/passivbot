@@ -1,14 +1,37 @@
+import os
+import sys
+import argparse
+from rust_utils import check_and_maybe_compile
+
+# Perform Rust compilation check before importing any modules that may load the extension
+_rust_parser = argparse.ArgumentParser(add_help=False)
+_rust_parser.add_argument("--skip-rust-compile", action="store_true", help="Skip Rust build check.")
+_rust_parser.add_argument(
+    "--force-rust-compile", action="store_true", help="Force rebuild of Rust extension."
+)
+_rust_parser.add_argument(
+    "--fail-on-stale-rust",
+    action="store_true",
+    help="Abort if Rust extension appears stale instead of attempting rebuild.",
+)
+_rust_known, _rust_remaining = _rust_parser.parse_known_args()
+try:
+    check_and_maybe_compile(
+        skip=_rust_known.skip_rust_compile
+        or os.environ.get("SKIP_RUST_COMPILE", "").lower() in ("1", "true", "yes"),
+        force=_rust_known.force_rust_compile,
+        fail_on_stale=_rust_known.fail_on_stale_rust,
+    )
+except Exception as exc:
+    print(f"Rust extension check failed: {exc}")
+    sys.exit(1)
+# rebuild argv for the real parser without rust flags
+sys.argv = [sys.argv[0]] + _rust_remaining
+
 import numpy as np
 import pandas as pd
-import os
 import json
-import passivbot_rust as pbr
-from tools.event_loop_policy import set_windows_event_loop_policy
-
-# on Windows this will pick the SelectorEventLoopPolicy
-set_windows_event_loop_policy()
 import asyncio
-import argparse
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 from config_utils import (
@@ -22,6 +45,7 @@ from config_utils import (
     require_config_value,
     require_live_value,
     get_optional_config_value,
+    strip_config_metadata,
 )
 from utils import (
     utc_ms,
@@ -36,6 +60,7 @@ from pure_funcs import (
     ts_to_date,
     sort_dict_keys,
     calc_hash,
+    str2bool,
 )
 import pprint
 from copy import deepcopy
@@ -53,12 +78,50 @@ from plotting import (
 )
 from collections import defaultdict
 import logging
-from main import manage_rust_compilation
 import gzip
 import traceback
-
-from logging_setup import configure_logging
+from logging_setup import configure_logging, resolve_log_level
 from suite_runner import extract_suite_config, run_backtest_suite_async
+import passivbot_rust as pbr  # noqa: E402
+from tools.event_loop_policy import set_windows_event_loop_policy
+
+# Fallback stubs for test environments without full extension symbols
+if not hasattr(pbr, "HlcvsBundle"):  # pragma: no cover
+
+    class HlcvsBundle:
+        pass
+
+    pbr.HlcvsBundle = HlcvsBundle  # type: ignore
+
+# on Windows this will pick the SelectorEventLoopPolicy
+set_windows_event_loop_policy()
+
+
+def _looks_like_bool_token(value: str) -> bool:
+    if value is None:
+        return False
+    lowered = value.lower()
+    return lowered in {"1", "0", "true", "false", "t", "f", "yes", "no", "y", "n"}
+
+
+def _normalize_optional_bool_flag(argv: list[str], flag: str) -> list[str]:
+    result: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == flag:
+            next_token = argv[i + 1] if i + 1 < len(argv) else None
+            if (
+                next_token
+                and not next_token.startswith("-")
+                and not _looks_like_bool_token(next_token)
+            ):
+                result.append(f"{flag}=true")
+                i += 1
+                continue
+        result.append(token)
+        i += 1
+    return result
 
 
 def oj(*x):
@@ -161,8 +224,19 @@ def _build_hlcvs_bundle(
     warmup_minutes,
     trade_start_indices,
     requested_start_ts,
-):
+    *,
+    coin_indices: list[int] | None = None,
+) -> pbr.HlcvsBundle:
+    subset_positions = None
+    if coin_indices is not None:
+        if len(coin_indices) != len(coins_order):
+            raise ValueError(
+                f"coin_indices length ({len(coin_indices)}) does not match coins ({len(coins_order)})"
+            )
+        subset_positions = [int(idx) for idx in coin_indices]
     hlcvs_arr = np.ascontiguousarray(hlcvs, dtype=np.float64)
+    if subset_positions is not None:
+        hlcvs_arr = np.ascontiguousarray(hlcvs_arr[:, subset_positions, :], dtype=np.float64)
     btc_arr = np.ascontiguousarray(btc_usd_prices, dtype=np.float64)
     if timestamps is None:
         timestamps_arr = np.arange(hlcvs_arr.shape[0], dtype=np.int64)
@@ -213,6 +287,8 @@ def build_backtest_payload(
     exchange: str,
     btc_usd_prices,
     timestamps=None,
+    *,
+    coin_indices: list[int] | None = None,
 ) -> BacktestPayload:
     """
     Assemble the bundle, bot params, and metadata needed to execute a backtest.
@@ -285,7 +361,11 @@ def build_backtest_payload(
         warmup_minutes,
         trade_start_indices,
         requested_start_ts,
+        coin_indices=coin_indices,
     )
+
+    if coin_indices is not None:
+        backtest_params["active_coin_indices"] = list(range(len(coins_order)))
 
     return BacktestPayload(
         bundle=bundle,
@@ -399,7 +479,7 @@ def process_forager_fills(
     coins,
     hlcvs,
     equities_array,
-    balance_sample_divider: int = 1,
+    balance_sample_divider: int = 60,
 ):
     fdf = pd.DataFrame(
         fills,
@@ -854,6 +934,9 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
             "trade_start_indices": [],
             "global_warmup_bars": 0,
             "metrics_only": False,
+            "filter_by_min_effective_cost": bool(
+                require_config_value(config, "backtest.filter_by_min_effective_cost")
+            ),
         }
     return bot_params_list, exchange_params, backtest_params
 
@@ -890,6 +973,16 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
         "total_wallet_exposure_max",
         "total_wallet_exposure_mean",
         "total_wallet_exposure_median",
+        "entry_initial_balance_pct_long",
+        "entry_initial_balance_pct_short",
+        "adg_pnl",
+        "adg_pnl_w",
+        "mdg_pnl",
+        "mdg_pnl_w",
+        "sharpe_ratio_pnl",
+        "sharpe_ratio_pnl_w",
+        "sortino_ratio_pnl",
+        "sortino_ratio_pnl_w",
     }
 
     result = {}
@@ -950,12 +1043,18 @@ def post_process(
 ):
     sts = utc_ms()
     equities_array = np.asarray(equities_array)
+    balance_sample_divider = get_optional_config_value(config, "backtest.balance_sample_divider", 60)
+    try:
+        balance_sample_divider = int(round(float(balance_sample_divider)))
+    except (TypeError, ValueError):
+        balance_sample_divider = 60
+    balance_sample_divider = max(1, balance_sample_divider)
     fdf, analysis_py, bal_eq = process_forager_fills(
         fills,
         require_config_value(config, f"backtest.coins.{exchange}"),
         hlcvs,
         equities_array,
-        balance_sample_divider=60,
+        balance_sample_divider=balance_sample_divider,
     )
     for k in analysis_py:
         if k not in analysis:
@@ -967,7 +1066,9 @@ def post_process(
     )
     json.dump(analysis, open(f"{results_path}analysis.json", "w"), indent=4, sort_keys=True)
     config["analysis"] = analysis
-    dump_config(format_config(config), f"{results_path}config.json")
+    formatted_config = format_config(config)
+    sanitized_config = strip_config_metadata(formatted_config)
+    dump_config(sanitized_config, f"{results_path}config.json")
     fdf.to_csv(f"{results_path}fills.csv")
     bal_eq.to_csv(oj(results_path, "balance_and_equity.csv.gz"), compression="gzip")
     balance_figs = create_forager_balance_figures(
@@ -998,7 +1099,6 @@ def post_process(
 
 
 async def main():
-    manage_rust_compilation()
     parser = argparse.ArgumentParser(prog="backtest", description="run forager backtest")
     parser.add_argument(
         "config_path", type=str, default=None, nargs="?", help="path to json passivbot config"
@@ -1011,18 +1111,19 @@ async def main():
         help="disable plotting",
     )
     parser.add_argument(
-        "--debug-level",
         "--log-level",
-        dest="debug_level",
-        type=int,
-        choices=[0, 1, 2, 3],
+        dest="log_level",
         default=None,
-        help="Logging verbosity: 0=warnings, 1=info, 2=debug, 3=trace.",
+        help="Logging verbosity (warning, info, debug, trace or 0-3).",
     )
     parser.add_argument(
         "--suite",
-        action="store_true",
-        help="Run all scenarios defined in backtest.suite.",
+        nargs="?",
+        const="true",
+        default=None,
+        type=str2bool,
+        metavar="y/n",
+        help="Enable or disable suite mode (omit to use config).",
     )
     parser.add_argument(
         "--suite-config",
@@ -1030,7 +1131,7 @@ async def main():
         default=None,
         help="Optional config file providing backtest.suite overrides.",
     )
-    template_config = get_template_config("v7")
+    template_config = get_template_config()
     del template_config["optimize"]
     keep_live_keys = {
         "approved_coins",
@@ -1040,10 +1141,14 @@ async def main():
     for key in sorted(template_config["live"]):
         if key not in keep_live_keys:
             del template_config["live"][key]
+    if "logging" in template_config and isinstance(template_config["logging"], dict):
+        template_config["logging"].pop("level", None)
     add_arguments_recursively(parser, template_config)
-    args = parser.parse_args()
-    initial_debug = args.debug_level if args.debug_level is not None else 1
-    configure_logging(debug=initial_debug)
+    raw_args = _normalize_optional_bool_flag(sys.argv[1:], "--suite")
+    args = parser.parse_args(raw_args)
+    cli_log_level = args.log_level
+    initial_log_level = resolve_log_level(cli_log_level, None, fallback=1)
+    configure_logging(debug=initial_log_level)
     if args.config_path is None:
         logging.info(f"loading default template config configs/template.json")
         config = load_config("configs/template.json", verbose=False)
@@ -1052,21 +1157,15 @@ async def main():
         config = load_config(args.config_path)
     update_config_with_args(config, args, verbose=True)
     config = format_config(config, verbose=False)
-    config_logging_level = get_optional_config_value(config, "logging.level", 1)
-    try:
-        config_logging_level = int(float(config_logging_level))
-    except Exception:
-        config_logging_level = 1
-    if args.debug_level is None:
-        effective_debug = max(0, min(config_logging_level, 3))
-        configure_logging(debug=effective_debug)
-    else:
-        effective_debug = max(0, min(int(args.debug_level), 3))
+    config_logging_value = get_optional_config_value(config, "logging.level", None)
+    effective_log_level = resolve_log_level(cli_log_level, config_logging_value, fallback=1)
+    if effective_log_level != initial_log_level:
+        configure_logging(debug=effective_log_level)
     logging_section = config.get("logging")
     if not isinstance(logging_section, dict):
         logging_section = {}
     config["logging"] = logging_section
-    logging_section["level"] = effective_debug
+    logging_section["level"] = effective_log_level
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     config = parse_overrides(config, verbose=True)
 
@@ -1079,8 +1178,8 @@ async def main():
             raise ValueError(f"Suite config {args.suite_config} does not define backtest.suite.")
 
     suite_cfg = extract_suite_config(config, suite_override)
-    if args.suite:
-        suite_cfg["enabled"] = True
+    if args.suite is not None:
+        suite_cfg["enabled"] = bool(args.suite)
 
     if suite_cfg.get("enabled"):
         logging.info("Running backtest suite (%d scenarios)...", len(suite_cfg.get("scenarios", [])))

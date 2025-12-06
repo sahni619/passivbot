@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 
 if sys.platform.startswith("win"):
     # ==== BEGIN fcntl stub for Windows ====
@@ -21,19 +22,45 @@ if sys.platform.startswith("win"):
         sys.modules["fcntl"] = _FcntlStub()
         fcntl = sys.modules["fcntl"]
     # ==== END fcntl stub for Windows ====
-import passivbot_rust as pbr
+
+# Rust extension check before importing compiled module
+from rust_utils import check_and_maybe_compile
+
+_rust_parser = argparse.ArgumentParser(add_help=False)
+_rust_parser.add_argument("--skip-rust-compile", action="store_true", help="Skip Rust build check.")
+_rust_parser.add_argument(
+    "--force-rust-compile", action="store_true", help="Force rebuild of Rust extension."
+)
+_rust_parser.add_argument(
+    "--fail-on-stale-rust",
+    action="store_true",
+    help="Abort if Rust extension appears stale instead of attempting rebuild.",
+)
+_rust_known, _rust_remaining = _rust_parser.parse_known_args()
+try:
+    check_and_maybe_compile(
+        skip=_rust_known.skip_rust_compile
+        or os.environ.get("SKIP_RUST_COMPILE", "").lower() in ("1", "true", "yes"),
+        force=_rust_known.force_rust_compile,
+        fail_on_stale=_rust_known.fail_on_stale_rust,
+    )
+except Exception as exc:
+    print(f"Rust extension check failed: {exc}")
+    sys.exit(1)
+sys.argv = [sys.argv[0]] + _rust_remaining
+
+import passivbot_rust as pbr  # noqa: E402
+from backtest import (
+    prepare_hlcvs_mss,
+    build_backtest_payload,
+    execute_backtest,
+)
 import asyncio
 import argparse
 import multiprocessing
 import signal
 import time
 from collections import defaultdict
-from backtest import (
-    prepare_hlcvs_mss,
-    build_backtest_payload,
-    execute_backtest,
-    expand_analysis,
-)
 from downloader import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
 from config_utils import (
     get_template_config,
@@ -44,27 +71,57 @@ from config_utils import (
     update_config_with_args,
     require_config_value,
     merge_negative_cli_values,
+    strip_config_metadata,
+    get_optional_config_value,
 )
 from pure_funcs import (
     denumpyize,
     sort_dict_keys,
     calc_hash,
     flatten,
+    str2bool,
 )
 from utils import date_to_ts, ts_to_date, utc_ms, make_get_filepath, format_approved_ignored_coins
+from logging_setup import configure_logging, resolve_log_level
 from copy import deepcopy
-from main import manage_rust_compilation
 import numpy as np
 from uuid import uuid4
 import logging
 import traceback
 import json
 import pprint
-from deap import base, creator, tools, algorithms
+
+try:
+    from deap import base, creator, tools, algorithms
+except ImportError:  # pragma: no cover - allow import in minimal test envs
+
+    class _DummyFitness:
+        weights = ()
+
+        def __init__(self, values=()):
+            self.values = values
+
+        def wvalues(self):
+            return self.values
+
+    class _DummyBase:
+        Fitness = _DummyFitness
+
+    class _DummyCreator:
+        def create(self, *args, **kwargs):
+            return None
+
+        def __getattr__(self, name):
+            raise AttributeError
+
+    base = _DummyBase()
+    creator = _DummyCreator()
+    tools = algorithms = None
 import math
 import fcntl
 from optimizer_overrides import optimizer_overrides
 from opt_utils import make_json_serializable, generate_incremental_diff, round_floats
+from limit_utils import expand_limit_checks, compute_limit_violation
 from pareto_store import ParetoStore
 import msgpack
 from typing import Sequence, Tuple, List, Dict, Any
@@ -75,8 +132,13 @@ from optimize_suite import (
     prepare_suite_contexts,
     extract_optimize_suite_config,
 )
-from suite_runner import SuiteScenario, ScenarioResult, aggregate_metrics
-from metrics_schema import build_scenario_metrics, flatten_metric_stats, merge_suite_payload
+from suite_runner import (
+    SuiteScenario,
+    ScenarioResult,
+    aggregate_metrics,
+    build_suite_metrics_payload,
+)
+from metrics_schema import build_scenario_metrics, flatten_metric_stats
 
 
 def _ignore_sigint_in_worker():
@@ -85,6 +147,61 @@ def _ignore_sigint_in_worker():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except (AttributeError, ValueError):
         pass
+
+
+class ConstraintAwareFitness(base.Fitness):
+    constraint_violation: float = 0.0
+
+    def dominates(self, other, obj=slice(None)):
+        self_violation = getattr(self, "constraint_violation", 0.0)
+        other_violation = getattr(other, "constraint_violation", 0.0)
+        if math.isclose(self_violation, other_violation, rel_tol=0.0, abs_tol=1e-12):
+            return super().dominates(other, obj)
+        return self_violation < other_violation
+
+
+def _apply_config_overrides(config: Dict[str, Any], overrides: Dict[str, Any]) -> None:
+    if not overrides:
+        return
+    for dotted_path, value in overrides.items():
+        if not isinstance(dotted_path, str):
+            continue
+        parts = dotted_path.split(".")
+        if not parts:
+            continue
+        target = config
+        for part in parts[:-1]:
+            if part not in target or not isinstance(target[part], dict):
+                target[part] = {}
+            target = target[part]
+        target[parts[-1]] = value
+
+
+_BOOL_LITERALS = {"1", "0", "true", "false", "t", "f", "yes", "no", "y", "n"}
+
+
+def _looks_like_bool_token(value: str) -> bool:
+    return value.lower() in _BOOL_LITERALS
+
+
+def _normalize_optional_bool_flag(argv: list[str], flag: str) -> list[str]:
+    result: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == flag:
+            next_token = argv[i + 1] if i + 1 < len(argv) else None
+            if (
+                next_token
+                and not next_token.startswith("-")
+                and not _looks_like_bool_token(next_token)
+            ):
+                result.append(f"{flag}=true")
+                i += 1
+                continue
+        result.append(token)
+        i += 1
+    return result
 
 
 class ResultRecorder:
@@ -135,23 +252,31 @@ class ResultRecorder:
                 self.results_file.flush()
             except Exception as exc:
                 logging.error(f"Error writing results: {exc}")
+        metrics_block = data.get("metrics", {}) or {}
+        violation = metrics_block.get("constraint_violation")
         try:
             updated = self.store.add_entry(data)
         except Exception as exc:
             logging.error(f"ParetoStore error: {exc}")
         else:
             if updated:
-                objectives_block = data.get("metrics", {}).get("objectives", {})
+                objectives_block = metrics_block.get("objectives", {})
                 objective_values = [
                     objectives_block[key]
                     for key in sorted(objectives_block)
                     if objectives_block.get(key) is not None
                 ]
+                violation_str = (
+                    f" | constraint={pbr.round_dynamic(violation, 3)}"
+                    if isinstance(violation, (int, float))
+                    else ""
+                )
                 logging.info(
-                    "Pareto update | eval=%d | front=%d | objectives=%s",
+                    "Pareto update | eval=%d | front=%d | objectives=%s%s",
                     self.store.n_iters,
                     len(self.store._front),
                     _format_objectives(objective_values),
+                    violation_str,
                 )
 
     def flush(self) -> None:
@@ -221,9 +346,7 @@ def extract_bounds_tuple_list_from_config(config) -> [Bound]:
                 return tuple(sorted([val[0], val[1]]))
         raise Exception(f"malformed bound {key}: {val}")
 
-    template_config = get_template_config(
-        TEMPLATE_CONFIG_MODE
-    )  # single source of truth for key names
+    template_config = get_template_config()
     keys_ignored = get_bound_keys_ignored()
     bounds = []
     for pside in sorted(template_config["bot"]):
@@ -343,7 +466,12 @@ def _record_individual_result(individual, evaluator_config, overrides_list, reco
         if isinstance(bt, dict):
             bt.pop("coins", None)
     if metrics:
+        if "constraint_violation" not in metrics:
+            violation = getattr(individual, "constraint_violation", None)
+            if violation is not None:
+                metrics["constraint_violation"] = violation
         entry["metrics"] = metrics
+    entry = strip_config_metadata(entry)
     recorder.record(entry)
     if hasattr(individual, "evaluation_metrics"):
         del individual.evaluation_metrics
@@ -391,9 +519,35 @@ def ea_mu_plus_lambda_stream(
                     continue
                 for res in ready:
                     idx = pending.pop(res)
-                    fit_values, metrics = res.get()
+                    fit_values, penalty, metrics = res.get()
                     ind = individuals[idx]
                     ind.fitness.values = fit_values
+                    ind.fitness.constraint_violation = penalty
+                    ind.constraint_violation = penalty
+                    if metrics and isinstance(metrics, dict):
+                        suite = metrics.get("suite_metrics", {}) or {}
+                        metric_map = suite.get("metrics", {}) or {}
+                        adg_entry = metric_map.get("adg_pnl", {}) or {}
+                        prh_entry = metric_map.get("peak_recovery_hours_pnl", {}) or {}
+                        logging.debug(
+                            "Eval metrics | idx=%d adg_pnl=%s peak_recovery_hours_pnl=%s",
+                            idx,
+                            adg_entry.get("aggregated"),
+                            prh_entry.get("aggregated"),
+                        )
+                        scenario_labels = suite.get("scenario_labels") or []
+                        if not scenario_labels and isinstance(adg_entry, dict):
+                            scenario_labels = list((adg_entry.get("scenarios") or {}).keys())
+                        for label in scenario_labels:
+                            adg_val = (adg_entry.get("scenarios") or {}).get(label)
+                            prh_val = (prh_entry.get("scenarios") or {}).get(label)
+                            logging.debug(
+                                "Eval metrics scenario | idx=%d label=%s adg_pnl=%s peak_recovery_hours_pnl=%s",
+                                idx,
+                                label,
+                                adg_val,
+                                prh_val,
+                            )
                     if metrics is not None:
                         ind.evaluation_metrics = metrics
                         _record_individual_result(ind, evaluator_config, overrides_list, recorder)
@@ -470,6 +624,13 @@ def ea_mu_plus_lambda_stream(
     record = stats.compile(population) if stats is not None else {}
     logbook.record(gen=0, nevals=nevals, **record)
     log_generation(0, nevals, record)
+
+    if len(population) < 2:
+        logging.warning(
+            "Population too small for crossover/mutation (size=%d); skipping evolution steps",
+            len(population),
+        )
+        return population, logbook
 
     for gen in range(1, ngen + 1):
         offspring = algorithms.varOr(population, toolbox, lambda_, cxpb, mutpb)
@@ -579,10 +740,19 @@ class Evaluator:
 
         shared_metric_weights = {
             "positions_held_per_day": 1.0,
+            "positions_held_per_day_w": 1.0,
             "position_held_hours_mean": 1.0,
             "position_held_hours_max": 1.0,
             "position_held_hours_median": 1.0,
             "position_unchanged_hours_max": 1.0,
+            "adg_pnl": -1.0,
+            "adg_pnl_w": -1.0,
+            "mdg_pnl": -1.0,
+            "mdg_pnl_w": -1.0,
+            "sharpe_ratio_pnl": -1.0,
+            "sharpe_ratio_pnl_w": -1.0,
+            "sortino_ratio_pnl": -1.0,
+            "sortino_ratio_pnl_w": -1.0,
         }
 
         currency_metric_weights = {
@@ -632,6 +802,8 @@ class Evaluator:
             "total_wallet_exposure_median": 1.0,
             "volume_pct_per_day_avg": -1.0,
             "volume_pct_per_day_avg_w": -1.0,
+            "entry_initial_balance_pct_long": -1.0,
+            "entry_initial_balance_pct_short": -1.0,
         }
 
         self.scoring_weights = {}
@@ -742,7 +914,11 @@ class Evaluator:
         config = individual_to_config(individual, optimizer_overrides, overrides_list, self.config)
         individual_hash = calc_hash(individual)
         if individual_hash in self.seen_hashes:
-            existing_score = self.seen_hashes[individual_hash]
+            existing_entry = self.seen_hashes[individual_hash]
+            existing_score = None
+            existing_penalty = 0.0
+            if existing_entry is not None:
+                existing_score, existing_penalty = existing_entry
             self.duplicate_counter["total"] += 1
             perturbation_funcs = [
                 self.perturb_x_pct,
@@ -767,7 +943,7 @@ class Evaluator:
             else:
                 if existing_score is not None:
                     self.duplicate_counter["reused"] += 1
-                    return tuple(existing_score), None
+                    return tuple(existing_score), existing_penalty, None
         else:
             self.seen_hashes[individual_hash] = None
         analyses = {}
@@ -790,115 +966,104 @@ class Evaluator:
         scenario_metrics = build_scenario_metrics(analyses)
         aggregate_stats = scenario_metrics.get("stats", {})
         flat_stats = flatten_metric_stats(aggregate_stats)
-        objectives = self.calc_fitness(flat_stats)
+        objectives, total_penalty = self.calc_fitness(flat_stats)
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
         metrics_payload = {
             "stats": aggregate_stats,
             "objectives": objectives_map,
+            "constraint_violation": total_penalty,
         }
         individual.evaluation_metrics = metrics_payload
         actual_hash = calc_hash(individual)
-        self.seen_hashes[actual_hash] = tuple(objectives)
-        return tuple(objectives), metrics_payload
+        self.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
+        return tuple(objectives), total_penalty, metrics_payload
 
     def build_limit_checks(self):
-        self.limit_checks = []
-        limits = self.config["optimize"].get("limits", {})
-        scoring_weights = self.scoring_weights
-
-        for i, full_key in enumerate(sorted(limits)):
-            bound = limits[full_key]
-
-            if full_key.startswith("penalize_if_greater_than_"):
-                metric = full_key[len("penalize_if_greater_than_") :]
-                penalize_if = "greater"
-            elif full_key.startswith("penalize_if_lower_than_"):
-                metric = full_key[len("penalize_if_lower_than_") :]
-                penalize_if = "lower"
-            else:
-                # Fallback for scoring_weight-based logic
-                metric = full_key
-                weight = scoring_weights.get(metric)
-                if weight is None:
-                    continue
-                penalize_if = "lower" if weight < 0 else "greater"
-            suffix = "min" if penalize_if == "lower" else "max"
-
-            self.limit_checks.append(
-                {
-                    "metric_key": f"{metric}_{suffix}",
-                    "penalize_if": penalize_if,
-                    "bound": bound,
-                    "penalty_weight": 1e6,
-                }
-            )
+        limits = self.config["optimize"].get("limits", [])
+        objective_index_map: Dict[str, List[int]] = {}
+        for idx, metric in enumerate(self.config["optimize"].get("scoring", [])):
+            objective_index_map.setdefault(metric, []).append(idx)
+        self.limit_checks = expand_limit_checks(
+            limits,
+            self.scoring_weights,
+            penalty_weight=1e6,
+            objective_index_map=objective_index_map,
+        )
 
     def calc_fitness(self, analyses_combined):
-        modifier = 0.0
+        scoring_keys = self.config["optimize"]["scoring"]
+        per_objective_modifier = [0.0] * len(scoring_keys)
+        global_modifier = 0.0
         for check in self.limit_checks:
             val = analyses_combined.get(check["metric_key"])
-            if val is None:
+            penalty = compute_limit_violation(check, val)
+            if not penalty:
+                continue
+            targets = check.get("objective_indexes") or []
+            if targets:
+                for idx in targets:
+                    if 0 <= idx < len(per_objective_modifier):
+                        per_objective_modifier[idx] += penalty
+            else:
+                global_modifier += penalty
+
+        total_penalty = global_modifier + sum(per_objective_modifier)
+        scores = []
+        for idx, sk in enumerate(scoring_keys):
+            penalty_total = global_modifier + per_objective_modifier[idx]
+            if penalty_total:
+                scores.append(penalty_total)
                 continue
 
-            if check["penalize_if"] == "greater" and val > check["bound"]:
-                modifier += (val - check["bound"]) * (check["penalty_weight"])
-            elif check["penalize_if"] == "lower" and val < check["bound"]:
-                modifier += (check["bound"] - val) * (check["penalty_weight"])
-
-        scores = []
-        for sk in self.config["optimize"]["scoring"]:
-            if modifier:
-                scores.append(modifier)
+            parts = sk.split("_")
+            candidates = []
+            if len(parts) <= 1:
+                candidates = [sk]
             else:
-                parts = sk.split("_")
-                candidates = []
-                if len(parts) <= 1:
-                    candidates = [sk]
-                else:
-                    base, rest = parts[0], parts[1:]
-                    base_candidate = "_".join([base, *rest])
-                    candidates.append(base_candidate)
-                    for perm in permutations(rest):
-                        candidate = "_".join([base, *perm])
-                        candidates.append(candidate)
+                base, rest = parts[0], parts[1:]
+                base_candidate = "_".join([base, *rest])
+                candidates.append(base_candidate)
+                for perm in permutations(rest):
+                    candidate = "_".join([base, *perm])
+                    candidates.append(candidate)
 
-                extended_candidates = []
-                seen = set()
-                for candidate in candidates:
-                    if candidate not in seen:
-                        extended_candidates.append(candidate)
-                        seen.add(candidate)
-                    for suffix in ("usd", "btc"):
-                        with_suffix = f"{candidate}_{suffix}"
-                        if with_suffix not in seen:
-                            extended_candidates.append(with_suffix)
-                            seen.add(with_suffix)
-                        parts_candidate = candidate.split("_")
-                        if len(parts_candidate) >= 2:
-                            inserted = "_".join(parts_candidate[:-1] + [suffix, parts_candidate[-1]])
-                            if inserted not in seen:
-                                extended_candidates.append(inserted)
-                                seen.add(inserted)
+            extended_candidates = []
+            seen = set()
+            for candidate in candidates:
+                if candidate not in seen:
+                    extended_candidates.append(candidate)
+                    seen.add(candidate)
+                for suffix in ("usd", "btc"):
+                    with_suffix = f"{candidate}_{suffix}"
+                    if with_suffix not in seen:
+                        extended_candidates.append(with_suffix)
+                        seen.add(with_suffix)
+                    parts_candidate = candidate.split("_")
+                    if len(parts_candidate) >= 2:
+                        inserted = "_".join(parts_candidate[:-1] + [suffix, parts_candidate[-1]])
+                        if inserted not in seen:
+                            extended_candidates.append(inserted)
+                            seen.add(inserted)
 
-                val = None
-                weight = None
-                selected_metric = None
-                for candidate in extended_candidates:
-                    metric_key = f"{candidate}_mean"
-                    if val is None and metric_key in analyses_combined:
-                        val = analyses_combined[metric_key]
-                        selected_metric = candidate
-                    if weight is None and candidate in self.scoring_weights:
-                        weight = self.scoring_weights[candidate]
-                    if val is not None and weight is not None:
-                        break
+            val = None
+            weight = None
+            selected_metric = None
+            for candidate in extended_candidates:
+                metric_key = f"{candidate}_mean"
+                if val is None and metric_key in analyses_combined:
+                    val = analyses_combined[metric_key]
+                    selected_metric = candidate
+                if weight is None and candidate in self.scoring_weights:
+                    weight = self.scoring_weights[candidate]
+                if val is not None and weight is not None:
+                    break
 
-                if val is None:
-                    val = 0
-                if weight is None:
-                    weight = 1.0
-                scores.append(val * weight)
-        return tuple(scores)
+            if val is None:
+                val = 0
+            if weight is None:
+                weight = 1.0
+            scores.append(val * weight)
+        return tuple(scores), total_penalty
 
     def __del__(self):
         for attachment_map in self._attachments.values():
@@ -954,7 +1119,11 @@ class SuiteEvaluator:
         duplicate_counter = self.base.duplicate_counter
 
         if individual_hash in seen_hashes:
-            existing_score = seen_hashes[individual_hash]
+            existing_entry = seen_hashes[individual_hash]
+            existing_score = None
+            existing_penalty = 0.0
+            if existing_entry is not None:
+                existing_score, existing_penalty = existing_entry
             duplicate_counter["total"] += 1
             perturbation_funcs = [
                 self.base.perturb_x_pct,
@@ -979,11 +1148,10 @@ class SuiteEvaluator:
             else:
                 if existing_score is not None:
                     duplicate_counter["reused"] += 1
-                    return tuple(existing_score), None
+                    return tuple(existing_score), existing_penalty, None
         else:
             seen_hashes[individual_hash] = None
 
-        per_scenario_metrics: Dict[str, Dict[str, Any]] = {}
         scenario_results: List[ScenarioResult] = []
 
         from tools.iterative_backtester import combine_analyses as combine
@@ -1003,11 +1171,21 @@ class SuiteEvaluator:
             scenario_config["live"]["ignored_coins"] = deepcopy(
                 ctx.config["live"].get("ignored_coins", {})
             )
+            logging.debug(
+                "Optimizer scenario %s | start=%s end=%s coins=%s",
+                ctx.label,
+                scenario_config["backtest"].get("start_date"),
+                scenario_config["backtest"].get("end_date"),
+                list(scenario_config["backtest"]["coins"].keys()),
+            )
+            if ctx.overrides:
+                _apply_config_overrides(scenario_config, ctx.overrides)
             scenario_config["disable_plotting"] = True
 
             analyses = {}
             for exchange in ctx.exchanges:
                 self._ensure_context_attachment(ctx, exchange)
+                coin_indices = ctx.coin_indices.get(exchange)
                 payload = build_backtest_payload(
                     ctx.shared_hlcvs_np[exchange],
                     ctx.msss[exchange],
@@ -1015,6 +1193,7 @@ class SuiteEvaluator:
                     exchange,
                     ctx.shared_btc_np.get(exchange),
                     ctx.timestamps.get(exchange),
+                    coin_indices=coin_indices,
                 )
                 fills, equities_array, analysis = execute_backtest(payload, scenario_config)
                 analyses[exchange] = analysis
@@ -1022,7 +1201,21 @@ class SuiteEvaluator:
                 del equities_array
 
             combined_metrics = combine(analyses)
-            per_scenario_metrics[ctx.label] = combined_metrics
+            stats = combined_metrics.get("stats", {})
+            logging.debug(
+                "Scenario metrics | label=%s adg_pnl=%s peak_recovery_hours_pnl=%s",
+                ctx.label,
+                (
+                    stats.get("adg_pnl", {}).get("mean")
+                    if isinstance(stats.get("adg_pnl"), dict)
+                    else stats.get("adg_pnl")
+                ),
+                (
+                    stats.get("peak_recovery_hours_pnl", {}).get("mean")
+                    if isinstance(stats.get("peak_recovery_hours_pnl"), dict)
+                    else stats.get("peak_recovery_hours_pnl")
+                ),
+            )
             scenario_results.append(
                 ScenarioResult(
                     scenario=SuiteScenario(
@@ -1040,26 +1233,23 @@ class SuiteEvaluator:
             )
 
         aggregate_summary = aggregate_metrics(scenario_results, self.aggregate_cfg)
-        suite_payload = merge_suite_payload(
-            aggregate_summary.get("stats", {}),
-            aggregate_values=aggregate_summary.get("aggregated", {}),
-            scenario_labels=list(per_scenario_metrics.keys()),
-        )
+        suite_payload = build_suite_metrics_payload(scenario_results, aggregate_summary)
         aggregate_stats = aggregate_summary.get("stats", {})
 
         flat_stats = flatten_metric_stats(aggregate_stats)
-        objectives = self.base.calc_fitness(flat_stats)
+        objectives, total_penalty = self.base.calc_fitness(flat_stats)
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
 
         metrics_payload = {
             "objectives": objectives_map,
             "suite_metrics": suite_payload,
+            "constraint_violation": total_penalty,
         }
 
         individual.evaluation_metrics = metrics_payload
         actual_hash = calc_hash(individual)
-        self.base.seen_hashes[actual_hash] = tuple(objectives)
-        return tuple(objectives), metrics_payload
+        self.base.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
+        return tuple(objectives), total_penalty, metrics_payload
 
     def __del__(self):
         for ctx in self.contexts:
@@ -1103,17 +1293,30 @@ def apply_fine_tune_bounds(
     fine_tune_params: list[str],
     cli_overridden_bounds: set[str],
 ) -> None:
-    if not fine_tune_params and not cli_overridden_bounds:
-        return
-
     bounds = config.get("optimize", {}).get("bounds", {})
     bot_cfg = config.get("bot", {})
+    # First, normalize any CLI overrides such that single values mean fixed bounds
+    for key in cli_overridden_bounds:
+        if key not in bounds:
+            continue
+        raw_val = bounds[key]
+        if isinstance(raw_val, (list, tuple)):
+            if len(raw_val) == 1:
+                bounds[key] = [float(raw_val[0]), float(raw_val[0])]
+        else:
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                continue
+            bounds[key] = [val, val]
+
+    if not fine_tune_params:
+        return
+
     fine_tune_set = set(fine_tune_params)
 
     for key in list(bounds.keys()):
         if key in fine_tune_set:
-            continue
-        if key in cli_overridden_bounds:
             continue
         try:
             pside, param = key.split("_", 1)
@@ -1178,33 +1381,37 @@ def get_starting_configs(starting_configs: str):
 
 
 def configs_to_individuals(cfgs, bounds, sig_digits=0):
-    inds = {}
+    inds = set()
     for cfg in cfgs:
         try:
             fcfg = format_config(cfg, verbose=False)
             individual = config_to_individual(fcfg, bounds, sig_digits)
-            inds[calc_hash(individual)] = individual
+            inds.add(tuple(individual))
             # add duplicate of config, but with lowered total wallet exposure limit
             fcfg2 = deepcopy(fcfg)
             for pside in ["long", "short"]:
-                fcfg2["bot"][pside]["total_wallet_exposure_limit"] *= 0.75
+                value = fcfg2["bot"][pside]["total_wallet_exposure_limit"] * 0.75
+                fcfg2["bot"][pside]["total_wallet_exposure_limit"] = value
             individual2 = config_to_individual(fcfg2, bounds, sig_digits)
-            inds[calc_hash(individual2)] = individual2
+            inds.add(tuple(individual2))
         except Exception as e:
             logging.error(f"error loading starting config: {e}")
-    return list(inds.values())
+    return list(inds)
 
 
 async def main():
-    manage_rust_compilation()
     parser = argparse.ArgumentParser(prog="optimize", description="run optimizer")
     parser.add_argument(
         "config_path", type=str, default=None, nargs="?", help="path to json passivbot config"
     )
     parser.add_argument(
         "--suite",
-        action="store_true",
-        help="Evaluate candidates across the scenarios defined in optimize.suite.",
+        nargs="?",
+        const="true",
+        default=None,
+        type=str2bool,
+        metavar="y/n",
+        help="Enable or disable optimize.suite (omit to follow config).",
     )
     parser.add_argument(
         "--suite-config",
@@ -1212,7 +1419,13 @@ async def main():
         default=None,
         help="Optional config file providing optimize.suite overrides.",
     )
-    template_config = get_template_config(TEMPLATE_CONFIG_MODE)
+    parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        default=None,
+        help="Logging verbosity (warning, info, debug, trace or 0-3).",
+    )
+    template_config = get_template_config()
     del template_config["bot"]
     keep_live_keys = {
         "approved_coins",
@@ -1224,7 +1437,10 @@ async def main():
     add_arguments_recursively(parser, template_config)
     add_extra_options(parser)
     raw_args = merge_negative_cli_values(sys.argv[1:])
+    raw_args = _normalize_optional_bool_flag(raw_args, "--suite")
     args = parser.parse_args(raw_args)
+    initial_log_level = resolve_log_level(args.log_level, None, fallback=1)
+    configure_logging(debug=initial_log_level)
     if args.config_path is None:
         logging.info(f"loading default template config configs/template.json")
         config = load_config("configs/template.json", verbose=True)
@@ -1233,6 +1449,10 @@ async def main():
         config = load_config(args.config_path, verbose=True)
     update_config_with_args(config, args, verbose=True)
     config = format_config(config, verbose=False)
+    config_logging_value = get_optional_config_value(config, "logging.level", None)
+    effective_log_level = resolve_log_level(args.log_level, config_logging_value, fallback=1)
+    if effective_log_level != initial_log_level:
+        configure_logging(debug=effective_log_level)
     logging.info(
         "Config normalized for optimization | template=%s | scoring=%s",
         TEMPLATE_CONFIG_MODE,
@@ -1263,8 +1483,8 @@ async def main():
         if suite_override is None:
             raise ValueError(f"Suite config {args.suite_config} must define optimize.suite.")
     suite_cfg = extract_optimize_suite_config(config, suite_override)
-    if args.suite:
-        suite_cfg["enabled"] = True
+    if args.suite is not None:
+        suite_cfg["enabled"] = bool(args.suite)
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     await format_approved_ignored_coins(config, backtest_exchanges)
     interrupted = False
@@ -1416,8 +1636,12 @@ async def main():
         )
 
         n_objectives = len(config["optimize"]["scoring"])
-        creator.create("FitnessMulti", base.Fitness, weights=(-1.0,) * n_objectives)
-        creator.create("Individual", list, fitness=creator.FitnessMulti)
+        if not hasattr(creator, "FitnessMulti"):
+            creator.create("FitnessMulti", ConstraintAwareFitness, weights=(-1.0,) * n_objectives)
+        else:
+            creator.FitnessMulti.weights = (-1.0,) * n_objectives
+        if not hasattr(creator, "Individual"):
+            creator.create("Individual", list, fitness=creator.FitnessMulti)
 
         toolbox = base.Toolbox()
 
@@ -1474,6 +1698,7 @@ async def main():
         def _evaluate_initial(individuals):
             if not individuals:
                 return 0
+            total = len(individuals)
             pending = {}
             for ind in individuals:
                 pending[pool.apply_async(toolbox.evaluate, (ind,))] = ind
@@ -1486,8 +1711,10 @@ async def main():
                         continue
                     for res in ready:
                         ind = pending.pop(res)
-                        fit_values, metrics = res.get()
+                        fit_values, penalty, metrics = res.get()
                         ind.fitness.values = fit_values
+                        ind.fitness.constraint_violation = penalty
+                        ind.constraint_violation = penalty
                         if metrics is not None:
                             ind.evaluation_metrics = metrics
                             _record_individual_result(
@@ -1499,6 +1726,7 @@ async def main():
                         elif hasattr(ind, "evaluation_metrics"):
                             delattr(ind, "evaluation_metrics")
                         completed += 1
+                        logging.info("Evaluated %d/%d starting configs", completed, total)
             except KeyboardInterrupt:
                 logging.info("Evaluation interrupted; terminating pending starting configs...")
                 for res in pending:
@@ -1616,7 +1844,7 @@ async def main():
             except Exception:
                 logging.exception("Failed to flush recorder")
             recorder.close()
-        if "pool" in locals():
+        if "pool" in locals() and pool is not None:
             if pool_terminated or interrupted:
                 logging.info("Joining terminated worker pool...")
             else:

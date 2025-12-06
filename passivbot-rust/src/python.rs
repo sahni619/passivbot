@@ -694,8 +694,8 @@ fn run_backtest_core<'py>(
     let backtest_params = backtest_params_from_dict(backtest_params_dict.as_gil_ref())?;
     let metrics_only = backtest_params.metrics_only;
     let mut backtest = Backtest::new(
-        &hlcvs_rust,
-        &btc_usd_rust,
+        hlcvs_rust,
+        btc_usd_rust,
         bot_params_vec,
         exchange_params,
         &backtest_params,
@@ -704,12 +704,17 @@ fn run_backtest_core<'py>(
     // Run the backtest and process results
     Python::with_gil(|py| {
         let (fills, equities) = backtest.run();
-        let (analysis_usd, analysis_btc) = analyze_backtest_pair(
+        let (entry_pct_long, entry_pct_short) = backtest.initial_entry_balance_pct();
+        let (mut analysis_usd, mut analysis_btc) = analyze_backtest_pair(
             &fills,
             &equities,
             backtest.balance.use_btc_collateral,
             &backtest.total_wallet_exposures,
         );
+        analysis_usd.entry_initial_balance_pct_long = entry_pct_long;
+        analysis_usd.entry_initial_balance_pct_short = entry_pct_short;
+        analysis_btc.entry_initial_balance_pct_long = entry_pct_long;
+        analysis_btc.entry_initial_balance_pct_short = entry_pct_short;
 
         // Create a dictionary to store analysis results using a more concise approach
         let py_analysis_usd = struct_to_py_dict(py, &analysis_usd)?;
@@ -784,6 +789,10 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
         starting_balance: extract_value(dict, "starting_balance").unwrap_or_default(),
         maker_fee: extract_value(dict, "maker_fee").unwrap_or_default(),
         coins: extract_value(dict, "coins").unwrap_or_default(),
+        active_coin_indices: dict
+            .get_item("active_coin_indices")?
+            .map(|item| item.extract::<Vec<usize>>())
+            .transpose()?,
         // First timestamp (ms); default to 0 if not provided
         first_timestamp_ms: extract_value(dict, "first_timestamp_ms").unwrap_or(0u64),
         requested_start_timestamp_ms: extract_value(dict, "requested_start_timestamp_ms")
@@ -816,6 +825,11 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
         },
         metrics_only: dict
             .get_item("metrics_only")?
+            .map(|item| item.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false),
+        filter_by_min_effective_cost: dict
+            .get_item("filter_by_min_effective_cost")?
             .map(|item| item.extract::<bool>())
             .transpose()?
             .unwrap_or(false),
@@ -880,10 +894,17 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         close_trailing_qty_pct: extract_value(dict, "close_trailing_qty_pct")?,
         close_trailing_threshold_pct: extract_value(dict, "close_trailing_threshold_pct")?,
         entry_grid_double_down_factor: extract_value(dict, "entry_grid_double_down_factor")?,
-        entry_grid_spacing_log_weight: extract_value(dict, "entry_grid_spacing_log_weight")?,
+        entry_grid_spacing_volatility_weight: extract_value(
+            dict,
+            "entry_grid_spacing_volatility_weight",
+        )?,
         entry_grid_spacing_we_weight: extract_grid_spacing_we_weight(dict)?,
         entry_grid_spacing_pct: extract_value(dict, "entry_grid_spacing_pct")?,
-        entry_log_range_ema_span_hours: extract_value(dict, "entry_log_range_ema_span_hours")?,
+        entry_volatility_ema_span_hours: extract_value_with_fallback(
+            dict,
+            "entry_volatility_ema_span_hours",
+            "entry_log_range_ema_span_hours",
+        )?,
         entry_initial_ema_dist: extract_value(dict, "entry_initial_ema_dist")?,
         entry_initial_qty_pct: extract_value(dict, "entry_initial_qty_pct")?,
         entry_trailing_double_down_factor: extract_value(
@@ -895,9 +916,9 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
             dict,
             "entry_trailing_retracement_we_weight",
         )?,
-        entry_trailing_retracement_log_weight: extract_value(
+        entry_trailing_retracement_volatility_weight: extract_value(
             dict,
-            "entry_trailing_retracement_log_weight",
+            "entry_trailing_retracement_volatility_weight",
         )?,
         entry_trailing_grid_ratio: extract_value(dict, "entry_trailing_grid_ratio")?,
         entry_trailing_threshold_pct: extract_value(dict, "entry_trailing_threshold_pct")?,
@@ -905,13 +926,18 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
             dict,
             "entry_trailing_threshold_we_weight",
         )?,
-        entry_trailing_threshold_log_weight: extract_value(
+        entry_trailing_threshold_volatility_weight: extract_value(
             dict,
-            "entry_trailing_threshold_log_weight",
+            "entry_trailing_threshold_volatility_weight",
         )?,
-        filter_log_range_ema_span: extract_value(dict, "filter_log_range_ema_span")?,
+        filter_volatility_ema_span: extract_value_with_fallback(
+            dict,
+            "filter_volatility_ema_span",
+            "filter_log_range_ema_span",
+        )?,
         filter_volume_ema_span: extract_value(dict, "filter_volume_ema_span")?,
         filter_volume_drop_pct: extract_value(dict, "filter_volume_drop_pct")?,
+        filter_volatility_drop_pct: extract_value(dict, "filter_volatility_drop_pct")?,
         ema_span_0: extract_value(dict, "ema_span_0")?,
         ema_span_1: extract_value(dict, "ema_span_1")?,
         n_positions,
@@ -941,6 +967,23 @@ fn extract_value<'a, T: pyo3::FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> 
         .and_then(pyo3::FromPyObject::extract)
 }
 
+fn extract_value_with_fallback<'a, T: pyo3::FromPyObject<'a>>(
+    dict: &'a PyDict,
+    primary: &str,
+    fallback: &str,
+) -> PyResult<T> {
+    if let Some(item) = dict.get_item(primary)? {
+        return item.extract::<T>();
+    }
+    if let Some(item) = dict.get_item(fallback)? {
+        return item.extract::<T>();
+    }
+    Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+        "Keys '{}' or '{}' not found",
+        primary, fallback
+    )))
+}
+
 #[pyfunction]
 pub fn calc_next_entry_long_py(
     qty_step: f64,
@@ -949,7 +992,7 @@ pub fn calc_next_entry_long_py(
     min_cost: f64,
     c_mult: f64,
     entry_grid_double_down_factor: f64,
-    entry_grid_spacing_log_weight: f64,
+    entry_grid_spacing_volatility_weight: f64,
     entry_grid_spacing_we_weight: f64,
     entry_grid_spacing_pct: f64,
     entry_initial_ema_dist: f64,
@@ -958,10 +1001,10 @@ pub fn calc_next_entry_long_py(
     entry_trailing_grid_ratio: f64,
     entry_trailing_retracement_pct: f64,
     entry_trailing_retracement_we_weight: f64,
-    entry_trailing_retracement_log_weight: f64,
+    entry_trailing_retracement_volatility_weight: f64,
     entry_trailing_threshold_pct: f64,
     entry_trailing_threshold_we_weight: f64,
-    entry_trailing_threshold_log_weight: f64,
+    entry_trailing_threshold_volatility_weight: f64,
     wallet_exposure_limit: f64,
     risk_we_excess_allowance_pct: f64,
     balance: f64,
@@ -997,7 +1040,7 @@ pub fn calc_next_entry_long_py(
     };
     let bot_params = BotParams {
         entry_grid_double_down_factor,
-        entry_grid_spacing_log_weight,
+        entry_grid_spacing_volatility_weight,
         entry_grid_spacing_we_weight,
         entry_grid_spacing_pct,
         entry_initial_ema_dist,
@@ -1006,10 +1049,10 @@ pub fn calc_next_entry_long_py(
         entry_trailing_grid_ratio,
         entry_trailing_retracement_pct,
         entry_trailing_retracement_we_weight,
-        entry_trailing_retracement_log_weight,
+        entry_trailing_retracement_volatility_weight,
         entry_trailing_threshold_pct,
         entry_trailing_threshold_we_weight,
-        entry_trailing_threshold_log_weight,
+        entry_trailing_threshold_volatility_weight,
         wallet_exposure_limit,
         risk_we_excess_allowance_pct,
         ..Default::default()
@@ -1125,7 +1168,7 @@ pub fn calc_next_entry_short_py(
     min_cost: f64,
     c_mult: f64,
     entry_grid_double_down_factor: f64,
-    entry_grid_spacing_log_weight: f64,
+    entry_grid_spacing_volatility_weight: f64,
     entry_grid_spacing_we_weight: f64,
     entry_grid_spacing_pct: f64,
     entry_initial_ema_dist: f64,
@@ -1134,10 +1177,10 @@ pub fn calc_next_entry_short_py(
     entry_trailing_grid_ratio: f64,
     entry_trailing_retracement_pct: f64,
     entry_trailing_retracement_we_weight: f64,
-    entry_trailing_retracement_log_weight: f64,
+    entry_trailing_retracement_volatility_weight: f64,
     entry_trailing_threshold_pct: f64,
     entry_trailing_threshold_we_weight: f64,
-    entry_trailing_threshold_log_weight: f64,
+    entry_trailing_threshold_volatility_weight: f64,
     wallet_exposure_limit: f64,
     risk_we_excess_allowance_pct: f64,
     balance: f64,
@@ -1173,7 +1216,7 @@ pub fn calc_next_entry_short_py(
     };
     let bot_params = BotParams {
         entry_grid_double_down_factor,
-        entry_grid_spacing_log_weight,
+        entry_grid_spacing_volatility_weight,
         entry_grid_spacing_we_weight,
         entry_grid_spacing_pct,
         entry_initial_ema_dist,
@@ -1182,10 +1225,10 @@ pub fn calc_next_entry_short_py(
         entry_trailing_grid_ratio,
         entry_trailing_retracement_pct,
         entry_trailing_retracement_we_weight,
-        entry_trailing_retracement_log_weight,
+        entry_trailing_retracement_volatility_weight,
         entry_trailing_threshold_pct,
         entry_trailing_threshold_we_weight,
-        entry_trailing_threshold_log_weight,
+        entry_trailing_threshold_volatility_weight,
         wallet_exposure_limit,
         risk_we_excess_allowance_pct,
         ..Default::default()
@@ -1301,7 +1344,7 @@ pub fn calc_entries_long_py(
     min_cost: f64,
     c_mult: f64,
     entry_grid_double_down_factor: f64,
-    entry_grid_spacing_log_weight: f64,
+    entry_grid_spacing_volatility_weight: f64,
     entry_grid_spacing_we_weight: f64,
     entry_grid_spacing_pct: f64,
     entry_initial_ema_dist: f64,
@@ -1310,10 +1353,10 @@ pub fn calc_entries_long_py(
     entry_trailing_grid_ratio: f64,
     entry_trailing_retracement_pct: f64,
     entry_trailing_retracement_we_weight: f64,
-    entry_trailing_retracement_log_weight: f64,
+    entry_trailing_retracement_volatility_weight: f64,
     entry_trailing_threshold_pct: f64,
     entry_trailing_threshold_we_weight: f64,
-    entry_trailing_threshold_log_weight: f64,
+    entry_trailing_threshold_volatility_weight: f64,
     wallet_exposure_limit: f64,
     risk_we_excess_allowance_pct: f64,
     balance: f64,
@@ -1351,7 +1394,7 @@ pub fn calc_entries_long_py(
 
     let bot_params = BotParams {
         entry_grid_double_down_factor,
-        entry_grid_spacing_log_weight,
+        entry_grid_spacing_volatility_weight,
         entry_grid_spacing_we_weight,
         entry_grid_spacing_pct,
         entry_initial_ema_dist,
@@ -1360,10 +1403,10 @@ pub fn calc_entries_long_py(
         entry_trailing_grid_ratio,
         entry_trailing_retracement_pct,
         entry_trailing_retracement_we_weight,
-        entry_trailing_retracement_log_weight,
+        entry_trailing_retracement_volatility_weight,
         entry_trailing_threshold_pct,
         entry_trailing_threshold_we_weight,
-        entry_trailing_threshold_log_weight,
+        entry_trailing_threshold_volatility_weight,
         wallet_exposure_limit,
         risk_we_excess_allowance_pct,
         ..Default::default()
@@ -1402,7 +1445,7 @@ pub fn calc_entries_short_py(
     min_cost: f64,
     c_mult: f64,
     entry_grid_double_down_factor: f64,
-    entry_grid_spacing_log_weight: f64,
+    entry_grid_spacing_volatility_weight: f64,
     entry_grid_spacing_we_weight: f64,
     entry_grid_spacing_pct: f64,
     entry_initial_ema_dist: f64,
@@ -1411,10 +1454,10 @@ pub fn calc_entries_short_py(
     entry_trailing_grid_ratio: f64,
     entry_trailing_retracement_pct: f64,
     entry_trailing_retracement_we_weight: f64,
-    entry_trailing_retracement_log_weight: f64,
+    entry_trailing_retracement_volatility_weight: f64,
     entry_trailing_threshold_pct: f64,
     entry_trailing_threshold_we_weight: f64,
-    entry_trailing_threshold_log_weight: f64,
+    entry_trailing_threshold_volatility_weight: f64,
     wallet_exposure_limit: f64,
     risk_we_excess_allowance_pct: f64,
     balance: f64,
@@ -1452,7 +1495,7 @@ pub fn calc_entries_short_py(
 
     let bot_params = BotParams {
         entry_grid_double_down_factor,
-        entry_grid_spacing_log_weight,
+        entry_grid_spacing_volatility_weight,
         entry_grid_spacing_we_weight,
         entry_grid_spacing_pct,
         entry_initial_ema_dist,
@@ -1461,10 +1504,10 @@ pub fn calc_entries_short_py(
         entry_trailing_grid_ratio,
         entry_trailing_retracement_pct,
         entry_trailing_retracement_we_weight,
-        entry_trailing_retracement_log_weight,
+        entry_trailing_retracement_volatility_weight,
         entry_trailing_threshold_pct,
         entry_trailing_threshold_we_weight,
-        entry_trailing_threshold_log_weight,
+        entry_trailing_threshold_volatility_weight,
         wallet_exposure_limit,
         risk_we_excess_allowance_pct,
         ..Default::default()
@@ -1749,6 +1792,10 @@ pub fn calc_twel_enforcer_orders_py(
             min_qty: dict
                 .get_item("min_qty")?
                 .ok_or_else(|| PyValueError::new_err("twel enforcer position missing 'min_qty'"))?
+                .extract::<f64>()?,
+            min_cost: dict
+                .get_item("min_cost")?
+                .ok_or_else(|| PyValueError::new_err("twel enforcer position missing 'min_cost'"))?
                 .extract::<f64>()?,
         });
     }

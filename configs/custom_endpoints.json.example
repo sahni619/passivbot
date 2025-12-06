@@ -1,21 +1,55 @@
 {
-    "defaults": {
-        "disable_ws": false,
-        "rest": {
-            "rewrite_domains": {},
-            "url_overrides": {},
-            "extra_headers": {}
-        }
-    },
-    "exchanges": {
-        "binanceusdm": {
-            "disable_ws": true,
-            "rest": {
-                "rewrite_domains": {
-                    "https://fapi.binance.com": "https://proxy.example.exchange"
-                }
-            },
-            "notes": "Sample override that sends Binance futures REST calls through a fictional proxy."
-        }
+  "defaults": {
+    "disable_ws": false,
+    "rest": {
+      "rewrite_domains": {},
+      "url_overrides": {},
+      "extra_headers": {}
     }
+  },
+  "exchanges": {
+    "binanceusdm": {
+      "disable_ws": true,
+      "rest": {
+        "rewrite_domains": {
+          "https://fapi.binance.com": "https://binance-fapi-1.mltech.ai",
+          "https://api.binance.com": "https://binance-sapi-1.mltech.ai",
+          "https://sapi.binance.com": "https://binance-sapi-1.mltech.ai",
+          "https://papi.binance.com": "https://binance-papi-1.mltech.ai"
+        }
+      }
+    },
+    "bybit": {
+      "disable_ws": true,
+      "rest": {
+        "rewrite_domains": {
+          "https://api.bybit.com": "https://bybit.mltech.ai",
+          "https://api.bytick.com": "https://bybit.mltech.ai"
+        },
+        "url_overrides": {
+          "https://api.bybit.com": "https://bybit.mltech.ai",
+          "https://api.bytick.com": "https://bybit.mltech.ai",
+          "https://api.bybit.com/v5": "https://bybit.mltech.ai/v5",
+          "https://api.bytick.com/v5": "https://bybit.mltech.ai/v5"
+        },
+        "extra_headers": {}
+      }
+    },
+    "okx": {
+      "disable_ws": true,
+      "rest": {
+        "rewrite_domains": {
+          "https://www.okx.com": "https://okx.mltech.ai",
+          "https://aws.okx.com": "https://okx.mltech.ai"
+        },
+        "url_overrides": {
+          "https://www.okx.com": "https://okx.mltech.ai",
+          "https://aws.okx.com": "https://okx.mltech.ai",
+          "https://www.okx.com/api/v5": "https://okx.mltech.ai/api/v5",
+          "https://aws.okx.com/api/v5": "https://okx.mltech.ai/api/v5"
+        },
+        "extra_headers": {}
+      }
+    }
+  }
 }

@@ -12,10 +12,18 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 import passivbot_rust as pbr
-from opt_utils import round_floats, dominates
+from opt_utils import round_floats
 from pure_funcs import calc_hash
 from utils import json_dumps_streamlined
 from metrics_schema import flatten_metric_stats
+from pareto_core import (
+    compute_ideal,
+    crowding_distances,
+    dominates_with_violation,
+    extract_objectives,
+    extract_violation,
+    prune_front_with_extremes,
+)
 
 STAT_FIELDS = {"mean", "min", "max", "std"}
 
@@ -30,11 +38,10 @@ class LimitSpec:
 
 def _split_metric_field(raw_key: str) -> tuple[str, str]:
     key = raw_key.strip()
-    for sep in (".", "_"):
-        if sep in key:
-            metric, suffix = key.rsplit(sep, 1)
-            if suffix in STAT_FIELDS:
-                return metric, suffix
+    if "." in key:
+        metric, suffix = key.rsplit(".", 1)
+        if suffix in STAT_FIELDS:
+            return metric, suffix
     return key, "auto"
 
 
@@ -64,6 +71,28 @@ def _resolve_limit_value(
     return stats_flat.get(key)
 
 
+def _suite_metrics_to_stats(entry: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    aggregated_values: Dict[str, float] = {}
+    stats_flat: Dict[str, float] = {}
+    suite_metrics = entry.get("suite_metrics") or {}
+    if "metrics" in suite_metrics:
+        for metric, payload in suite_metrics["metrics"].items():
+            stats = payload.get("stats") or {}
+            if stats:
+                stats_flat.update(flatten_metric_stats({metric: stats}))
+            agg = payload.get("aggregated")
+            if agg is None and stats:
+                agg = stats.get("mean")
+            if agg is not None:
+                aggregated_values[metric] = agg
+    elif "aggregate" in suite_metrics:
+        aggregate = suite_metrics.get("aggregate") or {}
+        agg_stats = aggregate.get("stats") or {}
+        aggregated_values = aggregate.get("aggregated") or {}
+        stats_flat = flatten_metric_stats(agg_stats)
+    return stats_flat, aggregated_values
+
+
 def _evaluate_limits(
     specs: Sequence[LimitSpec],
     stats_flat: Dict[str, float],
@@ -74,7 +103,7 @@ def _evaluate_limits(
     for spec in specs:
         value = _resolve_limit_value(spec, stats_flat, aggregated_values, objectives, metric_map)
         if value is None:
-            value = float("inf")
+            continue
         if not spec.op(value, spec.value):
             return False
     return True
@@ -99,6 +128,7 @@ class ParetoStore:
         # --- in-memory structures -----------------------------------------
         self._entries: dict[str, str] = {}  # hash -> file path
         self._objectives: dict[str, tuple] = {}  # hash -> objective vector
+        self._violations: dict[str, float] = {}  # hash -> constraint violation
         self._front: list[str] = []  # list of hashes (Pareto set)
         self._objective_lookup: dict[tuple, str] = {}  # objective vector ➜ hash
         # ------------------------------------------------------------------
@@ -125,33 +155,53 @@ class ParetoStore:
             if h in self._entries:  # fast‑dedupe
                 return False
 
-            # objective vector = sorted w_i keys
             metrics_block = rounded.get("metrics", {}) or {}
-            objectives = metrics_block.get("objectives", metrics_block)
-            w_keys = sorted(k for k in objectives if k.startswith("w_"))
-            obj = tuple(objectives[k] for k in w_keys)
+            scoring_keys = self.scoring_keys or entry.get("optimize", {}).get("scoring")
+            obj, _ = extract_objectives(rounded, scoring_keys=scoring_keys)
+            violation = extract_violation(rounded)
 
             # ───────────── NEW: dedupe on the objective vector ──────────────
-            # identical after rounding  → nothing new to store or write
-            if obj in self._objective_lookup:
-                self._log.info(f"Dropping candidate whose obj score is already present: {obj}")
-                return False
+            existing_hash = self._objective_lookup.get(obj)
+            if existing_hash:
+                existing_violation = self._violations.get(existing_hash, 0.0)
+                if violation >= existing_violation - 1e-12:
+                    self._log.info(
+                        "Dropping candidate whose obj score is already present with <= violation: %s",
+                        obj,
+                    )
+                    return False
+                else:
+                    # replace existing entry with higher violation
+                    self._remove_from_front(existing_hash)
             # ────────────────────────────────────────────────────────────────
 
             # discard if dominated by current front
-            if any(dominates(self._objectives[idx], obj) for idx in self._front):
+            if any(
+                dominates_with_violation(
+                    self._objectives[idx],
+                    self._violations.get(idx, 0.0),
+                    obj,
+                    violation,
+                )
+                for idx in self._front
+            ):
                 return False
 
             # remove dominated members
-            dominated = [idx for idx in self._front if dominates(obj, self._objectives[idx])]
+            dominated = [
+                idx
+                for idx in self._front
+                if dominates_with_violation(
+                    obj, violation, self._objectives[idx], self._violations.get(idx, 0.0)
+                )
+            ]
             for idx in dominated:
-                del self._objective_lookup[self._objectives[idx]]
-                self._front.remove(idx)
-                self._delete_entry_file(idx)
+                self._remove_from_front(idx)
 
             # add new member
             self._persist_entry(h, rounded, source_path=source_path)
             self._objectives[h] = obj
+            self._violations[h] = violation
             self._front.append(h)
             self._objective_lookup[obj] = h
 
@@ -237,28 +287,40 @@ class ParetoStore:
             )
 
         line = " | ".join(metrics)
+        violation_summary = ""
+        if self._front:
+            viols = [self._violations.get(idx, 0.0) for idx in self._front]
+            if viols:
+                violation_summary = (
+                    f" | constraint:("
+                    f"{pbr.round_dynamic(min(viols), 3)},"
+                    f"{pbr.round_dynamic(max(viols), 3)})"
+                )
+
         self._log.info(
-            f"Iter: {self.n_iters} | Pareto ↑ | +{added}/-{removed} | size:{len(self._front)} | {line}"
+            f"Iter: {self.n_iters} | Pareto ↑ | +{added}/-{removed} | size:{len(self._front)} | {line}{violation_summary}"
         )
 
     def _prune_front(self, n_prune: int) -> None:
         """Trim the Pareto front down by removing the most crowded entries."""
         if n_prune <= 0 or len(self._front) <= n_prune:
             return
-        objs = [self._objectives[idx] for idx in self._front]
-        crowding = self._crowding_distances(np.array(objs, dtype=float))
-        scored = list(zip(self._front, crowding))
-        scored.sort(key=lambda item: item[1])  # lowest crowding removed first
-        to_remove = [hash_id for hash_id, _ in scored[:n_prune]]
+        to_remove = prune_front_with_extremes(
+            self._front, self._objectives, self._violations, len(self._front) - n_prune
+        )
         for hash_id in to_remove:
-            obj = self._objectives.pop(hash_id, None)
-            self._delete_entry_file(hash_id)
-            if obj is not None:
-                self._objective_lookup.pop(obj, None)
-            try:
-                self._front.remove(hash_id)
-            except ValueError:
-                pass
+            self._remove_from_front(hash_id)
+
+    def _remove_from_front(self, hash_id: str) -> None:
+        obj = self._objectives.pop(hash_id, None)
+        if obj is not None:
+            self._objective_lookup.pop(obj, None)
+        self._violations.pop(hash_id, None)
+        self._delete_entry_file(hash_id)
+        try:
+            self._front.remove(hash_id)
+        except ValueError:
+            pass
 
     def _persist_entry(self, hash_id: str, entry: dict, *, source_path: str | None = None) -> None:
         if source_path is None:
@@ -297,67 +359,6 @@ class ParetoStore:
                 os.remove(path)
             except OSError:
                 pass
-
-    @staticmethod
-    def _crowding_distances(values: np.ndarray) -> np.ndarray:
-        if values.ndim != 2:
-            return np.zeros(len(values))
-        n, m = values.shape
-        if n == 0:
-            return np.array([])
-        if n <= 2:
-            return np.full(n, np.inf)
-        distances = np.zeros(n)
-        for col in range(m):
-            order = np.argsort(values[:, col])
-            distances[order[0]] = distances[order[-1]] = np.inf
-            column = values[order, col]
-            min_v = column[0]
-            max_v = column[-1]
-            denom = max_v - min_v
-            if denom == 0:
-                continue
-            normalized = (column[2:] - column[:-2]) / denom
-            distances[order[1:-1]] += normalized
-        return distances
-
-
-def compute_ideal(values_matrix, mode="min", weights=None, eps=1e-3, pct=10):
-    # values_matrix:  shape (n_points, n_obj)
-    if mode in ["m", "min"]:
-        return values_matrix.min(axis=0)
-
-    if mode in ["w", "weighted"]:
-        if weights is None:
-            raise ValueError("weights required")
-        vmin = values_matrix.min(axis=0)
-        vmax = values_matrix.max(axis=0)
-        return vmin + weights * (vmax - vmin)
-
-    if mode in ["u", "utopian"]:
-        mins = values_matrix.min(axis=0)
-        ranges = values_matrix.ptp(axis=0)
-        return mins - eps * ranges  # ε‑shift
-
-    if mode in ["p", "percentile"]:
-        return np.percentile(values_matrix, pct, axis=0)
-
-    if mode in ["mi", "midrange"]:
-        return 0.5 * (values_matrix.min(axis=0) + values_matrix.max(axis=0))
-
-    if mode in ["g", "geomedian"]:
-        # one Weiszfeld step is already a good approximation
-        z = values_matrix.mean(axis=0)
-        for _ in range(10):
-            d = np.linalg.norm(values_matrix - z, axis=1)
-            w = np.where(d > 0, 1.0 / d, 0.0)
-            z_new = (values_matrix * w[:, None]).sum(axis=0) / w.sum()
-            if np.allclose(z, z_new, atol=1e-9):
-                break
-            z = z_new
-        return z
-
-    raise ValueError(f"unknown mode {mode}")
 
 
 def comma_separated_values_float(x):
@@ -449,14 +450,12 @@ def main():
         "--limit",
         "--limits",
         dest="limits",
-        nargs="*",
+        action="append",
         help=(
-            "One or more limit filters applied before ranking. Expressions accept\n"
-            "objective ids (e.g. w_4<800) or metric names. When the metric name does\n"
-            "not include a statistic (mean/min/max/std) the tool uses suite-level\n"
-            "aggregates where available, otherwise the mean. Add a suffix such as\n"
-            "'.max' or '.min' to target a specific statistic. Remember to quote\n"
-            "expressions that contain comparison operators."
+            "Limit filters applied before ranking. Repeat for multiple expressions:\n"
+            '  -l "w_4<800" -l "position_held_hours_max<400"\n'
+            "Metrics accept optional suffixes (.min/.max/.mean/.std). Without a suffix\n"
+            "suite-level aggregates (if available) are used; otherwise the mean."
         ),
     )
     parser.add_argument(
@@ -531,15 +530,14 @@ def main():
                 metric_name_map = {f"w_{i}": name for i, name in enumerate(metric_names)}
             metrics_block = entry.get("metrics", {}) or {}
             objectives = metrics_block.get("objectives", metrics_block)
-            stats_flat = {}
-            aggregated_values = {}
+            stats_flat: Dict[str, float] = {}
+            aggregated_values: Dict[str, float] = {}
             if "stats" in metrics_block:
                 stats_flat = flatten_metric_stats(metrics_block["stats"])
-            elif "suite_metrics" in entry:
-                suite_payload = entry["suite_metrics"].get("aggregate", {})
-                agg_stats = suite_payload.get("stats", {})
-                aggregated_values = suite_payload.get("aggregated", {}) or {}
-                stats_flat = flatten_metric_stats(agg_stats)
+            if "suite_metrics" in entry:
+                stats_flat_suite, aggregated_values_suite = _suite_metrics_to_stats(entry)
+                stats_flat.update(stats_flat_suite)
+                aggregated_values.update(aggregated_values_suite)
             if not w_keys:
                 all_w_keys = sorted(k for k in objectives if k.startswith("w_"))
 

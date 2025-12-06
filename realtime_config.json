@@ -1,0 +1,296 @@
+{
+  "accounts": [
+    {
+      "api_key_id": "binance_01",
+      "exchange": "binanceusdm",
+      "name": "Binance Futures AlphaMint",
+      "settle_currency": "USDT",
+      "use_custom_endpoints": true
+    },
+    {
+      "api_key_id": "binance_03",
+      "exchange": "binanceusdm",
+      "name": "Binance Futures Vivek",
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "okx_01",
+      "exchange": "okx",
+      "name": "OKX Futures Prismatic",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "okx_02",
+      "exchange": "okx",
+      "name": "OKX Futures NN",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "bybit_01",
+      "exchange": "bybit",
+      "name": "Bybit USDT Perpetuals TheAlternative",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": true
+    },
+    {
+      "api_key_id": "bybit_02",
+      "exchange": "bybit",
+      "name": "Bybit USDT Perpetuals ANU",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "bybit_03",
+      "exchange": "bybit",
+      "name": "Bybit USDT Perpetuals SL2",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "bybit_04",
+      "exchange": "bybit",
+      "name": "Bybit USDT Perpetuals SL",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "bybit_06",
+      "exchange": "bybit",
+      "name": "Bybit USDT Perpetuals IK",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "okx_03",
+      "exchange": "okx",
+      "name": "OKX STD",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    },
+    {
+      "api_key_id": "okx_04",
+      "exchange": "okx",
+      "name": "OKX GP New",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "use_custom_endpoints": false
+    }
+  ],
+  "alert_thresholds": {
+    "loss_threshold_pct": -0.70,
+    "max_drawdown_pct": 0.760,
+    "position_wallet_exposure_pct": 1.3,
+    "wallet_exposure_pct": 11.4
+  },
+  "api_keys_file": "../api-keys.json",
+  "auth": {
+    "https_only": false,
+    "secret_key": "jhgjhguyg^^554$$67CFCGFDGFd",
+    "session_cookie_name": "risk_dashboard_session",
+    "users": {
+      "admin": "$2b$12$0ZCLkFp6iuhlEFshgPCBz.0dXxmRCV4vcjxHfRh0qKtzc79Pj9c5W"
+    }
+  },
+  "custom_endpoints": {
+    "autodiscover": true,
+    "path": "../configs/custom_endpoints.json"
+  },
+  "debug_api_payloads": false,
+  "email": {
+    "host": "smtppro.zoho.in",
+    "password": "L4naQ6CKK4Ja",
+    "port": 587,
+    "sender": "admin@plezna.com",
+    "use_tls": true,
+    "username": "admin@plezna.com"
+  },
+  "grafana": {
+    "base_url": "http://108.160.138.76:3000/",
+    "dashboards": [
+      {
+        "description": "NAV, profit rate, and drawdown metrics across the portfolio.",
+        "title": "Portfolio overview",
+        "url": "d-solo/d876c2e7-073f-425b-9a40-f5051fb91d1d/dwg?orgId=1&from=1761716882849&to=1761738482849&timezone=browser&panelId=panel-1&__feature.dashboardSceneSolo=true"
+      },
+      {
+        "description": "Wallet exposure, leverage ratios, and asset allocation breakdowns.",
+        "title": "Exposure & leverage",
+        "url": "d-solo/def456/portfolio-exposure?orgId=1&from=now-7d&to=now&panelId=6&refresh=1m"
+      }
+    ],
+    "default_height": 620
+  },
+  "notification_channels": [
+    "email:admin@plezna.com",
+    "slack:#passivbot-risk-alerts"
+  ],
+  "policies": [
+    {
+      "actions": [
+        {
+          "message": "Portfolio drawdown is {value:.2%} (limit {threshold:.2%}).",
+          "severity": "warning",
+          "type": "log"
+        },
+        {
+          "channels": [
+            "email",
+            "slack"
+          ],
+          "message": "Portfolio drawdown of {value:.2%} breached the {threshold:.2%} policy.",
+          "subject": "Risk policy breach: portfolio drawdown",
+          "type": "notify"
+        },
+        {
+          "confirmation_key": "portfolio-kill-switch",
+          "message": "Confirm whether to trigger the global kill switch due to drawdown breach.",
+          "type": "require_confirmation"
+        }
+      ],
+      "description": "Escalate when the portfolio drawdown exceeds 15%.",
+      "manual_override": {
+        "allowed": true,
+        "expires_after_seconds": 3600,
+        "instructions": "Desk lead approval required to keep trading after breach."
+      },
+      "name": "Portfolio drawdown escalation",
+      "trigger": {
+        "cooldown_seconds": 600,
+        "metric": "portfolio.drawdown_pct",
+        "operator": ">=",
+        "type": "metric_threshold",
+        "value": 0.15
+      }
+    },
+    {
+      "actions": [
+        {
+          "message": "Binance balance is ${value:,.2f}, below the ${threshold:,.2f} floor.",
+          "severity": "warning",
+          "type": "log"
+        },
+        {
+          "channels": [
+            "email"
+          ],
+          "message": "Binance account balance fell to ${value:,.2f} (policy floor ${threshold:,.2f}).",
+          "subject": "Risk policy breach: Binance balance",
+          "type": "notify"
+        }
+      ],
+      "description": "Alert when the Binance futures account balance drops below $40k.",
+      "manual_override": {
+        "allowed": true,
+        "expires_after_seconds": 7200,
+        "instructions": "Escalate to exchange coverage before overriding the balance floor."
+      },
+      "name": "Binance balance floor",
+      "trigger": {
+        "metric": "account.Binance Futures AlphaMint.balance",
+        "operator": "<",
+        "type": "metric_threshold",
+        "value": 40000
+      }
+    }
+  ],
+  "reports_dir": "../risk_reports",
+  "scenarios": [
+    {
+      "description": "Bitcoin sells off by ten percent.",
+      "id": "btc_minus_10",
+      "name": "BTC -10%",
+      "shocks": [
+        {
+          "price_pct": -0.1,
+          "symbol": "BTCUSDT"
+        }
+      ]
+    },
+    {
+      "description": "Ethereum retraces sharply.",
+      "id": "eth_minus_15",
+      "name": "ETH -15%",
+      "shocks": [
+        {
+          "price_pct": -0.15,
+          "symbol": "ETHUSDT"
+        }
+      ]
+    }
+  ]
+}
+
