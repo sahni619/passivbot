@@ -298,13 +298,11 @@ class RealtimeDataFetcher:
         if conditional_state:
             snapshot["conditional_stop_losses"] = conditional_state
 
-        await self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
-        await self._dispatch_notifications(snapshot)
-
         violations = list(self._policy_evaluator(snapshot))
         if violations:
             snapshot["policy_violations"] = [violation.as_dict() for violation in violations]
-        self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
+        await self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
+        await self._dispatch_notifications(violations, snapshot)
         if self._kill_switch_handler is not None:
             try:
                 await self._kill_switch_handler(violations, snapshot)
@@ -343,9 +341,7 @@ class RealtimeDataFetcher:
         return results
 
 
-    async def _dispatch_notifications(self, snapshot: Mapping[str, Any]) -> None:
-
-    def _dispatch_notifications(
+    async def _dispatch_notifications(
         self, violations: Sequence[RiskViolation], snapshot: Mapping[str, Any]
     ) -> None:
 
