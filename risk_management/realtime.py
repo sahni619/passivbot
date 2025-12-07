@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+
+from datetime import datetime, timezone
+from types import TracebackType
+from pathlib import Path
+
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
-from zoneinfo import ZoneInfo
+
 
 from custom_endpoint_overrides import (
     CustomEndpointConfigError,
@@ -31,10 +38,16 @@ from risk_engine.policies import RiskViolation
 
 from .account_clients import AccountClientProtocol, CCXTAccountClient
 from .configuration import CustomEndpointSettings, RealtimeConfig
-from .dashboard import evaluate_alerts, parse_snapshot
 from .email_notifications import EmailAlertSender
 from .telegram_notifications import TelegramNotifier
 from services.telemetry import ResiliencePolicy, Telemetry
+from .realtime_components import (
+    ClientOrchestrator,
+    KillSwitchExecutor,
+    NotificationDispatcher,
+    ResilientExecutor,
+    SnapshotPolicyEvaluator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,14 +117,15 @@ class RealtimeDataFetcher:
         self,
         config: RealtimeConfig,
         account_clients: Optional[Sequence[AccountClientProtocol]] = None,
-
         telemetry: Optional[Telemetry] = None,
-
         *,
         policy_evaluator: Optional[PolicyEvaluator] = None,
         notification_handler: Optional[NotificationHandler] = None,
         kill_switch_handler: Optional[KillSwitchHandler] = None,
-
+        orchestrator: Optional[ClientOrchestrator] = None,
+        notification_dispatcher: Optional[NotificationDispatcher] = None,
+        kill_switch_executor: Optional[KillSwitchExecutor] = None,
+        executor: Optional[ResilientExecutor] = None,
     ) -> None:
         self.config = config
         self.telemetry = telemetry or Telemetry(policy=config.resilience)
@@ -145,7 +159,6 @@ class RealtimeDataFetcher:
                 circuit_breaker_reset_s=config.resilience.circuit_breaker_reset_s,
             )
             self.telemetry.policy = self.resilience_policy
-        self._last_auth_errors: Dict[str, str] = {}
         if config.debug_api_payloads:
             logger.info(
                 "Exchange API payload debug logging enabled for realtime fetcher"
@@ -155,31 +168,38 @@ class RealtimeDataFetcher:
                 logger.info(
                     "Debug API payload logging enabled for account %s", account.name
                 )
+        self._executor = executor or ResilientExecutor(self.telemetry, self.resilience_policy)
+        self._orchestrator = orchestrator or ClientOrchestrator(
+            self._account_clients,
+            self._executor,
+            account_messages=config.account_messages,
+        )
         self._email_sender = EmailAlertSender(config.email) if config.email else None
         self._email_recipients = self._extract_email_recipients()
         self._telegram_targets = self._extract_telegram_targets()
         self._telegram_notifier = TelegramNotifier() if self._telegram_targets else None
-        self._active_alerts: set[str] = set()
-        self._daily_snapshot_tz = ZoneInfo("America/New_York")
-        self._daily_snapshot_sent_date: Optional[date] = None
         self._portfolio_stop_loss: Optional[Dict[str, Any]] = None
         self._last_portfolio_balance: Optional[float] = None
         self._conditional_stop_losses: list[Dict[str, Any]] = []
-        self._policy_evaluator: PolicyEvaluator = (
-            policy_evaluator if policy_evaluator is not None else self._evaluate_snapshot_policies
+        self._policy_evaluator: PolicyEvaluator = policy_evaluator or SnapshotPolicyEvaluator()
+        self._notification_dispatcher = notification_dispatcher or NotificationDispatcher(
+            self._executor,
+            email_sender=self._email_sender,
+            email_recipients=self._email_recipients,
+            telegram_notifier=self._telegram_notifier,
+            telegram_targets=self._telegram_targets,
         )
-        self._notification_handler: NotificationHandler = (
-            notification_handler if notification_handler is not None else self._dispatch_notifications
-        )
+        self._notification_handler: NotificationHandler = notification_handler or self._notification_dispatcher.dispatch
         self._kill_switch_handler = kill_switch_handler
+        self._kill_switch_executor = kill_switch_executor or KillSwitchExecutor(
+            self._account_clients, self._executor
+        )
 
     async def _resilient_call(self, name: str, func: Callable[[], Any]) -> Any:
-        return await self.telemetry.execute_with_resilience(
-            name, func, policy=self.resilience_policy
-        )
+        return await self._executor.execute(name, func)
 
     async def _resilient_threaded_call(self, name: str, func: Callable[[], Any]) -> Any:
-        return await self._resilient_call(name, lambda: asyncio.to_thread(func))
+        return await self._executor.execute_threaded(name, lambda: asyncio.to_thread(func))
 
     def _extract_email_recipients(self) -> List[str]:
         recipients: List[str] = []
@@ -216,73 +236,8 @@ class RealtimeDataFetcher:
                 targets.append((token, chat_id))
         return targets
 
-    def _evaluate_snapshot_policies(self, snapshot: Mapping[str, Any]) -> List[RiskViolation]:
-        try:
-            _, accounts, thresholds, _ = parse_snapshot(dict(snapshot))
-            alerts = evaluate_alerts(accounts, thresholds)
-        except Exception:  # pragma: no cover - defensive fall back
-            return []
-        return [RiskViolation("alert_threshold", alert) for alert in alerts]
-
     async def fetch_snapshot(self) -> Dict[str, Any]:
-        tasks = [
-            self._resilient_call(
-                f"account:{client.config.name}:fetch",
-                lambda client=client: client.fetch(),
-            )
-            for client in self._account_clients
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        accounts_payload: List[Dict[str, Any]] = []
-        account_messages: Dict[str, str] = dict(self.config.account_messages)
-        for account_config, result in zip(self.config.accounts, results):
-            if isinstance(result, Exception):
-                if isinstance(result, AuthenticationError):
-                    message = (
-                        f"{account_config.name}: authentication failed - {result}"
-                    )
-
-                    error_message = str(result)
-                    previous_error = self._last_auth_errors.get(account_config.name)
-                    if previous_error != error_message:
-                        logger.warning(
-                            "Authentication failed for %s: %s",
-                            account_config.name,
-                            result,
-                        )
-                        self._last_auth_errors[account_config.name] = error_message
-                    else:
-                        logger.debug(
-                            "Authentication failure for %s unchanged: %s",
-                            account_config.name,
-                            result,
-                        )
-
-                else:
-                    message = f"{account_config.name}: {result}"
-                    logger.error(
-                        "Failed to fetch snapshot for %s",
-                        account_config.name,
-                        exc_info=_exception_info(result),
-                    )
-                account_messages[account_config.name] = message
-                accounts_payload.append(
-                    {
-                        "name": account_config.name,
-                        "balance": 0.0,
-                        "positions": [],
-                        "exchange": account_config.exchange,
-                    }
-                )
-            else:
-                account_payload = dict(result)
-                account_payload.setdefault("exchange", account_config.exchange)
-                accounts_payload.append(account_payload)
-                if account_config.name in self._last_auth_errors:
-                    logger.info(
-                        "Authentication for %s restored", account_config.name
-                    )
-                    self._last_auth_errors.pop(account_config.name, None)
+        accounts_payload, account_messages = await self._orchestrator.fetch()
         snapshot = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "accounts": accounts_payload,
@@ -309,8 +264,6 @@ class RealtimeDataFetcher:
         violations = list(self._policy_evaluator(snapshot))
         if violations:
             snapshot["policy_violations"] = [violation.as_dict() for violation in violations]
-        await self._maybe_send_daily_balance_snapshot(snapshot, portfolio_balance)
-        await self._dispatch_notifications(violations, snapshot)
         if self._kill_switch_handler is not None:
             try:
                 await self._kill_switch_handler(violations, snapshot)
@@ -328,102 +281,8 @@ class RealtimeDataFetcher:
     async def execute_kill_switch(
         self, account_name: Optional[str] = None, symbol: Optional[str] = None
     ) -> Dict[str, Any]:
-        scope = account_name or "all accounts"
-        symbol_desc = f" for {symbol}" if symbol else ""
-        logger.info("Kill switch requested for %s%s", scope, symbol_desc)
-        targets: List[AccountClientProtocol] = []
-        for client in self._account_clients:
-            if account_name is None or client.config.name == account_name:
-                targets.append(client)
-        if account_name is not None and not targets:
-            raise ValueError(f"Account '{account_name}' is not configured for realtime monitoring.")
-        results: Dict[str, Any] = {}
-        for client in targets:
-            try:
-                results[client.config.name] = await self._resilient_call(
-                    f"account:{client.config.name}:kill_switch",
-                    lambda client=client: client.kill_switch(symbol),
-                )
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.exception("Kill switch failed for %s", client.config.name, exc_info=True)
-                results[client.config.name] = {"error": str(exc)}
-        logger.info("Kill switch completed for %s", scope)
-        return results
+        return await self._kill_switch_executor.execute(account_name, symbol)
 
-
-    async def _dispatch_notifications(
-        self, violations: Sequence[RiskViolation], snapshot: Mapping[str, Any]
-    ) -> None:
-
-        if not (self._email_sender or self._telegram_notifier):
-            return
-        alerts = [violation.message for violation in violations]
-        alerts_set = set(alerts)
-        new_alerts = [alert for alert in alerts if alert not in self._active_alerts]
-        self._active_alerts = alerts_set
-        if not new_alerts:
-            return
-        generated_at = snapshot.get("generated_at")
-        timestamp = (
-            generated_at
-            if isinstance(generated_at, str)
-            else datetime.now(timezone.utc).isoformat()
-        )
-        lines = [f"Exposure thresholds were exceeded at {timestamp}.", "", "Alerts:"]
-        lines.extend(f"- {alert}" for alert in new_alerts)
-        body = "\n".join(lines)
-        subject = "Risk alert: exposure threshold breached"
-        if self._email_sender and self._email_recipients:
-            await self._resilient_threaded_call(
-                "notification:email",
-                lambda: self._email_sender.send(subject, body, self._email_recipients),
-            )
-        if self._telegram_notifier and self._telegram_targets:
-            message = f"Exposure alert at {timestamp}\n" + "\n".join(new_alerts)
-            for token, chat_id in self._telegram_targets:
-                await self._resilient_threaded_call(
-                    f"notification:telegram:{chat_id}",
-                    lambda token=token, chat_id=chat_id: self._telegram_notifier.send(
-                        token, chat_id, message
-                    ),
-                )
-
-    async def _maybe_send_daily_balance_snapshot(
-        self, snapshot: Mapping[str, Any], portfolio_balance: float
-    ) -> None:
-        if not self._email_sender or not self._email_recipients:
-            return
-        now_ny = datetime.now(self._daily_snapshot_tz)
-        current_date = now_ny.date()
-        if self._daily_snapshot_sent_date and current_date > self._daily_snapshot_sent_date:
-            self._daily_snapshot_sent_date = None
-        if now_ny.time() < time(16, 0):
-            return
-        if self._daily_snapshot_sent_date == current_date:
-            return
-        accounts = snapshot.get("accounts", [])
-        lines = [
-            f"Daily portfolio snapshot ({now_ny.strftime('%Y-%m-%d')} 16:00 ET)",
-            f"Total balance: ${portfolio_balance:,.2f}",
-            "",
-            "Accounts:",
-        ]
-        for account in accounts or []:
-            if not isinstance(account, Mapping):
-                continue
-            name = str(account.get("name", "unknown"))
-            balance = float(account.get("balance", 0.0))
-            realised = float(account.get("daily_realized_pnl", 0.0))
-            lines.append(
-                f"- {name}: balance ${balance:,.2f}, daily realised PnL ${realised:,.2f}"
-            )
-        body = "\n".join(lines)
-        subject = "Daily portfolio balance snapshot"
-        await self._resilient_threaded_call(
-            "notification:email.daily",
-            lambda: self._email_sender.send(subject, body, self._email_recipients),
-        )
-        self._daily_snapshot_sent_date = current_date
 
     def _update_portfolio_stop_loss_state(
         self, portfolio_balance: float
