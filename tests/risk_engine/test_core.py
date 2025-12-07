@@ -104,3 +104,40 @@ def test_exchange_drawdown_breach_flag():
     )
     assert results[0].breached is True
 
+
+def test_evaluate_exchange_drawdowns_without_limit_has_no_breach():
+    results = evaluate_exchange_drawdowns(
+        current_equity={"binance": 7500},
+        peak_equity={"binance": 10000},
+        limits=None,
+    )
+
+    assert results[0].limit is None
+    assert pytest.approx(results[0].drawdown) == 0.25
+    assert results[0].breached is False
+
+
+def test_evaluate_exchange_drawdowns_with_limit_but_no_breach():
+    results = evaluate_exchange_drawdowns(
+        current_equity={"binance": 5500},
+        peak_equity={"binance": 10000},
+        limits={"binance": 0.6},
+    )
+
+    assert pytest.approx(results[0].drawdown) == 0.45
+    assert results[0].breached is False
+
+
+def test_evaluate_exchange_drawdowns_handles_zero_or_negative_peaks():
+    current_equity = {"binance": 5000, "bybit": 5000}
+    peak_equity = {"binance": 0, "bybit": -100}
+    limits = {"binance": 0.1, "bybit": 0.1}
+
+    results = evaluate_exchange_drawdowns(current_equity, peak_equity, limits)
+    result_map = {res.exchange: res for res in results}
+
+    assert result_map["binance"].drawdown == 0
+    assert result_map["binance"].breached is False
+    assert result_map["bybit"].drawdown == 0
+    assert result_map["bybit"].breached is False
+
