@@ -35,11 +35,11 @@ class CashFlowEvent:
 class ExchangeDrawdown:
     exchange: str
     drawdown: float
-    limit: float
+    limit: float | None
 
     @property
     def breached(self) -> bool:
-        return self.drawdown > self.limit
+        return self.limit is not None and self.drawdown > self.limit
 
 
 @dataclass(frozen=True)
@@ -60,20 +60,22 @@ def total_unrealized_pnl(positions: Iterable[Position]) -> float:
 def evaluate_exchange_drawdowns(
     current_equity: Dict[str, float],
     peak_equity: Dict[str, float],
-    limits: Dict[str, float],
+    limits: Dict[str, float | None] | None = None,
 ) -> List[ExchangeDrawdown]:
     """Calculate drawdowns per exchange and whether they breach configured limits.
 
     Drawdown is computed as (peak - current) / peak when peak is positive.
     Exchanges absent from peak_equity are treated as having zero peak.
+    Missing limits indicate no cap for the exchange and therefore no breach.
     """
 
+    limits = limits or {}
     drawdowns: List[ExchangeDrawdown] = []
     exchanges = set(current_equity) | set(peak_equity) | set(limits)
     for exchange in exchanges:
         peak = peak_equity.get(exchange, 0.0)
         current = current_equity.get(exchange, 0.0)
-        limit = limits.get(exchange, 0.0)
+        limit = limits.get(exchange)
         if peak <= 0:
             drawdown = 0.0
         else:
