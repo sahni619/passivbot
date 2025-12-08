@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from risk_management.configuration import AccountConfig, RealtimeConfig
 from risk_management.web import AuthManager, RiskDashboardService, create_app
+from services.telemetry import Telemetry
 
 
 def _patch_httpx_for_starlette() -> None:
@@ -407,11 +408,11 @@ def test_letsencrypt_challenge_mount(tmp_path: Path, auth_manager: AuthManager) 
 
 def test_portfolio_history_and_cashflows(
     sample_snapshot: dict, auth_manager: AuthManager
-) -> None:
-    client, fetcher = create_test_app(sample_snapshot, auth_manager)
-    with client:
-        login_response = client.post(
-            "/login",
+    ) -> None:
+        client, fetcher = create_test_app(sample_snapshot, auth_manager)
+        with client:
+            login_response = client.post(
+                "/login",
             data={"username": "admin", "password": "admin123"},
             allow_redirects=False,
         )
@@ -446,3 +447,25 @@ def test_portfolio_history_and_cashflows(
         report_response = client.get("/api/reports/portfolio")
         assert report_response.status_code == 200
         assert report_response.headers["content-type"].startswith("text/csv")
+
+
+def test_health_and_readiness_endpoints(
+    sample_snapshot: dict, auth_manager: AuthManager
+) -> None:
+    client, _ = create_test_app(sample_snapshot, auth_manager)
+    telemetry = Telemetry()
+    client.app.state.telemetry = telemetry
+
+    healthy = client.get("/health")
+    assert healthy.status_code == 200
+    assert healthy.json()["status"] == "healthy"
+
+    telemetry.mark_service_degraded("account:Demo:fetch", "timeout")
+
+    degraded = client.get("/health")
+    assert degraded.status_code == 503
+    assert degraded.json()["status"] == "degraded"
+
+    readiness = client.get("/readiness")
+    assert readiness.status_code == 503
+    assert readiness.json()["ready"] is False

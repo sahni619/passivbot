@@ -1,0 +1,17 @@
+{
+  "balance": {
+    "total": {"USDT": 1250.5},
+    "info": {"asset": "USDT"}
+  },
+  "positions": [
+    {
+      "symbol": "BTCUSDT",
+      "contracts": "0.01",
+      "entryPrice": "20000",
+      "markPrice": "20100",
+      "unrealizedPnl": "1",
+      "liquidationPrice": "15000",
+      "positionSide": "BOTH"
+    }
+  ]
+}

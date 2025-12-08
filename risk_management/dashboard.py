@@ -19,125 +19,19 @@ import json
 import math
 import logging
 import sys
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .configuration import CustomEndpointSettings, load_realtime_config
+from .models import AccountState, Order, Position, RiskLimits
+
+if TYPE_CHECKING:  # pragma: no cover - avoids circular imports at runtime
+    from .api import DashboardController
 
 
-@dataclass
-class Position:
-    """A lightweight representation of a trading position."""
-
-    symbol: str
-    side: str
-    notional: float
-    entry_price: float
-    mark_price: float
-    liquidation_price: Optional[float]
-    wallet_exposure_pct: Optional[float]
-    unrealized_pnl: float
-    max_drawdown_pct: Optional[float]
-    take_profit_price: Optional[float] = None
-    stop_loss_price: Optional[float] = None
-    size: Optional[float] = None
-    signed_notional: Optional[float] = None
-    volatility: Optional[Mapping[str, float]] = None
-    funding_rates: Optional[Mapping[str, float]] = None
-    daily_realized_pnl: float = 0.0
-
-    def exposure_relative_to(self, balance: float) -> float:
-        if balance == 0:
-            return 0.0
-        return abs(self.notional) / balance
-
-    def pnl_pct(self, balance: float) -> float:
-        if balance == 0:
-            return 0.0
-        return self.unrealized_pnl / balance
-
-
-@dataclass
-class Order:
-    """Representation of an open order."""
-
-    symbol: str
-    side: str
-    order_type: str
-    price: Optional[float]
-    amount: Optional[float]
-    remaining: Optional[float]
-    status: str
-    reduce_only: bool
-    stop_price: Optional[float] = None
-    notional: Optional[float] = None
-    order_id: Optional[str] = None
-    created_at: Optional[str] = None
-
-
-@dataclass
-class Account:
-    """Account level snapshot."""
-
-    name: str
-    balance: float
-    positions: Sequence[Position]
-    orders: Sequence[Order] = ()
-    daily_realized_pnl: float = 0.0
-
-    def total_abs_notional(self) -> float:
-        return sum(abs(p.notional) for p in self.positions)
-
-    def total_unrealized(self) -> float:
-        return sum(p.unrealized_pnl for p in self.positions)
-
-    def total_daily_realized(self) -> float:
-        return sum(p.daily_realized_pnl for p in self.positions)
-
-    def exposure_pct(self) -> float:
-        if self.balance == 0:
-            return 0.0
-        return self.total_abs_notional() / self.balance
-
-    def net_notional(self) -> float:
-        total = 0.0
-        for position in self.positions:
-            if position.signed_notional is not None:
-                total += position.signed_notional
-            else:
-                total += position.notional if position.side.lower() == "long" else -position.notional
-        return total
-
-    def gross_exposure_pct(self) -> float:
-        return self.exposure_pct()
-
-    def net_exposure_pct(self) -> float:
-        if self.balance == 0:
-            return 0.0
-        return self.net_notional() / self.balance
-
-    def exposures_by_symbol(self) -> Dict[str, Dict[str, float]]:
-        exposures: Dict[str, Dict[str, float]] = {}
-        for position in self.positions:
-            signed = (
-                position.signed_notional
-                if position.signed_notional is not None
-                else position.notional if position.side.lower() == "long" else -position.notional
-            )
-            data = exposures.setdefault(position.symbol, {"gross": 0.0, "net": 0.0})
-            data["gross"] += abs(signed)
-            data["net"] += signed
-        return exposures
-
-
-@dataclass
-class AlertThresholds:
-    wallet_exposure_pct: float = 0.6
-    position_wallet_exposure_pct: float = 0.25
-    max_drawdown_pct: float = 0.3
-    loss_threshold_pct: float = -0.12
+Account = AccountState
+AlertThresholds = RiskLimits
 
 
 logger = logging.getLogger(__name__)
@@ -221,6 +115,8 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
             else None
         ),
         daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
+        position_side=raw.get("positionSide") or raw.get("position_side"),
+        position_idx=raw.get("positionIdx") or raw.get("position_idx"),
     )
 
 
@@ -242,10 +138,12 @@ def _parse_account(raw: Dict[str, Any]) -> Account:
             daily_realized = sum(position.daily_realized_pnl for position in positions)
     return Account(
         name=str(raw["name"]),
-        balance=float(raw["balance"]),
+        balance=raw.get("balance"),
         positions=positions,
         orders=orders,
-        daily_realized_pnl=float(daily_realized),
+        pnl={"daily_realized": float(daily_realized)},
+        risk_limits=raw.get("risk_limits"),
+        exchange=raw.get("exchange"),
     )
 
 
@@ -265,13 +163,13 @@ def _parse_order(raw: Mapping[str, Any]) -> Order:
         symbol=symbol,
         side=side,
         order_type=order_type,
-        price=float(price) if price not in (None, "") else None,
-        amount=float(amount) if amount not in (None, "") else None,
-        remaining=float(remaining) if remaining not in (None, "") else None,
+        price=price,
+        amount=amount,
+        remaining=remaining,
         status=str(raw.get("status", "")),
-        reduce_only=bool(reduce_only_raw),
-        stop_price=float(stop_price) if stop_price not in (None, "") else None,
-        notional=float(notional) if notional not in (None, "") else None,
+        reduce_only=reduce_only_raw,
+        stop_price=stop_price,
+        notional=notional,
         order_id=str(order_id) if order_id not in (None, "") else None,
         created_at=str(created_at) if created_at not in (None, "") else None,
     )
@@ -293,6 +191,16 @@ def _parse_thresholds(raw: Dict[str, Any]) -> AlertThresholds:
 def load_snapshot(path: Path) -> Dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return data
+
+
+class StaticSnapshotProvider:
+    """Minimal snapshot provider used by the CLI."""
+
+    def __init__(self, snapshot: Mapping[str, Any]):
+        self.snapshot = snapshot
+
+    async def fetch_snapshot(self) -> Mapping[str, Any]:
+        return self.snapshot
 
 
 def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], AlertThresholds, Sequence[str]]:
@@ -320,7 +228,7 @@ def evaluate_alerts(accounts: Sequence[Account], thresholds: AlertThresholds) ->
                 f"{account.name}: wallet exposure {exposure:.2%} exceeds limit {thresholds.wallet_exposure_pct:.2%}"
             )
 
-        balance = account.balance
+        balance = account.balance.total
         unrealized_pct = account.total_unrealized() / balance if balance else 0.0
         if unrealized_pct < thresholds.loss_threshold_pct:
             alerts.append(
@@ -363,7 +271,7 @@ def render_dashboard(
         lines.append("No accounts available in the snapshot.")
     for account in accounts:
         lines.append(f"Account: {account.name}")
-        lines.append(f"  Balance: {_format_currency(account.balance)}")
+        lines.append(f"  Balance: {_format_currency(account.balance.total)}")
         lines.append(f"  Exposure: {_format_pct(account.exposure_pct())}")
         lines.append(f"  Unrealized PnL: {_format_currency(account.total_unrealized())}")
         lines.append(f"  Daily realized PnL: {_format_currency(account.daily_realized_pnl)}")
@@ -379,7 +287,7 @@ def render_dashboard(
             lines.append(header)
             lines.append("    " + "-" * (len(header) - 4))
             for position in account.positions:
-                balance = account.balance
+                balance = account.balance.total
                 pos_exposure = position.exposure_relative_to(balance)
                 pnl_pct = position.pnl_pct(balance)
                 lines.append(
@@ -415,16 +323,25 @@ def render_dashboard(
     return "\n".join(lines)
 
 
+async def render_from_controller(controller: "DashboardController") -> str:
+    generated_at, accounts, thresholds, notifications, account_messages = await controller.fetch_cli_view()
+    alerts = evaluate_alerts(accounts, thresholds)
+    return render_dashboard(generated_at, accounts, alerts, notifications, account_messages=account_messages)
+
+
 def run_dashboard(config_path: Path) -> str:
     snapshot = load_snapshot(config_path)
-    return build_dashboard(snapshot)
+    from .api import DashboardController
+
+    controller = DashboardController(StaticSnapshotProvider(snapshot))
+    return asyncio.run(render_from_controller(controller))
 
 
 def build_dashboard(snapshot: Dict[str, Any]) -> str:
-    generated_at, accounts, thresholds, notifications = parse_snapshot(snapshot)
-    alerts = evaluate_alerts(accounts, thresholds)
-    account_messages = snapshot.get("account_messages", {}) if isinstance(snapshot, Mapping) else {}
-    return render_dashboard(generated_at, accounts, alerts, notifications, account_messages=account_messages)
+    from .api import DashboardController
+
+    controller = DashboardController(StaticSnapshotProvider(snapshot))
+    return asyncio.run(render_from_controller(controller))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -484,6 +401,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
     from .realtime import RealtimeDataFetcher
 
     realtime_fetcher: Optional[RealtimeDataFetcher] = None
+    from .api import DashboardController
+
+    controller: Optional[DashboardController] = None
     if args.realtime_config:
         realtime_config = load_realtime_config(Path(args.realtime_config))
         override = args.custom_endpoints
@@ -506,16 +426,18 @@ async def _run_cli(args: argparse.Namespace) -> int:
                         path=override_normalized, autodiscover=False
                     )
         realtime_fetcher = RealtimeDataFetcher(realtime_config)
+        controller = DashboardController(realtime_fetcher)
         logger.info("Starting realtime dashboard using %s", args.realtime_config)
 
     try:
         iteration = 0
         while True:
             if realtime_fetcher is not None:
-                snapshot = await realtime_fetcher.fetch_snapshot()
+                dashboard = await render_from_controller(controller)  # type: ignore[arg-type]
             else:
                 snapshot = load_snapshot(Path(args.config))
-            dashboard = build_dashboard(snapshot)
+                static_controller = DashboardController(StaticSnapshotProvider(snapshot))
+                dashboard = await render_from_controller(static_controller)
             print(dashboard)
             iteration += 1
             if args.iterations and iteration >= args.iterations:

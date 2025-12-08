@@ -1,0 +1,12 @@
+{
+  "balance": {"total": {"USDT": 1000}},
+  "positions": [
+    {
+      "symbol": "BTCUSDT",
+      "contracts": 1,
+      "entryPrice": "30000",
+      "markPrice": "30100",
+      "positionSide": "LONG"
+    }
+  ]
+}
