@@ -1,80 +1,121 @@
 {
-  "api_keys_file": "/root/passivbot/api-keys.json",
-  "debug_api_payloads": false,
-  "custom_endpoints": {
-    "path": "/root/passivbot/configs/custom_endpoints.json",
-    "autodiscover": false
-  },
-  "reports_dir": "../risk_reports",
-  "grafana": {
-    "base_url": "https://108.160.138.76:8001/",
-    "default_height": 620,
-    "dashboards": [
-      {
-        "title": "Portfolio overview",
-        "url": "d-solo/abc123/portfolio-overview?orgId=1&from=now-7d&to=now&panelId=2&refresh=1m",
-        "description": "NAV, profit rate, and drawdown metrics across the portfolio."
-      },
-      {
-        "title": "Exposure & leverage",
-        "url": "d-solo/def456/portfolio-exposure?orgId=1&from=now-7d&to=now&panelId=6&refresh=1m",
-        "description": "Wallet exposure, leverage ratios, and asset allocation breakdowns."
-      }
-    ]
-  },
-
   "accounts": [
     {
-      "name": "Binance Futures TheAlter",
-      "exchange": "binanceusdm",
       "api_key_id": "binance_01",
+      "exchange": "binanceusdm",
+      "name": "Binance Futures AlphaMint",
       "settle_currency": "USDT"
     },
     {
-      "name": "OKX Futures",
-      "exchange": "okx",
       "api_key_id": "okx_01",
-      "settle_currency": "USDT",
+      "exchange": "okx",
+      "name": "OKX Futures Prismatic",
       "params": {
-        "balance": {"type": "swap"},
-        "positions": {"type": "swap"}
-      }
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT"
     },
     {
-      "name": "Bybit USDT Perpetuals AlphaMint",
-      "exchange": "bybit",
       "api_key_id": "bybit_01",
-      "settle_currency": "USDT",
+      "exchange": "bybit",
+      "name": "Bybit USDT Perpetuals TheAlternative",
       "params": {
-        "balance": {"type": "swap"},
-        "positions": {"type": "swap"}
-      }
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT"
+    },
+    {
+      "api_key_id": "binance_02",
+      "enabled": true,
+      "exchange": "binanceusdm",
+      "name": "Binance Futures SGM USDT",
+      "params": {},
+      "settle_currency": "USDT",
+      "symbols": null
+    },
+    {
+      "api_key_id": "okx_02",
+      "enabled": true,
+      "exchange": "okx",
+      "name": "OKX Futures Stellarpath USDT",
+      "params": {
+        "balance": {
+          "type": "swap"
+        },
+        "positions": {
+          "type": "swap"
+        }
+      },
+      "settle_currency": "USDT",
+      "symbols": null
+    },
+    {
+      "api_key_id": "binance_03",
+      "enabled": true,
+      "exchange": "binanceusdm",
+      "name": "Binance Futures SGM BTC",
+      "params": {},
+      "settle_currency": "USDT",
+      "symbols": null
     }
   ],
   "alert_thresholds": {
-    "wallet_exposure_pct": 0.65,
-    "position_wallet_exposure_pct": 0.25,
+    "loss_threshold_pct": -0.08,
     "max_drawdown_pct": 0.25,
-    "loss_threshold_pct": -0.08
+    "position_wallet_exposure_pct": 0.25,
+    "wallet_exposure_pct": 0.65
   },
+  "api_keys_file": "/root/passivbot/api-keys.json",
+  "auth": {
+    "https_only": false,
+    "secret_key": "jhgjhguyg^^554$$67CFCGFDGFd",
+    "session_cookie_name": "risk_dashboard_session",
+    "users": {
+      "admin": "$2b$12$jD2cJ2Oinrqb7EBh4yqz.eg1hsS2Xf/H1Gt2CH.Lo.6bo7.BY957O"
+    }
+  },
+  "custom_endpoints": {
+    "autodiscover": false,
+    "path": "/root/passivbot/configs/custom_endpoints.json"
+  },
+  "debug_api_payloads": false,
   "email": {
     "host": "smtppro.zoho.in",
-    "port": 587,
-    "username": "admin@plezna.com",
     "password": "L4naQ6CKK4Ja",
+    "port": 587,
     "sender": "admin@plezna.com",
-    "use_tls": true
+    "use_tls": true,
+    "username": "admin@plezna.com"
+  },
+  "grafana": {
+    "base_url": "https://108.160.138.76:8001/",
+    "dashboards": [
+      {
+        "description": "NAV, profit rate, and drawdown metrics across the portfolio.",
+        "title": "Portfolio overview",
+        "url": "d-solo/abc123/portfolio-overview?orgId=1&from=now-7d&to=now&panelId=2&refresh=1m"
+      },
+      {
+        "description": "Wallet exposure, leverage ratios, and asset allocation breakdowns.",
+        "title": "Exposure & leverage",
+        "url": "d-solo/def456/portfolio-exposure?orgId=1&from=now-7d&to=now&panelId=6&refresh=1m"
+      }
+    ],
+    "default_height": 620
   },
   "notification_channels": [
     "email:admin@plezna.com",
     "slack:#passivbot-risk-alerts"
   ],
-  "auth": {
-    "secret_key": "jhgjhguyg^^554$$67CFCGFDGFd",
-    "session_cookie_name": "risk_dashboard_session",
-    "https_only": false,
-    "users": {
-      "admin": ""
-    }
-  }
+  "reports_dir": "../risk_reports"
 }

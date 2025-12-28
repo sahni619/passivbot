@@ -21,8 +21,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence
-
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 from .configuration import CustomEndpointSettings, load_realtime_config
 from .models import AccountState, Order, Position, RiskLimits
 
@@ -120,7 +119,11 @@ def _parse_position(raw: Dict[str, Any]) -> Position:
     )
 
 
-def _parse_account(raw: Dict[str, Any]) -> Account:
+def _parse_account(raw: Union[Dict[str, Any], AccountState]) -> Account:
+    # If an AccountState is already provided, just return it as-is
+    if isinstance(raw, AccountState):
+        return raw
+
     if "name" not in raw or "balance" not in raw:
         raise ValueError("Account entries must include 'name' and 'balance'.")
 
@@ -145,7 +148,6 @@ def _parse_account(raw: Dict[str, Any]) -> Account:
         risk_limits=raw.get("risk_limits"),
         exchange=raw.get("exchange"),
     )
-
 
 def _parse_order(raw: Mapping[str, Any]) -> Order:
     symbol = str(raw.get("symbol", ""))
@@ -175,8 +177,17 @@ def _parse_order(raw: Mapping[str, Any]) -> Order:
     )
 
 
-def _parse_thresholds(raw: Dict[str, Any]) -> AlertThresholds:
+def _parse_thresholds(raw: Any) -> AlertThresholds:
+    # If we already have an AlertThresholds / RiskLimits instance, just return it
+    if isinstance(raw, AlertThresholds):
+        return raw
+
     thresholds = AlertThresholds()
+
+    # If it's not a mapping (e.g. None or some unexpected type), just return defaults
+    if not isinstance(raw, Mapping):
+        return thresholds
+
     for key in (
         "wallet_exposure_pct",
         "position_wallet_exposure_pct",
@@ -184,9 +195,12 @@ def _parse_thresholds(raw: Dict[str, Any]) -> AlertThresholds:
         "loss_threshold_pct",
     ):
         if key in raw:
-            setattr(thresholds, key, float(raw[key]))
+            try:
+                setattr(thresholds, key, float(raw[key]))
+            except (TypeError, ValueError):
+                # Ignore non-numeric values defensively
+                continue
     return thresholds
-
 
 def load_snapshot(path: Path) -> Dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -213,11 +227,17 @@ def parse_snapshot(data: Dict[str, Any]) -> tuple[datetime, Sequence[Account], A
     else:
         generated_at = datetime.now(timezone.utc)
 
-    accounts = [_parse_account(acc) for acc in data.get("accounts", [])]
+    raw_accounts = data.get("accounts", [])
+    accounts: List[Account] = []
+    for acc in raw_accounts:
+        if isinstance(acc, AccountState):
+            accounts.append(acc)
+        else:
+            accounts.append(_parse_account(acc))
+
     thresholds = _parse_thresholds(data.get("alert_thresholds", {}))
     notifications = [str(channel) for channel in data.get("notification_channels", [])]
     return generated_at, accounts, thresholds, notifications
-
 
 def evaluate_alerts(accounts: Sequence[Account], thresholds: AlertThresholds) -> List[str]:
     alerts: List[str] = []

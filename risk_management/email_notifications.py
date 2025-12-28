@@ -31,22 +31,27 @@ class EmailAlertSender:
         if not recipients:
             return
 
+        # Normalise recipient list and drop any empty/falsey entries
+        clean_recipients = [r for r in recipients if r]
+        if not clean_recipients:
+            return
+
         message = EmailMessage()
         message["Subject"] = subject
         sender = self._determine_sender()
         message["From"] = sender
-        message["To"] = ", ".join(recipient for recipient in recipients if recipient)
+        message["To"] = ", ".join(clean_recipients)
         message.set_content(body)
 
         try:
             if self._settings.use_ssl:
                 with smtplib.SMTP_SSL(self._settings.host, self._settings.port, timeout=10) as smtp:
-                    self._authenticate_and_send(smtp, message, recipients)
+                    self._authenticate_and_send(smtp, message, clean_recipients)
             else:
                 with smtplib.SMTP(self._settings.host, self._settings.port, timeout=10) as smtp:
                     if self._settings.use_tls:
                         smtp.starttls()
-                    self._authenticate_and_send(smtp, message, recipients)
+                    self._authenticate_and_send(smtp, message, clean_recipients)
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.error("Failed to send alert email: %s", exc, exc_info=True)
 
@@ -62,9 +67,15 @@ class EmailAlertSender:
     ) -> None:
         username = self._settings.username
         password = self._settings.password
+
+        # Defensively clean recipients again in case this is used elsewhere
+        recipient_list = [r for r in recipients if r]
+        if not recipient_list:
+            return
+
         if username and password:
             smtp.login(username, password)
-        smtp.send_message(message, from_addr=message["From"], to_addrs=list(recipients))
+        smtp.send_message(message, from_addr=message["From"], to_addrs=recipient_list)
 
 
 __all__ = ["EmailAlertSender"]

@@ -20,8 +20,17 @@ def build_presentable_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     generated_at, accounts, thresholds, notifications = parse_snapshot(dict(snapshot))
     alerts = evaluate_alerts(accounts, thresholds)
     account_messages = snapshot.get("account_messages", {}) if isinstance(snapshot, Mapping) else {}
+
+    # Build views and determine which accounts are hidden vs visible
     account_views = _build_account_views(accounts, account_messages)
-    portfolio = _build_portfolio_view(accounts)
+
+    # Accounts without a status message are considered "visible" for exposure calculations
+    visible_accounts = [acc for acc in accounts if not account_messages.get(acc.name)]
+
+    # Portfolio:
+    # - balance uses all accounts
+    # - exposure / symbols use only visible accounts
+    portfolio = _build_portfolio_view(accounts, exposure_accounts=visible_accounts)
 
     payload: Dict[str, Any] = {
         "generated_at": generated_at.isoformat(),
@@ -46,7 +55,6 @@ def build_presentable_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
 
     return payload
 
-
 def _build_account_views(
     accounts: Sequence[Account], account_messages: Mapping[str, str]
 ) -> Dict[str, list[Dict[str, Any]]]:
@@ -63,11 +71,26 @@ def _build_account_views(
     return {"visible": visible_accounts, "hidden": hidden_accounts}
 
 
-def _build_portfolio_view(accounts: Sequence[Account]) -> Dict[str, Any]:
+def _build_portfolio_view(
+    accounts: Sequence[Account],
+    exposure_accounts: Optional[Sequence[Account]] = None,
+) -> Dict[str, Any]:
+    """Aggregate portfolio metrics across accounts.
+
+    - `accounts`: all accounts contributing to portfolio balance
+    - `exposure_accounts`: subset of accounts whose positions should contribute
+      to exposure (gross/net), volatility, funding, etc. If None, all accounts
+      are used for exposure as well.
+    """
+    # Balance is always computed from all accounts
     total_balance = sum(account.balance.total for account in accounts)
-    gross_notional = sum(account.total_abs_notional() for account in accounts)
-    net_notional = sum(account.net_notional() for account in accounts)
-    daily_realized = sum(account.total_daily_realized() for account in accounts)
+
+    # Positions / exposure metrics only come from exposure_accounts (or all if not provided)
+    exposure_source = list(exposure_accounts) if exposure_accounts is not None else list(accounts)
+
+    gross_notional = sum(account.total_abs_notional() for account in exposure_source)
+    net_notional = sum(account.net_notional() for account in exposure_source)
+    daily_realized = sum(account.total_daily_realized() for account in exposure_source)
 
     symbol_data: Dict[str, Dict[str, Any]] = {}
     portfolio_volatility: Dict[str, float] = {}
@@ -75,7 +98,7 @@ def _build_portfolio_view(accounts: Sequence[Account]) -> Dict[str, Any]:
     volatility_weights: Dict[str, float] = {}
     funding_weights: Dict[str, float] = {}
 
-    for account in accounts:
+    for account in exposure_source:
         for position in account.positions:
             signed = (
                 position.signed_notional
@@ -132,7 +155,6 @@ def _build_portfolio_view(accounts: Sequence[Account]) -> Dict[str, Any]:
         "funding_rates": _finalise_metric(portfolio_funding, funding_weights),
         "symbols": symbol_entries,
     }
-
 
 def _build_account_view(account: Account, account_messages: Mapping[str, str]) -> Dict[str, Any]:
     positions = [_build_position_view(position, account.balance.total) for position in account.positions]
