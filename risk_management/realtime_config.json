@@ -74,7 +74,7 @@
     "session_cookie_name": "risk_dashboard_session",
     "https_only": false,
     "users": {
-      "admin": "$2b$12$0ZCLkFp6iuhlEFshgPCBz.0dXxmRCV4vcjxHfRh0qKtzc79Pj9c5W"
+      "admin": ""
     }
   }
 }
