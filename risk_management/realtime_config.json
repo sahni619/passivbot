@@ -3,13 +3,21 @@
     {
       "api_key_id": "binance_01",
       "exchange": "binanceusdm",
+<<<<<<< HEAD
       "name": "Binance Futures AlphaMint",
+=======
+      "name": "Binance Futures TheAlter",
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
       "settle_currency": "USDT"
     },
     {
       "api_key_id": "okx_01",
       "exchange": "okx",
+<<<<<<< HEAD
       "name": "OKX Futures Prismatic",
+=======
+      "name": "OKX Futures",
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
       "params": {
         "balance": {
           "type": "swap"
@@ -23,7 +31,11 @@
     {
       "api_key_id": "bybit_01",
       "exchange": "bybit",
+<<<<<<< HEAD
       "name": "Bybit USDT Perpetuals TheAlternative",
+=======
+      "name": "Bybit USDT Perpetuals AlphaMint",
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
       "params": {
         "balance": {
           "type": "swap"
@@ -35,6 +47,7 @@
       "settle_currency": "USDT"
     },
     {
+<<<<<<< HEAD
       "api_key_id": "binance_02",
       "enabled": true,
       "exchange": "binanceusdm",
@@ -48,6 +61,12 @@
       "enabled": true,
       "exchange": "okx",
       "name": "OKX Futures Stellarpath USDT",
+=======
+      "api_key_id": "bybit_02",
+      "enabled": false,
+      "exchange": "bybit",
+      "name": "Bybit SL",
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
       "params": {
         "balance": {
           "type": "swap"
@@ -58,6 +77,7 @@
       },
       "settle_currency": "USDT",
       "symbols": null
+<<<<<<< HEAD
     },
     {
       "api_key_id": "binance_03",
@@ -67,6 +87,8 @@
       "params": {},
       "settle_currency": "USDT",
       "symbols": null
+=======
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
     }
   ],
   "alert_thresholds": {
@@ -81,7 +103,11 @@
     "secret_key": "jhgjhguyg^^554$$67CFCGFDGFd",
     "session_cookie_name": "risk_dashboard_session",
     "users": {
+<<<<<<< HEAD
       "admin": "$2b$12$jD2cJ2Oinrqb7EBh4yqz.eg1hsS2Xf/H1Gt2CH.Lo.6bo7.BY957O"
+=======
+      "admin": "$2b$12$0ZCLkFp6iuhlEFshgPCBz.0dXxmRCV4vcjxHfRh0qKtzc79Pj9c5W"
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
     }
   },
   "custom_endpoints": {
@@ -118,4 +144,8 @@
     "slack:#passivbot-risk-alerts"
   ],
   "reports_dir": "../risk_reports"
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f

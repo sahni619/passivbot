@@ -4,6 +4,7 @@
     "key": "3a85ae8a-8384-4d72-b363-8a5daf4a9bc6",
     "secret": "8778e084f476aaf6379ec9e33ac9ca133e82231c31a1cebdba5fc56b80066f04"
   },
+<<<<<<< HEAD
   "binance_02": {
     "exchange": "binance",
     "key": "83553d3a-b79c-4ff9-bc64-a0dd703a1d3c",
@@ -13,17 +14,48 @@
     "exchange": "binance",
     "key": "50702821-b30c-4d9f-acdc-e8ee11fb6576",
     "secret": "7e335f03dccd867f0f54cd4ef39b975d8a4adfa220bd1d4c9abec3fd14d00d29"
+=======
+  "bitget_01": {
+    "exchange": "bitget",
+    "key": "key",
+    "passphrase": "passphrase",
+    "secret": "secret"
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
   },
   "bybit_01": {
     "exchange": "bybit",
     "key": "9f2d4d1c-5dcd-4a9c-b823-e4e9b4705ba0",
     "secret": "7bb418d6a21177908d1a40de4fa288b7c2e47890edef1ebd453846f85531b0e1"
   },
+<<<<<<< HEAD
   "okx_01": {
     "exchange": "okx",
     "key": "3eff5ee5-69ef-4c8c-b82f-dcd9e1f28690",
     "passphrase": "e_WRwNLz*Q4DzCcayFFD",
     "secret": "33F611C5AFAC722104A09630E3B45574"
+=======
+  "bybit_02": {
+    "exchange": "bybit",
+    "key": "OBjmw3g3jaNY2IAwGu",
+    "secret": "lFOCAQ9CIFOJdJUdhMCUfXeBqLPGjrtP6quG"
+  },
+  "gateio_01": {
+    "exchange": "gateio",
+    "key": "key",
+    "secret": "secret"
+  },
+  "hyperliquid_01": {
+    "exchange": "hyperliquid",
+    "is_vault": false,
+    "private_key": "private_key",
+    "wallet_address": "wallet_address"
+  },
+  "okx_01": {
+    "exchange": "okx",
+    "key": "key",
+    "passphrase": "passphrase",
+    "secret": "secret"
+>>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
   },
   "referrals": {
     "binance": "https://accounts.binance.com/register?ref=TII4B07C",
