@@ -1,41 +1,9 @@
 {
   "accounts": [
     {
-      "api_key_id": "binance_01",
-      "exchange": "binanceusdm",
-<<<<<<< HEAD
-      "name": "Binance Futures AlphaMint",
-=======
-      "name": "Binance Futures TheAlter",
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
-      "settle_currency": "USDT"
-    },
-    {
-      "api_key_id": "okx_01",
-      "exchange": "okx",
-<<<<<<< HEAD
-      "name": "OKX Futures Prismatic",
-=======
-      "name": "OKX Futures",
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
-      "params": {
-        "balance": {
-          "type": "swap"
-        },
-        "positions": {
-          "type": "swap"
-        }
-      },
-      "settle_currency": "USDT"
-    },
-    {
       "api_key_id": "bybit_01",
       "exchange": "bybit",
-<<<<<<< HEAD
-      "name": "Bybit USDT Perpetuals TheAlternative",
-=======
-      "name": "Bybit USDT Perpetuals AlphaMint",
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
+      "name": "Bybit USDT Perpetuals TheAlter",
       "params": {
         "balance": {
           "type": "swap"
@@ -47,8 +15,25 @@
       "settle_currency": "USDT"
     },
     {
-<<<<<<< HEAD
-      "api_key_id": "binance_02",
+      "api_key_id": "binance_01",
+      "enabled": true,
+      "exchange": "binanceusdm",
+      "name": "Binance Futures AlphaMint",
+      "params": {},
+      "settle_currency": "USDT",
+      "symbols": null
+    },
+    {
+      "api_key_id": "bybit_02",
+      "enabled": true,
+      "exchange": "bybit",
+      "name": "Bybit  Fasanara",
+      "params": {},
+      "settle_currency": "BTC",
+      "symbols": null
+    },
+    {
+      "api_key_id": "binance_03",
       "enabled": true,
       "exchange": "binanceusdm",
       "name": "Binance Futures SGM USDT",
@@ -57,38 +42,40 @@
       "symbols": null
     },
     {
-      "api_key_id": "okx_02",
-      "enabled": true,
-      "exchange": "okx",
-      "name": "OKX Futures Stellarpath USDT",
-=======
-      "api_key_id": "bybit_02",
-      "enabled": false,
-      "exchange": "bybit",
-      "name": "Bybit SL",
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
-      "params": {
-        "balance": {
-          "type": "swap"
-        },
-        "positions": {
-          "type": "swap"
-        }
-      },
-      "settle_currency": "USDT",
-      "symbols": null
-<<<<<<< HEAD
-    },
-    {
-      "api_key_id": "binance_03",
+      "api_key_id": "binance_04",
       "enabled": true,
       "exchange": "binanceusdm",
       "name": "Binance Futures SGM BTC",
       "params": {},
+      "settle_currency": "BTC",
+      "symbols": null
+    },
+    {
+      "api_key_id": "binance_02",
+      "enabled": false,
+      "exchange": "binanceusdm",
+      "name": "Binance Futures ET",
+      "params": {},
       "settle_currency": "USDT",
       "symbols": null
-=======
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
+    },
+    {
+      "api_key_id": "bybit_03",
+      "enabled": false,
+      "exchange": "bybit",
+      "name": "Bybit Personal",
+      "params": {},
+      "settle_currency": "USDT",
+      "symbols": null
+    },
+    {
+      "api_key_id": "binance_05",
+      "enabled": false,
+      "exchange": "binanceusdm",
+      "name": "Binance Futures Personal",
+      "params": {},
+      "settle_currency": "USDT",
+      "symbols": null
     }
   ],
   "alert_thresholds": {
@@ -103,11 +90,7 @@
     "secret_key": "jhgjhguyg^^554$$67CFCGFDGFd",
     "session_cookie_name": "risk_dashboard_session",
     "users": {
-<<<<<<< HEAD
       "admin": "$2b$12$jD2cJ2Oinrqb7EBh4yqz.eg1hsS2Xf/H1Gt2CH.Lo.6bo7.BY957O"
-=======
-      "admin": "$2b$12$0ZCLkFp6iuhlEFshgPCBz.0dXxmRCV4vcjxHfRh0qKtzc79Pj9c5W"
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
     }
   },
   "custom_endpoints": {
@@ -144,8 +127,4 @@
     "slack:#passivbot-risk-alerts"
   ],
   "reports_dir": "../risk_reports"
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> d76a1af5721171af2ff1925b02b80694aa44623f
