@@ -16,6 +16,7 @@ All notable user-facing changes will be documented in this file.
 - Rust compile flow now less noisy in normal operation (debug lock prints removed); compile attempts still logged when rebuilding.
 - Balance hysteresis now applied centrally in core bot update_balance; exchange fetch_balance implementations return raw balances.
 - Added configurable `live.balance_hysteresis_snap_pct` (default 0.02); set 0.0 to disable balance hysteresis entirely.
+- Optimizer: bounds now support optional step size `[low, high, step]` for grid-based optimization; stepped parameters stay on-grid through sampling, crossover/mutation, and Pareto storage.
 
 ### Changed
 - Pareto explorer: default metrics for X/Y/histogram, scenario comparison, param scatter, correlation heatmap, and Closest Config now derive from `config.optimize.scoring` and `config.optimize.limits` instead of first-alphabetical metrics; Closest Config table no longer shows raw *_mean/_min/_max/_std stat columns by default.
@@ -27,3 +28,7 @@ All notable user-facing changes will be documented in this file.
 - KuCoin `get_order_execution_params` now aligns with the latest CCXT payload requirements so orders always include the correct margin/position parameters after the CCXT upgrade.
 - Added Pareto regression test to ensure per-metric extremes remain present after front pruning.
 - Metric adg_pnl now includes fees paid, effectively making it net pnl instead of gross pnl.
+- Risk management docs refreshed and consolidated; new notes on unstucking, WEL/TWEL enforcers, and conditional stop-loss concepts.
+- Balance updates now keep the previous value on fetch failures (no more transient zero balances); warnings are logged and the standard restart-on-errors flow handles persistent issues.
+- EMA log spam reduced: volume/log-range EMA summaries only emit when rankings change, keeping live logs quieter.
+- Suite configuration is canonical under `backtest.suite` for both backtesting and optimizer runs; `optimize.suite` (if present) is ignored and removed during config normalization.

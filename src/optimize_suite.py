@@ -22,6 +22,7 @@ from config_utils import (
 from shared_arrays import attach_shared_array
 from suite_runner import (
     SuiteScenario,
+    extract_suite_config,
     aggregate_metrics,
     apply_scenario,
     build_scenarios,
@@ -308,11 +309,10 @@ def ensure_suite_config(config_path: Path, suite_path: Optional[Path]) -> Dict[s
     config = parse_overrides(config, verbose=False)
     suite_override = None
     if suite_path:
-        suite_override = load_config(str(suite_path), verbose=False).get("optimize", {}).get("suite")
+        suite_override = load_config(str(suite_path), verbose=False).get("backtest", {}).get("suite")
         if suite_override is None:
-            raise ValueError(f"Suite config {suite_path} must provide optimize.suite definition.")
-    suite_cfg = extract_optimize_suite_config(config, suite_override)
-    return suite_cfg
+            raise ValueError(f"Suite config {suite_path} must provide backtest.suite definition.")
+    return extract_suite_config(config, suite_override)
 
 
 def summarized_metrics(
@@ -325,10 +325,7 @@ def summarized_metrics(
     return payload
 
 
-def extract_optimize_suite_config(
-    config: Dict[str, Any], suite_override: Optional[Dict[str, Any]]
-) -> Dict[str, Any]:
-    suite_cfg = deepcopy(config.get("optimize", {}).get("suite", {}) or {})
-    if suite_override:
-        suite_cfg.update(deepcopy(suite_override))
-    return suite_cfg
+#
+# Suite configuration is canonical under backtest.suite.
+# Optimizer suite uses the same schema and reads it via suite_runner.extract_suite_config().
+#

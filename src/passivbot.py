@@ -3125,7 +3125,14 @@ class Passivbot:
                     logging.debug("update_balance: no fetch_balance implemented")
                     return False
                 balance = await self.fetch_balance()
-            if balance is None:
+            # Only accept numeric balances; keep previous value on failure
+            if balance is None or balance is False:
+                logging.warning("balance fetch failed; keeping previous balance")
+                return False
+            try:
+                balance = float(balance)
+            except (TypeError, ValueError):
+                logging.warning("non-numeric balance fetch result; keeping previous balance")
                 return False
             if self.balance_override is None:
                 if self.previous_hysteresis_balance is None:
@@ -4383,10 +4390,18 @@ class Passivbot:
         if out:
             top_n = min(8, len(out))
             top = sorted(out.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
-            summary = ", ".join(f"{symbol_to_coin(sym)}={val:.6f}" for sym, val in top)
-            logging.info(
-                f"log_range EMA span {span}: {n} coins elapsed={int(elapsed_s)}s, top{top_n}: {summary}"
-            )
+            top_syms = tuple(sym for sym, _ in top)
+            # Only log when the ranking changes (membership/order) to reduce noise.
+            if not hasattr(self, "_log_range_top_cache"):
+                self._log_range_top_cache = {}
+            cache_key = (pside, span)
+            last_top = self._log_range_top_cache.get(cache_key)
+            if last_top != top_syms:
+                self._log_range_top_cache[cache_key] = top_syms
+                summary = ", ".join(f"{symbol_to_coin(sym)}={val:.6f}" for sym, val in top)
+                logging.info(
+                    f"log_range EMA span {span}: {n} coins elapsed={int(elapsed_s)}s, top{top_n}: {summary}"
+                )
         return out
 
     async def calc_volumes(
@@ -4440,10 +4455,17 @@ class Passivbot:
         if out:
             top_n = min(8, len(out))
             top = sorted(out.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
-            summary = ", ".join(f"{symbol_to_coin(sym)}={val:.2f}" for sym, val in top)
-            logging.info(
-                f"volume EMA span {span}: {n} coins elapsed={int(elapsed_s)}s, top{top_n}: {summary}"
-            )
+            top_syms = tuple(sym for sym, _ in top)
+            if not hasattr(self, "_volume_top_cache"):
+                self._volume_top_cache = {}
+            cache_key = (pside, span)
+            last_top = self._volume_top_cache.get(cache_key)
+            if last_top != top_syms:
+                self._volume_top_cache[cache_key] = top_syms
+                summary = ", ".join(f"{symbol_to_coin(sym)}={val:.2f}" for sym, val in top)
+                logging.info(
+                    f"volume EMA span {span}: {n} coins elapsed={int(elapsed_s)}s, top{top_n}: {summary}"
+                )
         return out
 
     async def execute_multiple(self, orders: [dict], type_: str):

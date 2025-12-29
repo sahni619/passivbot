@@ -70,6 +70,7 @@ CURRENCY_METRICS = {
 
 SHARED_METRICS = {
     "positions_held_per_day",
+    "positions_held_per_day_w",
     "position_held_hours_mean",
     "position_held_hours_max",
     "position_held_hours_median",
@@ -974,7 +975,11 @@ def _sync_with_template(
         template_with_extras,
         result,
         verbose=verbose,
-        preserve=[("coin_overrides",)],
+        preserve=[
+            ("coin_overrides",),
+            ("backtest", "suite", "aggregate"),
+            ("backtest", "suite", "scenarios"),
+        ],
         tracker=tracker,
     )
     remove_unused_keys_recursively(template["bot"], result["bot"], verbose=verbose, tracker=tracker)
@@ -1013,7 +1018,17 @@ def _normalize_coin_sources(raw: Any) -> Dict[str, str]:
     for coin, exchange in raw.items():
         if exchange is None:
             continue
-        normalized[str(coin)] = str(exchange)
+        coin_key = symbol_to_coin(str(coin), verbose=False)
+        if not coin_key:
+            continue
+        exchange_value = str(exchange)
+        existing = normalized.get(coin_key)
+        if existing is not None and existing != exchange_value:
+            raise ValueError(
+                f"backtest.coin_sources maps conflicting exchanges for {coin_key}: "
+                f"{existing} and {exchange_value}"
+            )
+        normalized[coin_key] = exchange_value
     return normalized
 
 
@@ -1108,10 +1123,15 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
         result.setdefault("backtest", {})["coin_sources"] = coin_sources_input
     _preserve_coin_sources(result)
 
-    if not optimize_suite_defined:
-        backtest_suite = result.get("backtest", {}).get("suite")
-        if backtest_suite is not None:
-            result.setdefault("optimize", {})["suite"] = deepcopy(backtest_suite)
+    if optimize_suite_defined:
+        logging.warning(
+            "Config contains optimize.suite, but suite configuration is now canonical under "
+            "backtest.suite only. optimize.suite will be ignored and deleted; backtest.suite will "
+            "be used. If you need different suite definitions, pass --suite-config with a file "
+            "containing backtest.suite."
+        )
+        if isinstance(result.get("optimize"), dict) and "suite" in result["optimize"]:
+            del result["optimize"]["suite"]
 
     if not live_only:
         # unneeded adjustments if running live
@@ -1529,16 +1549,23 @@ def remove_unused_keys_recursively(
         return
     if not isinstance(dst, dict) or not isinstance(src, dict):
         return
-    for k in sorted(list(dst.keys())):
+    def _sort_key(value) -> tuple[str, str]:
+        """Sort keys by type name, then by string representation."""
+        return (type(value).__name__, str(value))
+
+    for k in sorted(list(dst.keys()), key=_sort_key):
         current_path = parent + [k]
         if _path_is_preserved(current_path):
             continue
-        if k.startswith("_"):
+        if isinstance(k, str) and k.startswith("_"):
             continue
         if k not in src:
             removed = dst.pop(k)
             _log_config(
-                verbose, logging.INFO, "Removed unused key from config: %s", ".".join(current_path)
+                verbose,
+                logging.INFO,
+                "Removed unused key from config: %s",
+                ".".join(map(str, current_path)),
             )
             if tracker is not None:
                 tracker.remove(current_path, removed)
@@ -1845,6 +1872,7 @@ def get_template_config():
             "base_dir": "backtests",
             "combine_ohlcvs": True,
             "compress_cache": True,
+            "coin_sources": {},
             "end_date": "now",
             "exchanges": ["binance", "bybit", "gateio", "bitget"],
             "gap_tolerance_ohlcvs_minutes": 120.0,
@@ -2066,12 +2094,5 @@ def get_template_config():
             "scoring": ["adg", "sharpe_ratio"],
             "write_all_results": True,
             "pareto_max_size": 300,
-            "suite": {
-                "enabled": False,
-                "include_base_scenario": False,
-                "base_label": "base",
-                "aggregate": {"default": "mean"},
-                "scenarios": [],
-            },
         },
     }
