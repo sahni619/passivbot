@@ -41,6 +41,7 @@ from .configuration import CustomEndpointSettings, RealtimeConfig
 from .email_notifications import EmailAlertSender
 from .telegram_notifications import TelegramNotifier
 from services.telemetry import ResiliencePolicy, Telemetry
+from services.persistence.history import PortfolioHistoryStore
 from .realtime_components import (
     ClientOrchestrator,
     KillSwitchExecutor,
@@ -48,8 +49,11 @@ from .realtime_components import (
     ResilientExecutor,
     SnapshotPolicyEvaluator,
 )
+from .cashflow_detector import CashflowDetector, CashflowDetectorConfig
+from .logging_config import set_correlation_id, set_account_context, AuditLogger
 
 logger = logging.getLogger(__name__)
+audit_logger = AuditLogger()
 
 def _exception_info(
     exc: BaseException,
@@ -182,6 +186,21 @@ class RealtimeDataFetcher:
         self._last_portfolio_balance: Optional[float] = None
         self._conditional_stop_losses: list[Dict[str, Any]] = []
         self._policy_evaluator: PolicyEvaluator = policy_evaluator or SnapshotPolicyEvaluator()
+        
+        # Initialize cashflow detection (institutional enhancement)
+        self._cashflow_detector = CashflowDetector(
+            config=CashflowDetectorConfig(
+                enabled=getattr(config, 'cashflow_detection_enabled', True),
+                detection_threshold=getattr(config, 'cashflow_detection_threshold', 10.0),
+            )
+        )
+        
+        # Initialize portfolio history store for cashflow tracking
+        history_dir = getattr(config, 'history_dir', Path(config.reports_dir) / "history")
+        self._history_store = PortfolioHistoryStore(history_dir)
+        
+        # Track account balance history for cashflow detection
+        self._account_balance_history: Dict[str, float] = {}
         self._notification_dispatcher = notification_dispatcher or NotificationDispatcher(
             self._executor,
             email_sender=self._email_sender,
@@ -237,21 +256,109 @@ class RealtimeDataFetcher:
         return targets
 
     async def fetch_snapshot(self) -> Dict[str, Any]:
+        # Set correlation ID for tracking this snapshot through the system
+        correlation_id = set_correlation_id()
+        
         accounts_payload, account_messages = await self._orchestrator.fetch()
         snapshot = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "accounts": accounts_payload,
             "alert_thresholds": self.config.alert_thresholds,
             "notification_channels": self.config.notification_channels,
+            "correlation_id": correlation_id,
         }
         if account_messages:
             snapshot["account_messages"] = account_messages
+        
+        # INSTITUTIONAL ENHANCEMENT: Detect cashflows (deposits/withdrawals)
+        all_cashflow_events = []
+        for account_data in accounts_payload:
+            account_name = account_data.get("name", "unknown")
+            set_account_context(account_name)
+            
+            current_balance = float(account_data.get("balance", 0.0))
+            previous_balance = self._account_balance_history.get(account_name, current_balance)
+            
+            # Only detect if we have previous balance to compare
+            if account_name in self._account_balance_history and abs(current_balance - previous_balance) > 0.01:
+                try:
+                    # Get exchange client for this account
+                    exchange_client = None
+                    for client in self._account_clients:
+                        if hasattr(client, 'config') and client.config.name == account_name:
+                            exchange_client = getattr(client, 'client', None)
+                            break
+                    
+                    # Detect cashflows
+                    cashflow_events = await self._cashflow_detector.detect_cashflows(
+                        account=account_name,
+                        current_balance=current_balance,
+                        previous_balance=previous_balance,
+                        exchange_client=exchange_client,
+                        currency=account_data.get("settle_currency", "USDT"),
+                        unrealized_pnl=float(account_data.get("unrealized_pnl", 0.0)),
+                        realized_pnl=float(account_data.get("daily_realized_pnl", 0.0)),
+                        account_data=account_data,
+                    )
+                    
+                    # Record cashflows in history store
+                    for event in cashflow_events:
+                        try:
+                            await self._history_store.add_cashflow_async(
+                                flow_type=event.flow_type,
+                                amount=event.amount,
+                                currency=event.currency,
+                                timestamp=event.timestamp,
+                                account=event.account,
+                                note=f"Auto-detected ({event.detection_method}, confidence: {event.confidence:.2f})"
+                            )
+                            logger.info(
+                                "Recorded %s of %.2f %s on %s",
+                                event.flow_type,
+                                event.amount,
+                                event.currency,
+                                event.account,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to record cashflow in history store: %s",
+                                exc,
+                                exc_info=True
+                            )
+                    
+                    all_cashflow_events.extend(cashflow_events)
+                    
+                except Exception as exc:
+                    logger.warning(
+                        "Cashflow detection failed for %s: %s",
+                        account_name,
+                        exc,
+                        exc_info=True
+                    )
+            
+            # Update balance history
+            self._account_balance_history[account_name] = current_balance
+        
+        # Add cashflows to snapshot if any detected
+        if all_cashflow_events:
+            snapshot["cashflow_events"] = [event.to_dict() for event in all_cashflow_events]
+            logger.info(
+                "Detected %d cashflow event(s) in this snapshot",
+                len(all_cashflow_events)
+            )
+        
         portfolio_balance = sum(
             float(account.get("balance", 0.0)) for account in accounts_payload
         )
         unrealized_total = sum(float(account.get("unrealized_pnl", 0.0)) for account in accounts_payload)
         portfolio_equity = portfolio_balance + unrealized_total
         self._last_portfolio_balance = portfolio_balance
+        
+        # Record snapshot in history store for historical analysis
+        try:
+            await self._history_store.record_async(snapshot)
+        except Exception as exc:
+            logger.warning("Failed to record snapshot in history: %s", exc)
         stop_loss_state = self._update_portfolio_stop_loss_state(portfolio_balance)
         if stop_loss_state:
             snapshot["portfolio_stop_loss"] = stop_loss_state

@@ -155,6 +155,7 @@ class NotificationDispatcher:
     async def dispatch(self, violations: Sequence[RiskViolation], snapshot: Mapping[str, Any]) -> None:
         await self._maybe_send_daily_snapshot(snapshot)
         await self._send_alerts(violations, snapshot)
+        await self._send_cashflow_alerts(snapshot)  # INSTITUTIONAL ENHANCEMENT
 
     async def _send_alerts(self, violations: Sequence[RiskViolation], snapshot: Mapping[str, Any]) -> None:
         if not (self._email_sender or self._telegram_notifier):
@@ -220,6 +221,98 @@ class NotificationDispatcher:
             "notification:email.daily", lambda: self._email_sender.send(subject, body, self._email_recipients)
         )
         self._daily_snapshot_sent_date = current_date
+
+    async def _send_cashflow_alerts(self, snapshot: Mapping[str, Any]) -> None:
+        """Send notifications for detected cashflow events (INSTITUTIONAL ENHANCEMENT).
+        
+        This method sends email and Telegram notifications for deposits and withdrawals
+        detected by the cashflow monitoring system.
+        """
+        # Check if there are any cashflow events in the snapshot
+        cashflow_events = snapshot.get("cashflow_events", [])
+        if not cashflow_events:
+            return
+        
+        if not (self._email_sender or self._telegram_notifier):
+            return
+        
+        # Process each cashflow event
+        for event in cashflow_events:
+            if not isinstance(event, Mapping):
+                continue
+            
+            flow_type = event.get("type", "unknown")
+            amount = float(event.get("amount", 0.0))
+            account = event.get("account", "unknown")
+            currency = event.get("currency", "USDT")
+            timestamp = event.get("timestamp", datetime.now(timezone.utc).isoformat())
+            detection_method = event.get("detection_method", "unknown")
+            confidence = float(event.get("confidence", 1.0))
+            
+            # Format notification message
+            flow_emoji = "💰" if flow_type == "deposit" else "📤"
+            subject = f"{'Deposit' if flow_type == 'deposit' else 'Withdrawal'} detected on {account}"
+            
+            email_body_lines = [
+                f"A {flow_type} was detected on account {account}:",
+                "",
+                f"Amount: ${amount:,.2f} {currency}",
+                f"Time: {timestamp}",
+                f"Account: {account}",
+                f"Detection method: {detection_method}",
+                f"Confidence: {confidence:.1%}",
+                "",
+                "This is an automated notification from the risk management system.",
+            ]
+            
+            if event.get("note"):
+                email_body_lines.insert(-1, "")
+                email_body_lines.insert(-1, f"Note: {event.get('note')}")
+            
+            body = "\n".join(email_body_lines)
+            
+            # Send email notification
+            if self._email_sender and self._email_recipients:
+                try:
+                    await self._executor.execute_threaded(
+                        f"notification:email:cashflow:{account}",
+                        lambda: self._email_sender.send(subject, body, self._email_recipients)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send cashflow email for %s: %s",
+                        account,
+                        exc,
+                        exc_info=True
+                    )
+            
+            # Send Telegram notification
+            if self._telegram_notifier and self._telegram_targets:
+                telegram_message = (
+                    f"{flow_emoji} {flow_type.upper()} detected\n"
+                    f"Account: {account}\n"
+                    f"Amount: ${amount:,.2f} {currency}\n"
+                    f"Time: {timestamp}\n"
+                    f"Confidence: {confidence:.1%}"
+                )
+                
+                try:
+                    await asyncio.gather(*[
+                        self._executor.execute_threaded(
+                            f"notification:telegram:cashflow:{chat_id}",
+                            lambda token=token, chat_id=chat_id: self._telegram_notifier.send(
+                                token, chat_id, telegram_message
+                            )
+                        )
+                        for token, chat_id in self._telegram_targets
+                    ])
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send cashflow Telegram notification for %s: %s",
+                        account,
+                        exc,
+                        exc_info=True
+                    )
 
 
 class KillSwitchExecutor:
