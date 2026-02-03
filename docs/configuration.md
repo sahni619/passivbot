@@ -15,6 +15,7 @@ This document provides an overview of the parameters found in `config/template.j
 - **filter_by_min_effective_cost**: When `true`, skip coins whose projected initial entry
   (balance × wallet_exposure_limit × entry_initial_qty_pct, including WE excess allowance)
   would fall below the exchange’s effective minimum cost.
+- **maker_fee_override**: Optional maker fee override (part-per-one; use `0.0002` for 0.02%). Leave `null` to use the exchange-derived maker fees.
 - **balance_sample_divider**: Minutes per bucket when sampling balances/equity for
   `balance_and_equity.csv` and related plots. `1` keeps full per-minute resolution; higher values
   thin out the series (e.g., `15` stores one point every 15 minutes) to reduce file sizes.
@@ -247,6 +248,7 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 - **execution_delay_seconds**: Wait `x` seconds after executing to exchange.
 - **max_memory_candles_per_symbol**: Maximum number of 1m candles retained in RAM per symbol. Older entries are trimmed once this cap is exceeded. Default (`20_000`) balances memory footprint with trailing-history visibility.
 - **max_disk_candles_per_symbol_per_tf**: Maximum number of candles persisted on disk per symbol and timeframe. Oldest shards are pruned once the limit is hit (default `2_000_000`).
+- **candle_lock_timeout_seconds**: Seconds to wait when another process holds the CandlestickManager per-symbol candle fetch lock (default `10`). Increase when running many bots sharing the same cache directory to avoid spurious timeouts during slow API calls.
 - **filter_by_min_effective_cost**: If `true`, disallows coins where `balance * WE_limit * entry_initial_qty_pct < min_effective_cost`.
   - Example: If the exchange's effective minimum cost for a coin is `$5`, but the bot wants to make an order of `$2`, disallow that coin.
 - **forced_mode_long**, **forced_mode_short**: Force all coins long/short to a given mode.

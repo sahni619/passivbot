@@ -4,7 +4,7 @@
 
 :warning: **Used at one's own risk** :warning:
 
-v7.5.8
+v7.7.0
 
 
 ## Overview
@@ -13,7 +13,7 @@ Passivbot is a cryptocurrency trading bot written in Python and Rust, intended t
 
 It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements, it does not use technical indicators, nor does it follow trends. Rather, it is a contrarian market maker, providing resistance to price changes in both directions, thereby "serving the market" as a price stabilizer.  
 
-Passivbot's behavior may be backtested on historical price data, using the included backtester whose CPU heavy functions are written in Rust for speed. Also included is an optimizer, which finds better configurations by iterating thousands of backtests with different candidates, converging on the optimal ones with an evolutionary algorithm.  
+Order planning is computed by a shared Rust orchestrator used by both live trading and backtesting for speed and consistency. Also included is an optimizer, which finds better configurations by iterating thousands of backtests with different candidates, converging on the optimal ones with an evolutionary algorithm.  
 
 ## Strategy
 
@@ -35,6 +35,8 @@ Passivbot manages underperforming, or "stuck", positions by realizing small loss
 ## Installation
 
 To install Passivbot and its dependencies, follow the steps below.
+
+Passivbot requires **Python 3.12**. Earlier versions are not supported.
 
 ### Step 1: Clone the Repository
 
@@ -64,7 +66,7 @@ python3 -m venv venv
 
  **Windows (Command Prompt or PowerShell):**
 ```cmd
-python -m venv venv
+py -3.12 -m venv venv
 ```
 
 Activate the virtual environment:
@@ -116,6 +118,10 @@ Add your keys to api-keys.json.
 
 ### Step 7: Run Passivbot
 
+> **Hint:**  
+> To ensure cache folder names are Windows-compatible (even outside Windows), set the environment variable `WINDOWS_COMPATIBILITY=1`.   
+> This is only required in certain scenarios, e.g., running under Docker (Linux) while mounting the `caches` folder to a Windows host.
+
 To start the bot with the default settings, run:
 
 ```sh
@@ -133,6 +139,7 @@ python3 src/main.py path/to/config.json
 
 Passivbot uses Python's logging module throughout the bot, backtester, and supporting tools.  
 - Use `--debug-level {0-3}` (alias `--log-level`) on `src/main.py` or `src/backtest.py` to adjust verbosity at runtime: `0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`.  
+- Use `--verbose` on `src/main.py` to force debug logging (`--log-level debug`).  
 - Persist a default by adding a top-level section to your config: `"logging": {"level": 2}`. The CLI flag always overrides the config value for that run.
 - CandlestickManager and other subsystems inherit the chosen level so EMA warm-up, data fetching, and cache behaviour can be inspected consistently.
 
@@ -149,7 +156,7 @@ python3 -m jupyter lab
 
 ## Requirements
 
-- Python >= 3.8
+- Python >= 3.12
 - [requirements.txt](requirements.txt) dependencies
 
 ## Pre-optimized configurations
@@ -208,7 +215,7 @@ If the robot is profitable, consider donating as showing gratitude for its devel
 - USDT or USDC Arbitrum One:  
 0x4b7b5bf6bea228052b775c052843fde1c63ec530  
 - Zcash (ZEC):  
-t1Zi1f1YHa5uYNyeJEf98Hh6otxxXyUWuRr  
+u1jlans93rrqusqx2wp5020aezyt0q22l4tuy7ezkna06fuyaa2gxzremf50wsj3k83a4cm0cncs6zt9urlpte7a3nzvq992z48jxzem455acmhmhhwfwjcjwl8z79vlznla0r3jln6ety565254h96whnllcmepmpqu3ft9hxtqvkn0m7  
 
 Bitcoin (BTC) via Strike:  
 enarjord@strike.me

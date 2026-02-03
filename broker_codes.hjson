@@ -17,8 +17,12 @@
 			"broker-name": ""
 		}
 	}
+<<<<<<< HEAD
 	mexc: ""
 	hyperliquid: ""
 	gateio: ""
 	defx: ""
+=======
+	gateio: "passivbot"
+>>>>>>> ee07ce52bb61579319de03068587645450baa629
 }
