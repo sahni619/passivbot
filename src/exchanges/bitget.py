@@ -3,9 +3,10 @@ from passivbot import logging, custom_id_to_snake, clip_by_timestamp
 import asyncio
 import json
 import os
+from copy import deepcopy
 from typing import Dict, List, Tuple
-from utils import utc_ms, ts_to_date
-from config_utils import require_live_value
+from utils import symbol_to_coin, utc_ms, ts_to_date
+from config.access import require_live_value
 from pure_funcs import calc_hash
 import passivbot_rust as pbr
 
@@ -89,6 +90,15 @@ class BitgetBot(CCXTBot):
         super().__init__(config)
         self.custom_id_max_length = 64
 
+    def create_ccxt_sessions(self):
+        """Bitget: set Passivbot channel code for broker rebate attribution."""
+        super().create_ccxt_sessions()
+        if not isinstance(self.broker_code, str) or not self.broker_code:
+            raise ValueError("Bitget broker code must be a non-empty string")
+        for client in [self.cca, self.ccp]:
+            if client is not None:
+                client.options["broker"] = self.broker_code
+
     # ═══════════════════ HOOK OVERRIDES ═══════════════════
 
     def _get_position_side_for_order(self, order: dict) -> str:
@@ -102,18 +112,6 @@ class BitgetBot(CCXTBot):
         logging.debug(f"symbol {symbol} missing from self.symbol_ids, using as-is")
         self.symbol_ids[symbol] = symbol
         return symbol
-
-    async def determine_utc_offset(self, verbose=True):
-        # returns millis to add to utc to get exchange timestamp
-        # call some endpoint which includes timestamp for exchange's server
-        # if timestamp is not included in self.cca.fetch_balance(),
-        # implement method in exchange child class
-        result = await self.cca.fetch_ticker("BTC/USDT:USDT")
-        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
-            1000 * 60 * 60
-        )
-        if verbose:
-            logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
 
     def set_market_specific_settings(self):
         """Bitget override: higher minimum cost floor (5.1 USDT)."""
@@ -145,15 +143,19 @@ class BitgetBot(CCXTBot):
                         return "sell"
         raise Exception(f"failed to determine side {order}")
 
-    async def fetch_open_orders(self, symbol: str = None):
+    def _normalize_open_orders(self, fetched: list) -> list:
         """Bitget override: derive side from tradeSide/posSide."""
-        fetched = await self.cca.fetch_open_orders(symbol=symbol)
         for elm in fetched:
             elm["position_side"] = elm["info"]["posSide"]
             elm["qty"] = elm["amount"]
             elm["custom_id"] = elm["clientOrderId"]
             elm["side"] = self._determine_side(elm)
+            self._record_live_margin_mode_from_payload(elm)
         return sorted(fetched, key=lambda x: x["timestamp"])
+
+    async def fetch_open_orders(self, symbol: str = None):
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return self._normalize_open_orders(fetched)
 
     async def fetch_positions(self):
         """Bitget: use CCXT unified fields (contracts, entryPrice, side)."""
@@ -162,6 +164,25 @@ class BitgetBot(CCXTBot):
             elm["position_side"] = elm["side"]
             elm["size"] = elm["contracts"]
             elm["price"] = elm["entryPrice"]
+            margin_mode = self._extract_live_margin_mode(elm)
+            if margin_mode is not None:
+                elm["margin_mode"] = margin_mode
+                self._record_live_margin_mode(elm["symbol"], margin_mode)
+        return fetched
+
+    async def capture_positions_snapshot(self) -> tuple[list, list]:
+        fetched = await self._do_fetch_positions()
+        return fetched, self.fetch_positions_from_fetched(deepcopy(fetched))
+
+    def fetch_positions_from_fetched(self, fetched: list) -> list:
+        for elm in fetched:
+            elm["position_side"] = elm["side"]
+            elm["size"] = elm["contracts"]
+            elm["price"] = elm["entryPrice"]
+            margin_mode = self._extract_live_margin_mode(elm)
+            if margin_mode is not None:
+                elm["margin_mode"] = margin_mode
+                self._record_live_margin_mode(elm["symbol"], margin_mode)
         return fetched
 
     def _get_balance(self, fetched: dict) -> float:
@@ -264,13 +285,15 @@ class BitgetBot(CCXTBot):
                 logging.debug(
                     "bitget order detail missing clientOid for id=%s symbol=%s",
                     event["id"],
-                    event["symbol"],
+                    symbol_to_coin(event["symbol"] or "", verbose=False)
+                    or event["symbol"],
                 )
         except Exception as exc:
             logging.warning(
                 "failed to fetch bitget order detail for id=%s symbol=%s: %s",
                 event["id"],
-                event["symbol"],
+                symbol_to_coin(event["symbol"] or "", verbose=False)
+                or event["symbol"],
                 exc,
             )
 
@@ -440,7 +463,8 @@ class BitgetBot(CCXTBot):
                     logging.info(
                         "bitget fill without pb_order_type id=%s symbol=%s clientOrderId=%s %s %s %s @ %s",
                         elm.get("id"),
-                        elm.get("symbol"),
+                        symbol_to_coin(elm.get("symbol") or "", verbose=False)
+                        or elm.get("symbol"),
                         elm.get("clientOrderId"),
                         elm.get("side"),
                         elm.get("info", {}).get("posSide"),
@@ -547,45 +571,54 @@ class BitgetBot(CCXTBot):
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call_lev, coros_to_call_margin_mode = {}, {}
         for symbol in symbols:
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             try:
                 coros_to_call_margin_mode[symbol] = asyncio.create_task(
                     self.cca.set_margin_mode(
-                        "cross",
+                        margin_mode,
                         symbol=symbol,
                     )
                 )
             except Exception as e:
-                logging.error(f"{symbol}: error setting cross mode {e}")
+                logging.error(f"{log_symbol}: error setting {margin_mode} mode {e}")
             try:
                 coros_to_call_lev[symbol] = asyncio.create_task(
-                    self.cca.set_leverage(
-                        int(self.config_get(["live", "leverage"], symbol=symbol)), symbol=symbol
-                    )
+                    self.cca.set_leverage(self._calc_leverage_for_symbol(symbol), symbol=symbol)
                 )
             except Exception as e:
-                logging.error(f"{symbol}: error setting leverage {e}")
+                logging.error(f"{log_symbol}: error setting leverage {e}")
         for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             res = None
             to_print = ""
             try:
                 res = await coros_to_call_lev[symbol]
                 to_print += f"leverage={format_exchange_config_response(res)} "
             except Exception as e:
-                logging.error(f"{symbol} error setting leverage {e}")
+                logging.error(f"{log_symbol} error setting leverage {e}")
             res = None
             try:
                 res = await coros_to_call_margin_mode[symbol]
                 to_print += f"margin={format_exchange_config_response(res)}"
             except Exception as e:
-                logging.error(f"{symbol} error setting cross mode {e}")
+                logging.error(
+                    f"{log_symbol} error setting {self._get_margin_mode_for_symbol(symbol)} mode {e}"
+                )
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{log_symbol}: {to_print}")
 
     async def calc_ideal_orders(self):
         # Bitget returns max 100 open orders per fetch_open_orders.
         # Only create 100 open orders.
         # Drop orders whose pprice diff is greatest.
         ideal_orders = await super().calc_ideal_orders()
+        market_prices = await self._get_live_last_prices(
+            ideal_orders.keys(),
+            max_age_ms=10_000,
+            context="bitget_order_cap_sort",
+            allow_completed_candle_fallback=True,
+        )
         ideal_orders_tmp = []
         for s in ideal_orders:
             for x in ideal_orders[s]:
@@ -594,7 +627,7 @@ class BitgetBot(CCXTBot):
                         calc_order_price_diff(
                             x["side"],
                             x["price"],
-                            await self.cm.get_current_close(s, max_age_ms=10_000),
+                            market_prices[s],
                         ),
                         {**x, **{"symbol": s}},
                     )
@@ -609,9 +642,9 @@ class BitgetBot(CCXTBot):
         res = None
         try:
             res = await self.cca.set_position_mode(True)
-            logging.info(f"set hedge mode {res}")
+            logging.debug("[config] set hedge mode response: %s", res)
         except Exception as e:
-            logging.error(f"error setting hedge mode {e} {res}")
+            logging.error("[config] error setting hedge mode: %s %s", e, res)
 
     def format_custom_id_single(self, order_type_id: int) -> str:
         formatted = super().format_custom_id_single(order_type_id)

@@ -14,6 +14,8 @@ Throughout:
   (`>0` long, `<0` short).
 * `wallet_exposure(balance, size, price, c_mult)` returns `abs(size) * price / (balance * c_mult)`.
 * `wel_base` abbreviates `wallet_exposure_limit` for the symbol and pside.
+  In live mode this is derived from a fixed denominator (`n_positions`); in backtests it may be
+  fixed or tradability-driven depending on `backtest.dynamic_wel_by_tradability`.
 
 ## Initial Entry & Grid Re-entries
 
@@ -43,6 +45,8 @@ next_grid_qty(last_fill_qty) =
 * `entry_grid_double_down_factor > 0` multiplies each successive re-entry quantity; values
   `< 1` still increase size if the preceding fill was larger than the remaining gap to the
   exposure cap.
+* Grid re-entries are only normal or cropped. Near the effective exposure cap, the bot keeps the
+  current order literal instead of pulling future size forward into an inflated terminal step.
 
 ## Trailing Entries
 
@@ -134,6 +138,14 @@ if equity < unstuck_allowed:
 
 Positions become eligible when
 `wallet_exposure / wel_base > unstuck_threshold`.
+
+`unstuck_ema_dist` must keep the EMA-derived trigger price positive:
+- `bot.long.unstuck_ema_dist > -1.0`
+- `bot.short.unstuck_ema_dist < 1.0`
+
+Configs that cross those boundaries now hard-fail during validation instead of silently
+disabling auto-unstuck. For near-always-on EMA triggering on either side, use a value like
+`-0.99`, not `-1.0`.
 
 ## WEL Enforcer (Auto Reduce)
 

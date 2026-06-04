@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 import types
 
@@ -6,8 +7,8 @@ import numpy as np
 
 sys.modules.setdefault("passivbot_rust", types.SimpleNamespace())
 
-from backtest import ensure_valid_index_metadata
-from downloader import compute_per_coin_warmup_minutes
+from backtest import ensure_valid_index_metadata, warn_hlcv_valid_range_coverage
+from warmup_utils import compute_per_coin_warmup_minutes
 
 
 def test_ensure_valid_index_metadata_infers_ranges_for_each_coin():
@@ -83,6 +84,39 @@ def test_ensure_valid_index_metadata_default_warmup_fallback():
     assert mss["fallback"]["first_valid_index"] == 1
     assert mss["fallback"]["warmup_minutes"] == 4
     assert mss["fallback"]["trade_start_index"] == 4
+
+
+def test_ensure_valid_index_metadata_warmup_map_overrides_cached_warmup():
+    hlcvs = np.zeros((12, 1, 4), dtype=np.float64)
+    coins = ["coinwarm"]
+    mss = {"coinwarm": {"first_valid_index": 2, "last_valid_index": 10, "warmup_minutes": 9}}
+    ensure_valid_index_metadata(mss, hlcvs, coins, {"coinwarm": 3})
+    assert mss["coinwarm"]["warmup_minutes"] == 3
+    assert mss["coinwarm"]["trade_start_index"] == 5
+
+
+def test_warn_hlcv_valid_range_coverage_reports_trailing_gap(caplog):
+    config = {"backtest": {"start_date": "2024-01-01", "end_date": "2024-01-02"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(1441)], dtype=np.int64)
+    mss = {"TON": {"first_valid_index": 0, "last_valid_index": 1438}}
+
+    caplog.set_level(logging.WARNING)
+    warn_hlcv_valid_range_coverage(config, ["TON"], mss, timestamps)
+
+    assert "TON valid data ends before requested end" in caplog.text
+    assert "missing_minutes=2" in caplog.text
+
+
+def test_warn_hlcv_valid_range_coverage_reports_outside_range(caplog):
+    config = {"backtest": {"start_date": "2024-01-02", "end_date": "2024-01-03"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(5)], dtype=np.int64)
+    mss = {"OLD": {"first_valid_index": 0, "last_valid_index": 4}}
+
+    caplog.set_level(logging.WARNING)
+    warn_hlcv_valid_range_coverage(config, ["OLD"], mss, timestamps)
+
+    assert "OLD valid data range" in caplog.text
+    assert "entirely outside requested range" in caplog.text
 
 
 def test_compute_per_coin_warmup_minutes_handles_overrides():

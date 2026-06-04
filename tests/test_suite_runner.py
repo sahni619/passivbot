@@ -1,5 +1,7 @@
 import asyncio
+import sys
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,31 +16,40 @@ from suite_runner import (
     collect_suite_coin_sources,
     extract_suite_config,
     filter_coins_by_exchange_assignment,
+    prepare_master_datasets,
     resolve_coin_sources,
     _prepare_dataset_subset,
+    _run_combined_dataset,
     summarize_scenario_metrics,
 )
 
 
 def test_extract_suite_config_merges_override():
-    base = {"backtest": {"suite": {"enabled": False, "scenarios": ["base"]}}}
-    override = {"enabled": True, "scenarios": ["override"]}
+    """Test that extract_suite_config properly merges overrides with new structure."""
+    base = {
+        "backtest": {
+            "suite_enabled": True,
+            "scenarios": [{"label": "base"}],
+            "aggregate": {"default": "mean"},
+        }
+    }
+    override = {"scenarios": [{"label": "override"}]}
     merged = extract_suite_config(base, override)
     assert merged["enabled"] is True
-    assert merged["scenarios"] == ["override"]
+    assert merged["scenarios"] == [{"label": "override"}]
 
 
-def test_build_scenarios_include_base():
+def test_build_scenarios_basic():
+    """Test basic scenario building with new flattened structure."""
     suite_cfg = {
         "scenarios": [{"label": "A"}],
-        "include_base_scenario": True,
-        "base_label": "base",
+        "exchanges": ["binance"],
     }
-    scenarios, aggregate_cfg, include_base, base_label = build_scenarios(suite_cfg)
+    scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=["binance"])
     assert len(scenarios) == 1
     assert scenarios[0].label == "A"
-    assert include_base is True
-    assert base_label == "base"
+    # Scenarios now inherit exchanges from suite_cfg or base_exchanges
+    assert scenarios[0].exchanges == ["binance"]
 
 
 def test_build_scenarios_handles_exchanges_and_coin_sources():
@@ -51,7 +62,7 @@ def test_build_scenarios_handles_exchanges_and_coin_sources():
             }
         ],
     }
-    scenarios, *_ = build_scenarios(suite_cfg)
+    scenarios, _ = build_scenarios(suite_cfg)
     scenario = scenarios[0]
     assert scenario.exchanges == ["binance", "bybit"]
     assert scenario.coin_sources == {"BTC": "binance"}
@@ -68,11 +79,28 @@ def test_build_scenarios_normalizes_coins_and_coin_sources():
             }
         ],
     }
-    scenarios, *_ = build_scenarios(suite_cfg)
+    scenarios, _ = build_scenarios(suite_cfg)
     scenario = scenarios[0]
     assert scenario.coins == ["BTC", "ETH"]
     assert scenario.ignored_coins == ["SOL"]
     assert scenario.coin_sources == {"BTC": "binance", "ETH": "bybit"}
+
+
+def test_build_scenarios_inherits_exchanges_from_defaults():
+    """Test that scenarios without explicit exchanges inherit from base_exchanges."""
+    suite_cfg = {
+        "scenarios": [{"label": "A"}],
+        "exchanges": ["binance", "bybit"],  # Default exchanges in suite config
+    }
+    scenarios, _ = build_scenarios(suite_cfg)
+    assert scenarios[0].exchanges == ["binance", "bybit"]
+
+    # Test inheritance from base_exchanges when suite config doesn't specify
+    suite_cfg_no_exchanges = {
+        "scenarios": [{"label": "B"}],
+    }
+    scenarios, _ = build_scenarios(suite_cfg_no_exchanges, base_exchanges=["kucoin"])
+    assert scenarios[0].exchanges == ["kucoin"]
 
 
 def test_apply_scenario_filters_unavailable_coins():
@@ -233,6 +261,100 @@ def test_filter_coins_by_exchange_assignment_filters_correctly():
     assert skipped == ["ETH"]
 
 
+@pytest.mark.asyncio
+async def test_prepare_master_datasets_uses_scenario_windows_for_individual_exchanges(
+    monkeypatch, caplog
+):
+    base_config = {
+        "backtest": {
+            "start_date": "2021",
+            "end_date": "2026-05-21",
+            "exchanges": ["binance", "bybit"],
+            "coins": {},
+        },
+        "live": {
+            "approved_coins": {"long": ["BTC"], "short": ["BTC"]},
+            "ignored_coins": {"long": [], "short": []},
+        },
+    }
+    scenarios = [
+        SuiteScenario(
+            label="base",
+            start_date=None,
+            end_date=None,
+            coins=None,
+            ignored_coins=None,
+            exchanges=["binance", "bybit"],
+        ),
+        SuiteScenario(
+            label="binance_only",
+            start_date="2025-01-01",
+            end_date=None,
+            coins=None,
+            ignored_coins=None,
+            exchanges=["binance"],
+        ),
+        SuiteScenario(
+            label="bybit_only",
+            start_date="2025-01-01",
+            end_date=None,
+            coins=None,
+            ignored_coins=None,
+            exchanges=["bybit"],
+        ),
+    ]
+    calls = []
+
+    async def fake_prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps=False):
+        calls.append(
+            (
+                exchange,
+                config["backtest"]["start_date"],
+                config["backtest"]["end_date"],
+            )
+        )
+        timestamps = np.array([0, 60_000], dtype=np.int64)
+        return (
+            ["BTC"],
+            np.ones((2, 1, 4), dtype=np.float64),
+            {"BTC": {"exchange": exchange}, "__meta__": {}},
+            "",
+            f"/tmp/{exchange}",
+            np.ones(2, dtype=np.float64),
+            timestamps,
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "backtest",
+        SimpleNamespace(prepare_hlcvs_mss=fake_prepare_hlcvs_mss),
+    )
+    caplog.set_level("INFO")
+
+    await prepare_master_datasets(
+        base_config,
+        ["binance", "bybit"],
+        needed_individual_exchanges={"binance", "bybit"},
+        scenarios=scenarios,
+    )
+
+    assert calls == [
+        ("combined", "2021", "2026-05-21"),
+        ("binance", "2025-01-01", "2026-05-21"),
+        ("bybit", "2025-01-01", "2026-05-21"),
+    ]
+    assert any(
+        "[suite] dataset window binance start=2025-01-01 end=2026-05-21 scenarios=binance_only"
+        in rec.message
+        for rec in caplog.records
+    )
+    assert any(
+        "[suite] dataset window bybit start=2025-01-01 end=2026-05-21 scenarios=bybit_only"
+        in rec.message
+        for rec in caplog.records
+    )
+
+
 def test_aggregate_metrics_computes_stats():
     scenario_results = [
         ScenarioResult(
@@ -297,3 +419,113 @@ def test_prepare_dataset_subset_clips_dates(monkeypatch):
     assert meta["requested_start_ts"] == 60_000
     assert meta["requested_end_ts"] == 180_000
     assert "warmup_minutes_requested" in meta
+
+
+def test_prepare_dataset_subset_recomputes_warmup_from_scenario(monkeypatch):
+    coins = ["BTC"]
+    timestamps = np.array([0, 60_000, 120_000, 180_000, 240_000, 300_000], dtype=np.int64)
+    hlcvs = np.random.random((len(timestamps), len(coins), 4))
+    dataset = ExchangeDataset(
+        exchange="combined",
+        coins=coins,
+        coin_index={"BTC": 0},
+        coin_exchange={"BTC": "combined"},
+        available_exchanges=["combined"],
+        hlcvs=hlcvs,
+        mss={"BTC": {"first_valid_index": 0, "last_valid_index": 5, "warmup_minutes": 1}},
+        btc_usd_prices=np.ones(len(timestamps)),
+        timestamps=timestamps,
+        cache_dir="/tmp",
+    )
+    scenario_config = {
+        "backtest": {"start_date": "1970-01-01T00:00:00", "end_date": "1970-01-01T00:05:00"},
+        "live": {"warmup_ratio": 0.0},
+        "bot": {"long": {}, "short": {}},
+        "optimize": {"bounds": {}},
+    }
+    monkeypatch.setattr("suite_runner.compute_backtest_warmup_minutes", lambda cfg: 0)
+    monkeypatch.setattr(
+        "suite_runner.compute_per_coin_warmup_minutes",
+        lambda cfg: {"__default__": 0, "BTC": 5},
+    )
+
+    _subset_hlcvs, _subset_btc, _subset_ts, subset_mss = _prepare_dataset_subset(
+        dataset, scenario_config, ["BTC"], "scenario_warmup"
+    )
+
+    assert subset_mss["BTC"]["warmup_minutes"] == 5
+    assert subset_mss["BTC"]["trade_start_index"] == 5
+
+
+def test_run_combined_dataset_passes_payload_timestamps_to_post_process(tmp_path):
+    timestamps = np.array([0, 60_000, 120_000], dtype=np.int64)
+    hlcvs = np.zeros((3, 1, 4), dtype=np.float64)
+    dataset = ExchangeDataset(
+        exchange="combined",
+        coins=["BTC"],
+        coin_index={"BTC": 0},
+        coin_exchange={"BTC": "binance"},
+        available_exchanges=["binance"],
+        hlcvs=hlcvs,
+        mss={"BTC": {}, "__meta__": {}},
+        btc_usd_prices=np.ones(3, dtype=np.float64),
+        timestamps=timestamps,
+        cache_dir="/tmp/cache",
+    )
+    scenario = SuiteScenario(
+        label="base",
+        start_date=None,
+        end_date=None,
+        coins=None,
+        ignored_coins=None,
+        exchanges=None,
+    )
+    scenario_config = {
+        "backtest": {
+            "coins": {},
+            "cache_dir": {},
+            "start_date": "1970-01-01T00:00:00",
+            "end_date": "1970-01-01T00:02:00",
+        },
+        "live": {"warmup_ratio": 0.0, "max_warmup_minutes": 0.0},
+        "bot": {"long": {}, "short": {}},
+        "optimize": {"bounds": {}},
+    }
+    seen = {}
+
+    def build_payload_fn(hlcvs_slice, mss_slice, config, exchange, btc_prices, payload_timestamps):
+        class Bundle:
+            hlcvs = hlcvs_slice
+            timestamps = payload_timestamps
+
+        class Payload:
+            bundle = Bundle()
+            hard_stop_plot_data = {"sample": True}
+
+        return Payload()
+
+    def execute_backtest_fn(payload, config):
+        return [], np.empty((0, 0)), {"ok": 1}
+
+    def post_process_fn(*args, **kwargs):
+        seen["plot_context"] = kwargs.get("plot_context")
+
+    _run_combined_dataset(
+        dataset,
+        scenario,
+        scenario_config,
+        ["BTC"],
+        scenario_dir=tmp_path,
+        build_payload_fn=build_payload_fn,
+        execute_backtest_fn=execute_backtest_fn,
+        post_process_fn=post_process_fn,
+        plot_context_factory=lambda payload: SimpleNamespace(
+            hlcvs=np.asarray(payload.bundle.hlcvs),
+            timestamps=np.asarray(payload.bundle.timestamps),
+            hard_stop_plot_data=payload.hard_stop_plot_data,
+        ),
+    )
+
+    np.testing.assert_array_equal(seen["plot_context"].timestamps, timestamps)
+    np.testing.assert_array_equal(seen["plot_context"].hlcvs, hlcvs)
+    assert seen["plot_context"].hard_stop_plot_data == {"sample": True}

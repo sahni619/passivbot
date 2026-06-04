@@ -252,3 +252,46 @@ def test_reentry_short_is_cropped_to_cap():
     )
     allowed = params["wallet_exposure_limit"] * (1.0 + params["risk_we_excess_allowance_pct"])
     assert new_exposure <= allowed * 1.02 + 1e-9
+
+
+@pytest.mark.skipif(pbr is None or pbr_is_stub, reason="passivbot_rust extension not available")
+def test_reentry_long_near_cap_stays_normal():
+    params = dict(
+        qty_step=0.1,
+        price_step=0.1,
+        min_qty=0.0,
+        min_cost=0.0,
+        c_mult=1.0,
+        entry_grid_double_down_factor=0.5,
+        entry_grid_spacing_volatility_weight=0.0,
+        entry_grid_spacing_we_weight=0.0,
+        entry_grid_spacing_pct=0.05,
+        entry_initial_ema_dist=0.0,
+        entry_initial_qty_pct=0.1,
+        entry_trailing_double_down_factor=1.0,
+        entry_trailing_grid_ratio=0.0,
+        entry_trailing_retracement_pct=0.0,
+        entry_trailing_retracement_we_weight=0.0,
+        entry_trailing_retracement_volatility_weight=0.0,
+        entry_trailing_threshold_pct=0.0,
+        entry_trailing_threshold_we_weight=0.0,
+        entry_trailing_threshold_volatility_weight=0.0,
+        wallet_exposure_limit=0.3,
+        risk_we_excess_allowance_pct=0.0,
+        balance=1000.0,
+        position_size=2.0,
+        position_price=100.0,
+        min_since_open=0.0,
+        max_since_min=0.0,
+        max_since_open=0.0,
+        min_since_max=0.0,
+        ema_bands_lower=100.0,
+        entry_volatility_logrange_ema_1h=0.0,
+        order_book_bid=95.0,
+    )
+
+    qty, price, order_type = _calc_next_entry_long(**params)
+
+    assert order_type == "entry_grid_normal_long"
+    assert qty > 0.0
+    assert price > 0.0

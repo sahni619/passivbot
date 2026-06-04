@@ -3,7 +3,9 @@
 Interactive iterative backtesting helper.
 
 Usage:
-    python src/tools/iterative_backtester.py path/to/config.hjson
+    python src/tools/iterative_backtester.py path/to/config.hjson --auto-run
+    python src/tools/iterative_backtester.py path/to/config.hjson --auto-run \\
+        --override backtest.start_date=2022-01-01 --override backtest.end_date=now
 
 The script loads all OHLCV data up-front and then lets you rerun backtests
 quickly after editing bot parameters. It prints a concise metrics table per run
@@ -19,15 +21,18 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from prettytable import PrettyTable
+from config import load_prepared_config  # noqa: E402
 
 # Ensure we can import modules from src/
 SRC_ROOT = Path(__file__).resolve().parents[1]
@@ -35,13 +40,23 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
 from backtest import prepare_hlcvs_mss, run_backtest  # noqa: E402
+from config.access import get_optional_config_value, require_config_value  # noqa: E402
+from config.limits import normalize_limit_entries  # noqa: E402
+from config.metrics import resolve_metric_value as resolve_stored_metric_value  # noqa: E402
+from config.overrides import parse_overrides  # noqa: E402
+from config.schema import get_template_config  # noqa: E402
 from config_utils import (  # noqa: E402
-    format_config,
-    load_config,
-    parse_overrides,
-    require_config_value,
-    get_optional_config_value,
-    normalize_limit_entries,
+    add_config_arguments,
+    project_template_config_for_cli,
+    set_nested_value_safe,
+)
+from config.scoring import (  # noqa: E402
+    ObjectiveSpec,
+    default_scoring_weights,
+    dominates_objectives,
+    extract_objective_specs,
+    objective_index_map,
+    to_engine_value,
 )
 from logging_setup import configure_logging, resolve_log_level  # noqa: E402
 from pure_funcs import calc_hash, denumpyize  # noqa: E402
@@ -54,65 +69,7 @@ from utils import (  # noqa: E402
 )
 from metrics_schema import build_scenario_metrics, flatten_metric_stats  # noqa: E402
 from limit_utils import expand_limit_checks, compute_limit_violation  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Constants mirroring optimizer scoring preferences
-# ---------------------------------------------------------------------------
-SHARED_METRIC_WEIGHTS = {
-    "positions_held_per_day": 1.0,
-    "position_held_hours_mean": 1.0,
-    "position_held_hours_max": 1.0,
-    "position_held_hours_median": 1.0,
-    "position_unchanged_hours_max": 1.0,
-    "loss_profit_ratio": 1.0,
-    "loss_profit_ratio_w": 1.0,
-    "volume_pct_per_day_avg": -1.0,
-    "volume_pct_per_day_avg_w": -1.0,
-    "peak_recovery_hours_pnl": 1.0,
-}
-
-CURRENCY_METRIC_WEIGHTS = {
-    "adg": -1.0,
-    "adg_per_exposure_long": -1.0,
-    "adg_per_exposure_short": -1.0,
-    "adg_w": -1.0,
-    "adg_w_per_exposure_long": -1.0,
-    "adg_w_per_exposure_short": -1.0,
-    "calmar_ratio": -1.0,
-    "calmar_ratio_w": -1.0,
-    "drawdown_worst": 1.0,
-    "drawdown_worst_mean_1pct": 1.0,
-    "equity_balance_diff_neg_max": 1.0,
-    "equity_balance_diff_neg_mean": 1.0,
-    "equity_balance_diff_pos_max": 1.0,
-    "equity_balance_diff_pos_mean": 1.0,
-    "equity_choppiness": 1.0,
-    "equity_choppiness_w": 1.0,
-    "equity_jerkiness": 1.0,
-    "equity_jerkiness_w": 1.0,
-    "peak_recovery_hours_equity": 1.0,
-    "expected_shortfall_1pct": 1.0,
-    "exponential_fit_error": 1.0,
-    "exponential_fit_error_w": 1.0,
-    "gain": -1.0,
-    "gain_per_exposure_long": -1.0,
-    "gain_per_exposure_short": -1.0,
-    "mdg": -1.0,
-    "mdg_per_exposure_long": -1.0,
-    "mdg_per_exposure_short": -1.0,
-    "mdg_w": -1.0,
-    "mdg_w_per_exposure_long": -1.0,
-    "mdg_w_per_exposure_short": -1.0,
-    "omega_ratio": -1.0,
-    "omega_ratio_w": -1.0,
-    "sharpe_ratio": -1.0,
-    "sharpe_ratio_w": -1.0,
-    "sortino_ratio": -1.0,
-    "sortino_ratio_w": -1.0,
-    "sterling_ratio": -1.0,
-    "sterling_ratio_w": -1.0,
-}
+from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes  # noqa: E402
 
 PENALTY_WEIGHT = 1e6
 
@@ -136,6 +93,7 @@ class MetricInfo:
     value: Optional[float]
     resolved_key: Optional[str]
     weight: Optional[float]
+    goal: Optional[str] = None
 
 
 @dataclass
@@ -160,25 +118,34 @@ class RunSummary:
     scoring_metrics: Dict[str, MetricInfo]
     limit_metrics: List[LimitInfo]
     results_path: Path
-    bot_hash: str
+    config_hash: str
     bot_flat: Dict[str, Any] = field(default_factory=dict)
     param_deltas: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
     duration_s: float = 0.0
     objective_vector: Tuple[float, ...] = field(default_factory=tuple)
 
 
+CLI_OVERRIDE_RE = re.compile(r"^(?P<path>[^=]+)=(?P<value>.*)$")
+
+
+class IterativeOverrideParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+@lru_cache(maxsize=1)
+def build_iterative_override_parser() -> argparse.ArgumentParser:
+    parser = IterativeOverrideParser(add_help=False, allow_abbrev=False)
+    template = project_template_config_for_cli(get_template_config(), "backtest")
+    add_config_arguments(parser, template, command="backtest")
+    return parser
+
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
 def build_scoring_weights() -> Dict[str, float]:
-    weights = dict(SHARED_METRIC_WEIGHTS)
-    for metric, weight in CURRENCY_METRIC_WEIGHTS.items():
-        weights[f"{metric}_usd"] = weight
-        weights[f"{metric}_btc"] = weight
-        weights.setdefault(metric, weight)
-        weights.setdefault(f"usd_{metric}", weight)
-        weights.setdefault(f"btc_{metric}", weight)
-    return weights
+    return default_scoring_weights()
 
 
 def ensure_float(value: Optional[float]) -> Optional[float]:
@@ -211,12 +178,40 @@ def summarize_limit(info: LimitInfo) -> Tuple[str, str, str]:
         diff = info.value - info.bound
         status = "VIOL" if diff > 0 else "OK"
         return constraint, format_number(diff), status
+    if info.mode == "greater_than_or_equal":
+        constraint = f"< {format_number(info.bound)}"
+        if info.value is None or info.bound is None:
+            return constraint, "-", "-"
+        diff = info.value - info.bound
+        status = "VIOL" if diff >= 0 else "OK"
+        return constraint, format_number(diff), status
     if info.mode == "less_than":
         constraint = f"≥ {format_number(info.bound)}"
         if info.value is None or info.bound is None:
             return constraint, "-", "-"
         diff = info.bound - info.value
         status = "VIOL" if diff > 0 else "OK"
+        return constraint, format_number(diff), status
+    if info.mode == "less_than_or_equal":
+        constraint = f"> {format_number(info.bound)}"
+        if info.value is None or info.bound is None:
+            return constraint, "-", "-"
+        diff = info.bound - info.value
+        status = "VIOL" if diff >= 0 else "OK"
+        return constraint, format_number(diff), status
+    if info.mode == "equal_to":
+        constraint = f"≠ {format_number(info.bound)}"
+        if info.value is None or info.bound is None:
+            return constraint, "-", "-"
+        diff = abs(info.value - info.bound)
+        status = "VIOL" if diff == 0 else "OK"
+        return constraint, format_number(diff), status
+    if info.mode == "not_equal":
+        constraint = f"= {format_number(info.bound)}"
+        if info.value is None or info.bound is None:
+            return constraint, "-", "-"
+        diff = abs(info.value - info.bound)
+        status = "VIOL" if diff != 0 else "OK"
         return constraint, format_number(diff), status
     if info.mode == "outside_range":
         low, high = info.range or (None, None)
@@ -349,16 +344,16 @@ def resolve_metric_value(
 
 
 def calc_score_vector(
-    scoring_keys: Iterable[str],
+    objective_specs: Iterable[ObjectiveSpec],
     combined: Dict[str, Any],
     scoring_weights: Dict[str, float],
     limit_checks: List[Dict[str, Any]],
 ) -> Tuple[Tuple[float, ...], float]:
-    scoring_keys = list(scoring_keys)
-    per_objective_modifier = [0.0] * len(scoring_keys)
+    objective_specs = list(objective_specs)
+    per_objective_modifier = [0.0] * len(objective_specs)
     modifier = 0.0
     for check in limit_checks:
-        val = ensure_float(combined.get(check["metric_key"]))
+        val = ensure_float(resolve_stored_metric_value(combined, check["metric_key"]))
         penalty = compute_limit_violation(check, val)
         if not penalty:
             continue
@@ -371,44 +366,150 @@ def calc_score_vector(
             modifier += penalty
 
     scores: List[float] = []
-    for idx, key in enumerate(scoring_keys):
+    for idx, spec in enumerate(objective_specs):
         penalty_total = modifier + per_objective_modifier[idx]
         if penalty_total:
             scores.append(penalty_total)
             continue
-        value, resolved = resolve_metric_value(key, combined)
+        value, resolved = resolve_metric_value(spec.metric, combined)
         if value is None:
             scores.append(float("inf"))
             continue
-        weight = scoring_weights.get(resolved or key)
-        if weight is None:
-            scores.append(value)
-        elif weight < 0:
-            scores.append(-value)
-        else:
-            scores.append(value)
+        scores.append(to_engine_value(spec, float(value)))
     return tuple(scores), modifier
 
 
+def _config_hash_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        "backtest": deepcopy(config.get("backtest", {})),
+        "bot": deepcopy(config.get("bot", {})),
+        "live": deepcopy(config.get("live", {})),
+        "optimize": deepcopy(config.get("optimize", {})),
+    }
+    payload["backtest"].pop("coins", None)
+    payload["backtest"].pop("cache_dir", None)
+    return payload
+
+
+def _dataset_hash_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+    backtest_cfg = config.get("backtest", {}) or {}
+    live_cfg = config.get("live", {}) or {}
+    return {
+        "backtest": {
+            "start_date": backtest_cfg.get("start_date"),
+            "end_date": backtest_cfg.get("end_date"),
+            "exchanges": deepcopy(backtest_cfg.get("exchanges", [])),
+            "gap_tolerance_ohlcvs_minutes": backtest_cfg.get("gap_tolerance_ohlcvs_minutes"),
+            "coin_sources": deepcopy(backtest_cfg.get("coin_sources", {})),
+            "market_settings_sources": deepcopy(backtest_cfg.get("market_settings_sources", {})),
+            "ohlcv_source_dir": backtest_cfg.get("ohlcv_source_dir"),
+        },
+        "live": {
+            "approved_coins": deepcopy(live_cfg.get("approved_coins")),
+            "minimum_coin_age_days": live_cfg.get("minimum_coin_age_days"),
+            "max_warmup_minutes": live_cfg.get("max_warmup_minutes"),
+            "warmup_ratio": live_cfg.get("warmup_ratio"),
+        },
+        "warmup": {
+            "global_minutes": compute_backtest_warmup_minutes(config),
+            "per_coin_minutes": compute_per_coin_warmup_minutes(config),
+        },
+    }
+
+
+def make_dataset_signature(config: Dict[str, Any]) -> str:
+    return calc_hash(_dataset_hash_payload(config))
+
+
+def make_run_signature(config: Dict[str, Any]) -> str:
+    return calc_hash(_config_hash_payload(config))
+
+
 def make_backtest_signature(config: Dict[str, Any]) -> str:
-    backtest = deepcopy(config.get("backtest", {}))
-    backtest.pop("coins", None)
-    backtest.pop("cache_dir", None)
-    return calc_hash(backtest)
+    # Kept as a compatibility wrapper for existing imports/tests in this branch.
+    return make_dataset_signature(config)
 
 
 def format_timestamp(ms: float) -> str:
     return ts_to_date(ms)[:19].replace("T", " ")
 
 
+def parse_override_value(raw: str) -> Any:
+    text = raw.strip()
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    if re.fullmatch(r"[+-]?\d+", text):
+        try:
+            return int(text)
+        except ValueError:
+            pass
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    return text
+
+
+def parse_cli_override(entry: str) -> Tuple[List[str], Any]:
+    match = CLI_OVERRIDE_RE.match(entry.strip())
+    if match is None:
+        raise ValueError(
+            f"invalid override {entry!r}; expected dotted.path=value"
+        )
+    path = match.group("path").strip()
+    if not path:
+        raise ValueError(f"invalid override {entry!r}; path cannot be empty")
+    raw_value = match.group("value")
+    parser = build_iterative_override_parser()
+    try:
+        namespace, unknown = parser.parse_known_args([f"--{path}", raw_value])
+    except ValueError as exc:
+        raise ValueError(f"invalid override {entry!r}: {exc}") from exc
+    if not unknown and hasattr(namespace, path):
+        parsed = getattr(namespace, path)
+        if parsed is not None:
+            return path.split("."), parsed
+    return path.split("."), parse_override_value(raw_value)
+
+
+def apply_cli_overrides(config: Dict[str, Any], overrides: Iterable[str]) -> Dict[str, Any]:
+    result = deepcopy(config)
+    for entry in overrides:
+        path_parts, value = parse_cli_override(entry)
+        if not set_nested_value_safe(result, path_parts, value, create_missing=True):
+            dotted = ".".join(path_parts)
+            raise ValueError(f"failed to apply override {dotted}={value!r}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Core session class
 # ---------------------------------------------------------------------------
 class IterativeBacktestSession:
-    def __init__(self, config_path: Path, log_level: Optional[str], auto_run: bool) -> None:
+    def __init__(
+        self,
+        config_path: Path,
+        log_level: Optional[str],
+        auto_run: bool,
+        *,
+        cli_overrides: Optional[List[str]] = None,
+        quit_after_run: bool = False,
+    ) -> None:
         self.config_path = config_path
         self.log_level = log_level
         self.auto_run = auto_run
+        self.cli_overrides = list(cli_overrides or [])
+        self.quit_after_run = quit_after_run
         self.datasets: Dict[str, ExchangeDataset] = {}
         self.backtest_exchanges: List[str] = []
         self.combine_ohlcvs = False
@@ -419,6 +520,7 @@ class IterativeBacktestSession:
         self.config_cache: Dict[str, RunSummary] = {}
         self.last_bot_flat: Optional[Dict[str, Any]] = None
         self.scoring_keys: List[str] = []
+        self.scoring_specs: List[ObjectiveSpec] = []
         self.backtest_durations: List[float] = []
         self.pareto_front_indices: List[int] = []
         self.scoring_weights = build_scoring_weights()
@@ -427,7 +529,7 @@ class IterativeBacktestSession:
     async def initialize(self) -> None:
         config = await self._load_config()
         self.backtest_exchanges = list(require_config_value(config, "backtest.exchanges"))
-        self.combine_ohlcvs = bool(require_config_value(config, "backtest.combine_ohlcvs"))
+        self.combine_ohlcvs = len(self.backtest_exchanges) > 1
         self.backtest_signature = make_backtest_signature(config)
         base_dir = require_config_value(config, "backtest.base_dir")
         session_label = time.strftime("iterative_%Y%m%d_%H%M%S")
@@ -440,9 +542,11 @@ class IterativeBacktestSession:
     async def _load_config(self) -> Dict[str, Any]:
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
-        config = load_config(str(self.config_path), verbose=False)
-        config = format_config(config, verbose=False)
+        config = load_prepared_config(str(self.config_path), verbose=False)
         config = parse_overrides(config, verbose=False)
+        if self.cli_overrides:
+            config = apply_cli_overrides(config, self.cli_overrides)
+            logging.info("Applied iterative overrides: %s", self.cli_overrides)
         # Configure logging lazily based on CLI/debug preference
         level = resolve_log_level(
             self.log_level, get_optional_config_value(config, "logging.level", None), fallback=1
@@ -514,7 +618,7 @@ class IterativeBacktestSession:
 
     # ------------------------------------------------------------------
     async def reload_datasets(self, config: Dict[str, Any]) -> None:
-        logging.info("Backtest configuration changed; reloading datasets...")
+        logging.info("Dataset-affecting configuration changed; reloading datasets...")
         self.history.clear()
         self.best_run_index = None
         self.config_cache.clear()
@@ -522,6 +626,7 @@ class IterativeBacktestSession:
         self.pareto_front_indices = []
         self.backtest_durations.clear()
         self.scoring_keys = []
+        self.scoring_specs = []
         self.datasets = await self._prepare_datasets(config)
         self.backtest_signature = make_backtest_signature(config)
         logging.info("Datasets reloaded.")
@@ -534,9 +639,9 @@ class IterativeBacktestSession:
             await self.reload_datasets(config)
 
         bot_section = denumpyize(deepcopy(config.get("bot", {})))
-        bot_hash = calc_hash(json.dumps(bot_section, sort_keys=True))
-        if bot_hash in self.config_cache:
-            cached = self.config_cache[bot_hash]
+        config_hash = make_run_signature(config)
+        if config_hash in self.config_cache:
+            cached = self.config_cache[config_hash]
             self.last_bot_flat = cached.bot_flat
             logging.info(
                 "Configuration unchanged; reusing cached results from run #%d.", cached.index
@@ -582,29 +687,30 @@ class IterativeBacktestSession:
 
         combined = combine_analyses(analyses)
         combined_flat = flatten_metric_stats(combined.get("stats", {}))
-        scoring_keys = list(config.get("optimize", {}).get("scoring", []))
-        scoring_index_map: Dict[str, List[int]] = {}
-        for idx, key in enumerate(scoring_keys):
-            scoring_index_map.setdefault(key, []).append(idx)
+        objective_specs = extract_objective_specs(config)
+        scoring_keys = [spec.metric for spec in objective_specs]
         self.scoring_keys = scoring_keys
+        self.scoring_specs = objective_specs
         limits_cfg = config.get("optimize", {}).get("limits", [])
         limit_checks = build_limit_checks(
             limits_cfg,
             self.scoring_weights,
-            scoring_index_map,
+            objective_index_map(objective_specs),
         )
         score_vector, modifier = calc_score_vector(
-            scoring_keys, combined_flat, self.scoring_weights, limit_checks
+            objective_specs, combined_flat, self.scoring_weights, limit_checks
         )
 
         scoring_metrics: Dict[str, MetricInfo] = {}
-        for key in scoring_keys:
+        for spec in objective_specs:
+            key = spec.metric
             value, resolved = resolve_metric_value(key, combined_flat)
             weight = self.scoring_weights.get(resolved or key)
             scoring_metrics[key] = MetricInfo(
                 value=ensure_float(value),
                 resolved_key=resolved,
                 weight=weight,
+                goal=spec.goal,
             )
 
         limit_metrics: List[LimitInfo] = []
@@ -634,20 +740,13 @@ class IterativeBacktestSession:
                     param_deltas[key] = (prev_val, new_val)
 
         objectives: List[float] = []
-        for key in scoring_keys:
+        for spec in objective_specs:
+            key = spec.metric
             info = scoring_metrics.get(key)
             if info is None or info.value is None:
                 objectives.append(float("inf"))
                 continue
-            weight = info.weight
-            if weight is None:
-                weight = self.scoring_weights.get(info.resolved_key or key)
-            if weight is None:
-                objectives.append(info.value)
-            elif weight < 0:
-                objectives.append(-info.value)
-            else:
-                objectives.append(info.value)
+            objectives.append(float(info.value))
 
         run_index = len(self.history) + 1
         run_ts = utc_ms()
@@ -671,7 +770,7 @@ class IterativeBacktestSession:
             scoring_metrics=scoring_metrics,
             limit_metrics=limit_metrics,
             results_path=run_dir,
-            bot_hash=bot_hash,
+            config_hash=config_hash,
             bot_flat=current_bot_flat,
             param_deltas=param_deltas,
             duration_s=duration,
@@ -679,7 +778,7 @@ class IterativeBacktestSession:
         )
         self.history.append(summary)
         self._update_best_run(summary)
-        self.config_cache[bot_hash] = summary
+        self.config_cache[config_hash] = summary
         self.last_bot_flat = current_bot_flat
         self.backtest_durations.append(duration)
         if len(self.backtest_durations) > 100:
@@ -749,7 +848,7 @@ class IterativeBacktestSession:
                 vec_other = objective_map.get(other.index)
                 if vec_other is None or len(vec_other) == 0:
                     continue
-                if self._dominates(vec_other, vec_candidate):
+                if self._dominates(vec_other, vec_candidate, self.scoring_specs):
                     dominated = True
                     break
             if not dominated:
@@ -758,29 +857,22 @@ class IterativeBacktestSession:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _dominates(vector_a: Tuple[float, ...], vector_b: Tuple[float, ...]) -> bool:
-        if not vector_a or not vector_b:
+    def _dominates(
+        vector_a: Tuple[float, ...], vector_b: Tuple[float, ...], specs: Sequence[ObjectiveSpec]
+    ) -> bool:
+        if not vector_a or not vector_b or not specs:
             return False
         if len(vector_a) != len(vector_b):
             return False
-        better_or_equal = True
-        strictly_better = False
-        for a, b in zip(vector_a, vector_b):
-            if a > b:
-                better_or_equal = False
-                break
-            if a < b:
-                strictly_better = True
-        return better_or_equal and strictly_better
+        return dominates_objectives(vector_a, vector_b, specs)
 
     # ------------------------------------------------------------------
     def _goal_symbol(self, metric: str, info: MetricInfo) -> str:
-        weight = info.weight
-        if weight is None:
-            weight = self.scoring_weights.get(info.resolved_key or metric)
-        if weight is None:
-            return "?"
-        return "↑" if weight < 0 else "↓"
+        if info.goal == "max":
+            return "↑"
+        if info.goal == "min":
+            return "↓"
+        return "?"
 
     # ------------------------------------------------------------------
     def _append_history_log(self, run: RunSummary) -> None:
@@ -793,7 +885,7 @@ class IterativeBacktestSession:
             "modifier": run.modifier,
             "results_path": str(run.results_path),
             "backtest_signature": self.backtest_signature,
-            "bot_hash": run.bot_hash,
+            "config_hash": run.config_hash,
             "duration_s": run.duration_s,
             "objective_vector": run.objective_vector,
             "best_run_index": (
@@ -935,7 +1027,7 @@ class IterativeBacktestSession:
                     r.index
                     for r in pareto_runs
                     if r.index != run.index
-                    and self._dominates(r.objective_vector, run.objective_vector)
+                    and self._dominates(r.objective_vector, run.objective_vector, self.scoring_specs)
                 ]
                 if dominators:
                     print(f"Dominated by: {', '.join('#' + str(idx) for idx in dominators)}")
@@ -1036,6 +1128,8 @@ class IterativeBacktestSession:
         if self.auto_run:
             run, reused = await self.run_once()
             self.print_summary(run, reused=reused)
+            if self.quit_after_run:
+                return
         while True:
             cmd = (await asyncio.to_thread(input, "iterbt> ")).strip().lower()
             if cmd in ("", "run", "r"):
@@ -1084,9 +1178,31 @@ async def async_main() -> None:
         action="store_true",
         help="Run a backtest immediately after loading datasets",
     )
+    parser.add_argument(
+        "--quit-after-run",
+        action="store_true",
+        help="Exit after the initial auto-run instead of entering the interactive prompt",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="PATH=VALUE",
+        help="Apply a dotted config override after loading the config, e.g. "
+        "--override backtest.start_date=2022-01-01",
+    )
     args = parser.parse_args()
 
-    session = IterativeBacktestSession(args.config_path, args.log_level, args.auto_run)
+    if args.quit_after_run and not args.auto_run:
+        parser.error("--quit-after-run requires --auto-run")
+
+    session = IterativeBacktestSession(
+        args.config_path,
+        args.log_level,
+        args.auto_run,
+        cli_overrides=args.override,
+        quit_after_run=args.quit_after_run,
+    )
     await session.initialize()
     await session.interactive_loop()
 

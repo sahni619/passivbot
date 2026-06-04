@@ -140,6 +140,57 @@ The bot reduces positions, starting with the **least underwater** ones first (fo
 
 This portfolio trimming mechanism pairs well with the excess allowance. When TWE hits TWEL and new orders are blocked, the TWEL enforcer will start chipping away at the least underwater positions to free up margin, even if those positions are technically within their per-position effective exposure limit.
 
+### C. Realized-Loss Gate (`live.max_realized_loss_pct`)
+This is a global guardrail on **loss-realizing close orders**. It applies to all close order types, including WEL/TWEL auto-reduce and unstuck closes. Only panic closes are exempt.
+
+The gate is anchored to the realized PnL peak reconstructed from fill history:
+
+`balance_peak = current_balance + (realized_pnl_cumsum_max - realized_pnl_cumsum_last)`
+
+`balance_floor = balance_peak * (1 - max_realized_loss_pct)`
+
+For each candidate close order, the bot projects realized PnL if filled and blocks the order when:
+
+`projected_balance_after_fill < balance_floor`
+
+Behavior by value:
+* `max_realized_loss_pct <= 0.0`: block all lossy closes.
+* `0.0 < max_realized_loss_pct < 1.0`: allow losses only down to the configured fraction below peak balance.
+* `max_realized_loss_pct >= 1.0`: disabled.
+
+Operational notes:
+* The shipped default is `1.0`, which keeps the gate disabled until you opt in explicitly.
+* Live bot logs visible warnings whenever an order is blocked by this gate.
+* This can intentionally block automatic reducers if they would realize too much loss.
+* If you need immediate forced reduction regardless of realized loss, use panic mode.
+
+### D. Equity Hard Stop Loss (`bot.{long,short}.hsl_*`)
+This is a side-specific circuit breaker based on reconstructed strategy drawdown, not just raw exchange equity.
+
+It exists for cases where:
+
+1. auto-unstuck is too slow
+2. the realized-loss gate is still allowing the bot to operate in a clearly degraded state
+3. you want a final supervisory backstop that can close all positions on one `pside` and halt that `pside`
+
+Behavior:
+
+1. `yellow`: warning tier
+2. `orange`: reduced-risk mode (`graceful_stop` or `tp_only_with_active_entry_cancellation`) for that `pside`
+3. `red`: force panic exits, wait until all positions on that `pside` are fully closed, and halt that `pside`
+
+Operational notes:
+
+1. HSL is configured separately under `bot.long.hsl_*` and `bot.short.hsl_*`.
+2. `live.hsl_signal_mode` defaults to the shared `unified` account-level signal, with `pside` available when each side should use its own side-local strategy signal.
+3. RED can auto-restart after `hsl_cooldown_minutes_after_red`. Terminal no-restart uses persistent cross-restart HSL drawdown.
+4. In backtests, simulated market panic closes use `backtest.market_order_slippage_pct`; live market panic closes use the exchange adapter's order semantics and live exchange/CCXT slippage controls.
+5. Backtests export canonical strategy-equity metrics under `*_strategy_eq`, including side-specific `*_strategy_eq_long` / `*_strategy_eq_short` metrics. Deprecated `*_hsl` metric names remain accepted as aliases for older configs/results.
+
+See the dedicated guide:
+
+1. [Equity Hard Stop Loss](equity_hard_stop_loss.md)
+
 ---
 
 ## 4. Bankruptcy & Liquidation Technicals

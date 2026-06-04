@@ -133,7 +133,6 @@
         "pnls_manager_shadow_mode": true,
         "balance_hysteresis_snap_pct": 0.02,
         "balance_override": null,
-        "empty_means_all_approved": true,
         "execution_delay_seconds": 2,
         "filter_by_min_effective_cost": true,
         "forced_mode_long": "",
@@ -149,9 +148,9 @@
         "max_n_restarts_per_day": 10,
         "max_warmup_minutes": 0,
         "minimum_coin_age_days": 180,
+        "forager_score_hysteresis_pct": 0.005,
         "order_match_tolerance_pct": 0.0002,
         "pnls_max_lookback_days": 30,
-        "price_distance_threshold": 0.002,
         "recv_window_ms": 5000,
         "time_in_force": "good_till_cancelled",
         "user": "bybit_01",
@@ -267,19 +266,19 @@
                 "value": 0.0009
             },
             {
-                "metric": "peak_recovery_hours_pnl",
+                "metric": "peak_recovery_days_pnl",
                 "penalize_if": "greater_than",
-                "value": 1344
+                "value": 56
             },
             {
-                "metric": "position_held_hours_max",
+                "metric": "position_held_days_max",
                 "penalize_if": "greater_than",
-                "value": 1344
+                "value": 56
             },
             {
-                "metric": "position_unchanged_hours_max",
+                "metric": "position_unchanged_days_max",
                 "penalize_if": "greater_than",
-                "value": 840
+                "value": 35
             }
         ],
         "mutation_eta": 20,
@@ -294,9 +293,9 @@
             "adg_pnl",
             "mdg_pnl",
             "loss_profit_ratio",
-            "peak_recovery_hours_pnl",
-            "position_held_hours_max",
-            "position_unchanged_hours_max",
+            "peak_recovery_days_pnl",
+            "position_held_days_max",
+            "position_unchanged_days_max",
             "volume_pct_per_day_avg_w",
             "entry_initial_balance_pct_long"
         ],

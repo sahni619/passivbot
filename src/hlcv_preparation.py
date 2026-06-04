@@ -2,20 +2,29 @@ import asyncio
 import json
 import logging
 import os
-import pprint
 import sys
 import time
 import traceback
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 
 from candlestick_manager import CandlestickManager
+from backtest_dataset_materializer import BacktestDatasetMaterializer, materialize_frames
+from ohlcv_catalog import OhlcvCatalog
+from ohlcv_legacy_import import import_legacy_range_into_store
+from ohlcv_planner import plan_local_symbol_range
+from ohlcv_store import OhlcvStore, timeframe_to_interval_ms
+
+
+class HlcvsDataIntegrityError(ValueError):
+    pass
 
 
 def _pct_log(level: str, pct: int, msg: str, *args, **kwargs) -> None:
@@ -65,24 +74,133 @@ class ProgressTracker:
         _pct_log("info", 100, f"{self.context} done {self.processed}/{self.total} in {elapsed}s")
 
 
-from config_utils import require_config_value, require_live_value
-from ohlcv_utils import dump_ohlcv_data
+from config.access import require_config_value, require_live_value
+from ohlcv_utils import get_days_in_between, load_ohlcv_data
 from procedures import get_first_timestamps_unified
 from utils import (
     coin_to_symbol,
-    denormalize_exchange_name,
+    to_standard_exchange_name,
     format_end_date,
     get_quote,
     load_ccxt_instance,
     load_markets,
     make_get_filepath,
-    normalize_exchange_name,
+    to_ccxt_exchange_id,
     symbol_to_coin,
     ts_to_date,
     utc_ms,
     date_to_ts,
 )
 from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
+from backtest_universe import effective_backtest_data_coins
+
+
+@dataclass(frozen=True)
+class CombinedCoinPlan:
+    coin: str
+    effective_start_ts: int
+    forced_exchange: Optional[str]
+    candidate_exchanges: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CombinedCandidateSummary:
+    coin: str
+    exchange: str
+    symbol: Optional[str]
+    status: str
+    rows: int
+    coverage_count: int
+    gap_count: int
+    total_volume: float
+    first_ts: Optional[int]
+    last_ts: Optional[int]
+    source_layers_used: tuple[str, ...]
+    repaired_windows: tuple[dict, ...] = ()
+    remaining_gaps: tuple[dict, ...] = ()
+    reason: Optional[str] = None
+    gap_class: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "coin": self.coin,
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "status": self.status,
+            "rows": int(self.rows),
+            "coverage_count": int(self.coverage_count),
+            "gap_count": int(self.gap_count),
+            "total_volume": float(self.total_volume),
+            "first_ts": self.first_ts,
+            "last_ts": self.last_ts,
+            "source_layers_used": list(self.source_layers_used),
+            "repaired_windows": list(self.repaired_windows),
+            "remaining_gaps": list(self.remaining_gaps),
+            "reason": self.reason,
+            "gap_class": self.gap_class,
+        }
+
+
+@dataclass(frozen=True)
+class V2FetchResult:
+    ok: bool
+    reason: str
+    wrote_rows: int = 0
+    first_ts: Optional[int] = None
+    last_ts: Optional[int] = None
+    leading_missing_bars: int = 0
+    trailing_missing_bars: int = 0
+    max_internal_missing_bars: int = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.ok)
+
+
+def _conflicting_duplicate_ohlcv_timestamps(df: pd.DataFrame) -> tuple[int, list[int]]:
+    duplicate_mask = df["timestamp"].duplicated(keep=False)
+    if not bool(duplicate_mask.any()):
+        return 0, []
+    value_cols = ["high", "low", "close", "volume"]
+    conflicts: list[int] = []
+    for timestamp, group in df.loc[duplicate_mask, ["timestamp", *value_cols]].groupby(
+        "timestamp", sort=True
+    ):
+        values = group[value_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+        if values.size == 0:
+            continue
+        if not np.all(values == values[0]):
+            conflicts.append(int(timestamp))
+    return len(conflicts), conflicts[:20]
+
+
+@dataclass(frozen=True)
+class CombinedExchangeCandidate:
+    exchange: str
+    df: pd.DataFrame
+    coverage_count: int
+    gap_count: int
+    total_volume: float
+    full_range: bool = True
+    summary: Optional[CombinedCandidateSummary] = None
+
+
+@dataclass(frozen=True)
+class CombinedCoinResolution:
+    coin: str
+    best_exchange: str
+    best_df: pd.DataFrame
+    market_settings: dict
+    candidates: tuple[CombinedExchangeCandidate, ...]
+
+
+def _has_tradfi_provider_config() -> bool:
+    try:
+        with open("api-keys.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tradfi = data.get("tradfi") if isinstance(data, dict) else None
+        return isinstance(tradfi, dict) and bool(tradfi.get("provider"))
+    except Exception:
+        return False
 
 
 class HLCVManager:
@@ -99,16 +217,17 @@ class HLCVManager:
         cm_debug_level: int = 0,
         cm_progress_log_interval_seconds: float = 10.0,  # Log progress every 10s by default
         force_refetch_gaps: bool = False,
+        ohlcv_source_dir: Optional[str] = None,
     ):
-        self.exchange = normalize_exchange_name(exchange)
+        self.exchange = to_ccxt_exchange_id(exchange)
         self.quote = get_quote(self.exchange)
         self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
         self.end_date = format_end_date("now" if end_date is None else end_date)
         self.start_ts = int(date_to_ts(self.start_date))
         self.end_ts = int(date_to_ts(self.end_date))
         self.cc = cc
-        # Use denormalized exchange name for cache paths (e.g., "binance" not "binanceusdm")
-        cache_exchange = denormalize_exchange_name(self.exchange)
+        # Use standard exchange name for cache paths (e.g., "binance" not "binanceusdm")
+        cache_exchange = to_standard_exchange_name(self.exchange)
         self.cache_filepaths = {
             "markets": os.path.join("caches", cache_exchange, "markets.json"),
             "first_timestamps": os.path.join("caches", cache_exchange, "first_timestamps.json"),
@@ -123,6 +242,8 @@ class HLCVManager:
             self.cm_progress_log_interval_seconds = 0.0
         self.force_refetch_gaps = bool(force_refetch_gaps)
         self.cm: Optional[CandlestickManager] = None
+        self.ohlcv_source_dir = str(ohlcv_source_dir) if ohlcv_source_dir else None
+        self.tradfi_for_stock_perps = _has_tradfi_provider_config()
 
     def update_date_range(self, new_start_date=None, new_end_date=None):
         if new_start_date is not None:
@@ -143,6 +264,12 @@ class HLCVManager:
             self.end_date = format_end_date(self.end_date)
             self.end_ts = int(date_to_ts(self.end_date))
 
+    def update_timestamp_range(self, new_start_ts: int, new_end_ts: int):
+        self.start_ts = int(new_start_ts)
+        self.end_ts = int(new_end_ts)
+        self.start_date = ts_to_date(self.start_ts)
+        self.end_date = ts_to_date(self.end_ts)
+
     def load_cc(self):
         if self.cc is None:
             self.cc = load_ccxt_instance(self.exchange, enable_rate_limit=True)
@@ -150,9 +277,10 @@ class HLCVManager:
             # Limit concurrent ccxt requests per exchange to reduce timeouts under heavy parallelism.
             # Bybit tends to be more sensitive.
             max_concurrent_requests = 3 if self.exchange == "bybit" else 5
+            # Use standard name for cache paths (e.g., "binance" not "binanceusdm")
             self.cm = CandlestickManager(
                 exchange=self.cc,
-                exchange_name=self.exchange,
+                exchange_name=to_standard_exchange_name(self.exchange),
                 debug=int(self.cm_debug_level),
                 progress_log_interval_seconds=float(self.cm_progress_log_interval_seconds),
                 max_concurrent_requests=max_concurrent_requests,
@@ -237,12 +365,32 @@ class HLCVManager:
                 if (now - float(self._download_log_last.get(key, 0.0))) < 10.0:
                     return
                 self._download_log_last[key] = now
+                first_ts = payload.get("first_ts")
+                last_ts = payload.get("last_ts")
+                first_iso = None
+                last_iso = None
+                try:
+                    if first_ts is not None:
+                        first_iso = datetime.fromtimestamp(
+                            int(first_ts) / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    first_iso = None
+                try:
+                    if last_ts is not None:
+                        last_iso = datetime.fromtimestamp(
+                            int(last_ts) / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    last_iso = None
                 logging.info(
-                    "[%s] download ccxt ok symbol=%s tf=%s rows=%s elapsed_ms=%s",
+                    "[%s] download ccxt ok symbol=%s tf=%s rows=%s first=%s last=%s elapsed_ms=%s",
                     self.exchange,
                     symbol,
                     payload.get("tf"),
                     payload.get("rows"),
+                    first_iso if first_iso is not None else first_ts,
+                    last_iso if last_iso is not None else last_ts,
                     payload.get("elapsed_ms"),
                 )
                 return
@@ -315,13 +463,40 @@ class HLCVManager:
         except Exception:
             pass
 
+    @staticmethod
+    def _market_lookup_forms(value: str) -> set[str]:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return set()
+        return {
+            normalized,
+            normalized.replace("-", ":"),
+            normalized.replace(":", "-"),
+        }
+
     def get_symbol(self, coin: str) -> str:
         assert self.markets, "needs to call load_markets() first"
-        return coin_to_symbol(coin, self.exchange)
+        symbol = coin_to_symbol(coin, self.exchange)
+        if symbol in self.markets:
+            return symbol
+
+        coin_forms = self._market_lookup_forms(coin)
+        symbol_forms = self._market_lookup_forms(symbol)
+        for market_symbol, market in self.markets.items():
+            market_forms = self._market_lookup_forms(market_symbol)
+            base_forms = self._market_lookup_forms(market.get("base", ""))
+            if market_forms & symbol_forms:
+                return market_symbol
+            if base_forms & coin_forms:
+                return market_symbol
+            if base_forms & symbol_forms:
+                return market_symbol
+        return symbol
 
     def has_coin(self, coin: str) -> bool:
         symbol = self.get_symbol(coin)
-        return bool(symbol)
+        # Also verify symbol exists in markets (fallback symbols won't be present)
+        return symbol and symbol in self.markets
 
     def get_market_specific_settings(self, coin: str) -> dict:
         mss = dict(self.markets[self.get_symbol(coin)])
@@ -402,6 +577,101 @@ class HLCVManager:
         self.dump_first_timestamp(coin, fts)
         return float(fts)
 
+    def _try_load_ohlcvs_from_source_dir(
+        self, coin: str, symbol: str, start_ts: int, end_ts: int
+    ) -> Optional[pd.DataFrame]:
+        if not self.ohlcv_source_dir:
+            return None
+        source_root = Path(self.ohlcv_source_dir)
+        if not source_root.exists():
+            return None
+
+        exchange_dir = to_standard_exchange_name(self.exchange)
+        exchange_root = source_root / exchange_dir / "1m"
+
+        start_day = ts_to_date(start_ts)
+        end_day = ts_to_date(end_ts)
+        days = get_days_in_between(start_day, end_day)
+
+        frames = []
+        candidates: list[str] = []
+
+        # Mirror CandlestickManager's symbol sanitization for Windows compatibility
+        windows_compat = os.name == "nt" or os.getenv("WINDOWS_COMPATIBILITY") == "1"
+
+        for name in (coin, symbol):
+            if not name:
+                continue
+            # Original name
+            candidates.append(name)
+            # Variant with "/" replaced by "_"
+            if "/" in name:
+                candidates.append(name.replace("/", "_"))
+            # In Windows compatibility mode, also mirror CandlestickManager's ":" -> "_"
+            if windows_compat and ("/" in name or ":" in name):
+                candidates.append(name.replace("/", "_").replace(":", "_"))
+
+        # De-duplicate while preserving order
+        seen = set()
+        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+        for day in days:
+            loaded = False
+            for name in candidates:
+                base_dir = exchange_root / name
+                if not base_dir.exists():
+                    continue
+                for ext in (".npz", ".npy"):
+                    filepath = base_dir / f"{day}{ext}"
+                    if not filepath.exists():
+                        continue
+                    try:
+                        df = load_ohlcv_data(str(filepath))
+                    except Exception as exc:
+                        logging.warning(
+                            "[%s] source dir load failed for %s %s: %s",
+                            self.exchange,
+                            coin,
+                            filepath,
+                            exc,
+                        )
+                        continue
+                    if not df.empty:
+                        frames.append(df)
+                        loaded = True
+                        break
+                if loaded:
+                    break
+
+        if not frames:
+            return None
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+        df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
+        if df.empty:
+            return None
+
+        ts = df["timestamp"].astype(np.int64, copy=False).values
+        if ts.size > 1:
+            intervals = np.diff(ts)
+            if not np.all(intervals == 60_000):
+                is_tradfi_stock_perp = coin.startswith("xyz:") and self.tradfi_for_stock_perps
+                gap_tolerance_ms = int(self.gap_tolerance_ohlcvs_minutes * 60_000)
+                if is_tradfi_stock_perp:
+                    gap_tolerance_ms = max(gap_tolerance_ms, 4 * 24 * 60 * 60_000)
+
+                greatest_gap_ms = int(intervals.max(initial=60_000))
+                if greatest_gap_ms > gap_tolerance_ms:
+                    logging.warning(
+                        "[%s] source dir non-contiguous data for %s; greatest gap %.1f minutes. Falling back.",
+                        self.exchange,
+                        coin,
+                        greatest_gap_ms / 60_000.0,
+                    )
+                    return None
+
+        return df.reset_index(drop=True)
+
     async def get_ohlcvs(self, coin: str, start_date=None, end_date=None) -> pd.DataFrame:
         empty_df = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
         if start_date is not None or end_date is not None:
@@ -409,14 +679,74 @@ class HLCVManager:
         if not self.markets:
             await self.load_markets()
         if not self.has_coin(coin):
+            logging.debug("[%s] get_ohlcvs: coin %s not found in markets", self.exchange, coin)
             return empty_df
-        self.load_cc()
-        assert self.cm is not None
         symbol = self.get_symbol(coin)
         start_ts = int(self.start_ts)
         end_ts = int(self.end_ts)
         if start_ts > end_ts:
+            logging.debug(
+                "[%s] get_ohlcvs: invalid range start_ts=%s > end_ts=%s",
+                self.exchange,
+                start_ts,
+                end_ts,
+            )
             return empty_df
+
+        if self.ohlcv_source_dir:
+            df = self._try_load_ohlcvs_from_source_dir(coin, symbol, start_ts, end_ts)
+            if df is not None and not df.empty:
+                self.load_cc()
+                assert self.cm is not None
+
+                src = np.zeros(
+                    len(df),
+                    dtype=[
+                        ("ts", "i8"),
+                        ("o", "f8"),
+                        ("h", "f8"),
+                        ("l", "f8"),
+                        ("c", "f8"),
+                        ("bv", "f8"),
+                    ],
+                )
+                src["ts"] = df["timestamp"].astype(np.int64, copy=False).values
+                src["o"] = df["open"].astype(float, copy=False).values
+                src["h"] = df["high"].astype(float, copy=False).values
+                src["l"] = df["low"].astype(float, copy=False).values
+                src["c"] = df["close"].astype(float, copy=False).values
+                src["bv"] = df["volume"].astype(float, copy=False).values
+
+                filled = self.cm.standardize_gaps(
+                    src, start_ts=start_ts, end_ts=end_ts, strict=False, assume_sorted=True
+                )
+                if filled.size == 0:
+                    return empty_df
+
+                df = pd.DataFrame(
+                    {
+                        "timestamp": filled["ts"].astype(np.int64),
+                        "open": filled["o"].astype(float),
+                        "high": filled["h"].astype(float),
+                        "low": filled["l"].astype(float),
+                        "close": filled["c"].astype(float),
+                        "volume": filled["bv"].astype(float),
+                    }
+                )
+                logging.info(
+                    "[%s] get_ohlcvs: using source dir for %s",
+                    self.exchange,
+                    coin,
+                )
+                return df.reset_index(drop=True)
+            logging.debug(
+                "[%s] get_ohlcvs: source dir had no data for %s; falling back to candlestick manager",
+                self.exchange,
+                coin,
+            )
+
+        self.load_cc()
+        assert self.cm is not None
 
         # Fetch strict (real) candles first to detect large gaps.
         real = await self.cm.get_candles(
@@ -429,13 +759,27 @@ class HLCVManager:
             force_refetch_gaps=self.force_refetch_gaps,
         )
         if real.size == 0:
+            logging.warning(
+                "[%s] get_ohlcvs: cm.get_candles returned empty for %s range %s to %s",
+                self.exchange,
+                symbol,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
             return empty_df
 
         ts = real["ts"].astype(np.int64, copy=False)
         if ts.size > 1:
+            is_tradfi_stock_perp = coin.startswith("xyz:") and self.tradfi_for_stock_perps
+            gap_tolerance_ms = int(self.gap_tolerance_ohlcvs_minutes * 60_000)
+            if is_tradfi_stock_perp:
+                # Allow expected stock-market closures (weekends/holidays) for TradFi-backed data.
+                # Keep configured tolerance when it's already stricter.
+                gap_tolerance_ms = max(gap_tolerance_ms, 4 * 24 * 60 * 60_000)
+
             intervals = np.diff(ts)
             greatest_gap_ms = int(intervals.max(initial=60_000))
-            if greatest_gap_ms > int(self.gap_tolerance_ohlcvs_minutes * 60_000):
+            if greatest_gap_ms > gap_tolerance_ms:
                 # Helpful diagnostics: locate the exact gap boundaries
                 gap_start_ts = None
                 gap_end_ts = None
@@ -470,7 +814,7 @@ class HLCVManager:
                         # Single or zero timestamp implies no measurable gaps;
                         # don't reuse stale greatest_gap_ms from the initial fetch.
                         greatest_gap_ms = 0
-                if greatest_gap_ms > int(self.gap_tolerance_ohlcvs_minutes * 60_000):
+                if greatest_gap_ms > gap_tolerance_ms:
                     if self.verbose:
                         logging.warning(
                             "[%s] gaps detected in %s OHLCV data; greatest gap: %.1f minutes. Returning empty.",
@@ -513,15 +857,99 @@ class HLCVManager:
         )
         return df.reset_index(drop=True)
 
+    async def fetch_ohlcvs_for_v2_store(
+        self, coin: str, *, start_ts: int, end_ts: int
+    ) -> pd.DataFrame:
+        """Fetch 1m candles for the v2 store without writing legacy daily shards."""
+        empty_df = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if not self.markets:
+            await self.load_markets()
+        if not self.has_coin(coin):
+            logging.debug("[%s] v2 fetch: coin %s not found in markets", self.exchange, coin)
+            return empty_df
+        if int(start_ts) > int(end_ts):
+            logging.debug(
+                "[%s] v2 fetch: invalid range start_ts=%s > end_ts=%s",
+                self.exchange,
+                start_ts,
+                end_ts,
+            )
+            return empty_df
 
-async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool = False):
-    approved = require_live_value(config, "approved_coins")
-    coins = sorted(
-        set(symbol_to_coin(c) for c in approved["long"])
-        | set(symbol_to_coin(c) for c in approved["short"])
-    )
+        symbol = self.get_symbol(coin)
+        if self.ohlcv_source_dir:
+            df = self._try_load_ohlcvs_from_source_dir(coin, symbol, int(start_ts), int(end_ts))
+            if df is not None and not df.empty:
+                logging.info(
+                    "[%s] v2 fetch: using source dir for %s",
+                    self.exchange,
+                    coin,
+                )
+                return df.reset_index(drop=True)
+            logging.debug(
+                "[%s] v2 fetch: source dir had no data for %s; fetching remote",
+                self.exchange,
+                coin,
+            )
+
+        self.load_cc()
+        assert self.cm is not None
+
+        async with self.cm._acquire_fetch_lock(symbol, "1m"):
+            fetched = await self.cm._fetch_ohlcv_paginated(
+                symbol,
+                int(start_ts),
+                int(end_ts) + 60_000,
+                timeframe="1m",
+            )
+        real = (
+            self.cm._slice_ts_range(fetched, int(start_ts), int(end_ts))
+            if fetched.size
+            else fetched
+        )
+        if real.size == 0:
+            logging.warning(
+                "[%s] v2 fetch returned empty for %s range %s to %s",
+                self.exchange,
+                symbol,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return empty_df
+
+        return pd.DataFrame(
+            {
+                "timestamp": real["ts"].astype(np.int64),
+                "open": real["o"].astype(float),
+                "high": real["h"].astype(float),
+                "low": real["l"].astype(float),
+                "close": real["c"].astype(float),
+                "volume": real["bv"].astype(float),
+            }
+        ).reset_index(drop=True)
+
+
+async def prepare_hlcvs(
+    config: dict,
+    exchange: str,
+    *,
+    force_refetch_gaps: bool = False,
+    skip_v2_local: bool = False,
+):
+    if not skip_v2_local:
+        try:
+            local_v2 = await try_prepare_hlcvs_v2_local(
+                config, exchange, force_refetch_gaps=force_refetch_gaps
+            )
+        except Exception as e:
+            raise ValueError(f"{exchange} deterministic HLCV materialization failed: {e}") from e
+        if local_v2 is not None:
+            return local_v2
+        logging.info("[%s] local v2 HLCV preparation unavailable; using direct fetch path", exchange)
+
+    coins = effective_backtest_data_coins(config)
     orig_coins = list(coins)
-    exchange = normalize_exchange_name(exchange)
+    exchange = to_ccxt_exchange_id(exchange)
     requested_start_date = require_config_value(config, "backtest.start_date")
     requested_start_ts = int(date_to_ts(requested_start_date))
     end_date = format_end_date(require_config_value(config, "backtest.end_date"))
@@ -552,10 +980,11 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
             config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
         ),
         force_refetch_gaps=force_refetch_gaps,
+        ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
     )
 
     try:
-        mss, timestamps, hlcvs = await prepare_hlcvs_internal(
+        mss, timestamps, prepared_hlcvs = await prepare_hlcvs_internal(
             config,
             coins,
             exchange,
@@ -567,8 +996,37 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
 
         om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
         btc_df = await om.get_ohlcvs("BTC")
+        btc_source_exchange = exchange
+
+        if btc_df.empty and exchange != "binanceusdm":
+            logging.warning(
+                "BTC/USD fetch returned empty on %s, retrying with binanceusdm",
+                exchange,
+            )
+            btc_fallback_om = HLCVManager(
+                "binanceusdm",
+                effective_start_date,
+                end_date,
+                gap_tolerance_ohlcvs_minutes=require_config_value(
+                    config, "backtest.gap_tolerance_ohlcvs_minutes"
+                ),
+            )
+            try:
+                btc_fallback_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
+                btc_df = await btc_fallback_om.get_ohlcvs("BTC")
+                if not btc_df.empty:
+                    btc_source_exchange = "binanceusdm"
+            finally:
+                await btc_fallback_om.aclose()
+                if btc_fallback_om.cc:
+                    await btc_fallback_om.cc.close()
+
         if btc_df.empty:
-            raise ValueError(f"Failed to fetch BTC/USD prices from {exchange}")
+            raise ValueError(
+                f"Failed to fetch BTC/USD prices from {exchange} (and binanceusdm fallback)"
+            )
+
+        logging.info("using BTC/USD benchmark source: %s", btc_source_exchange)
 
         btc_df = (
             btc_df.set_index("timestamp")
@@ -580,6 +1038,7 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
         btc_usd_prices = btc_df["close"].values
 
         warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // minute_ms))
+        candidate_report = mss.pop("__candidate_report__", [])
         mss["__meta__"] = {
             "requested_start_ts": int(requested_start_ts),
             "requested_start_date": ts_to_date(requested_start_ts),
@@ -587,13 +1046,1964 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
             "effective_start_date": ts_to_date(int(timestamps[0])),
             "warmup_minutes_requested": int(warmup_minutes),
             "warmup_minutes_provided": int(warmup_provided),
+            "btc_source_exchange": btc_source_exchange,
+            "candidate_report": candidate_report,
         }
 
-        return mss, timestamps, hlcvs, btc_usd_prices
+        if isinstance(prepared_hlcvs, dict):
+            coins_sorted = sorted([coin for coin in mss.keys() if not coin.startswith("__")])
+            handle = materialize_frames(
+                output_root=Path("caches") / "ohlcvs" / "materialized",
+                exchange=to_standard_exchange_name(exchange),
+                coins=coins_sorted,
+                timestamps=timestamps,
+                aligned_values_by_coin=prepared_hlcvs,
+                btc_usd_prices=btc_usd_prices,
+                mss={coin: mss[coin] for coin in coins_sorted},
+                run_id=f"{to_standard_exchange_name(exchange)}_{uuid4().hex[:12]}",
+            )
+            enriched_mss = handle.mss
+            enriched_mss["__meta__"] = mss["__meta__"]
+            return (
+                enriched_mss,
+                handle.open_timestamps(),
+                handle.open_hlcvs(),
+                handle.open_btc_usd_prices(),
+            )
+
+        return mss, timestamps, prepared_hlcvs, btc_usd_prices
     finally:
         await om.aclose()
         if om.cc:
             await om.cc.close()
+
+
+async def try_prepare_hlcvs_v2_local(
+    config: dict, exchange: str, *, force_refetch_gaps: bool = False
+) -> Optional[tuple[dict, np.ndarray, np.memmap, np.memmap]]:
+    if exchange == "combined":
+        return None
+
+    legacy_root_cfg = Path(
+        config.get("backtest", {}).get("ohlcv_source_dir") or Path("caches") / "ohlcv"
+    )
+    legacy_root = legacy_root_cfg if legacy_root_cfg.exists() else None
+
+    coins = effective_backtest_data_coins(config)
+    if any(coin.startswith("xyz:") for coin in coins):
+        return None
+
+    exchange = to_ccxt_exchange_id(exchange)
+    store_exchange = to_standard_exchange_name(exchange)
+    requested_start_date = require_config_value(config, "backtest.start_date")
+    requested_start_ts = int(date_to_ts(requested_start_date))
+    end_date = format_end_date(require_config_value(config, "backtest.end_date"))
+    end_ts = int(date_to_ts(end_date))
+    warmup_minutes = compute_backtest_warmup_minutes(config)
+    minute_ms = 60_000
+    warmup_ms = warmup_minutes * minute_ms
+    effective_start_ts = max(0, requested_start_ts - warmup_ms)
+    effective_start_ts = (effective_start_ts // minute_ms) * minute_ms
+    effective_start_date = ts_to_date(effective_start_ts)
+    minimum_coin_age_days = float(require_live_value(config, "minimum_coin_age_days"))
+    min_coin_age_ms = 1000 * 60 * 60 * 24 * minimum_coin_age_days
+    logging.info(
+        "[%s] starting local v2 HLCV preparation for %d candidate coins (%s -> %s)",
+        exchange,
+        len(coins),
+        effective_start_date,
+        end_date,
+    )
+
+    om = HLCVManager(
+        exchange,
+        effective_start_date,
+        end_date,
+        gap_tolerance_ohlcvs_minutes=require_config_value(
+            config, "backtest.gap_tolerance_ohlcvs_minutes"
+        ),
+        cm_debug_level=int(config.get("backtest", {}).get("cm_debug_level", 0) or 0),
+        cm_progress_log_interval_seconds=float(
+            config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
+        ),
+        force_refetch_gaps=force_refetch_gaps,
+        ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
+    )
+
+    try:
+        await om.load_markets()
+        first_timestamps_unified = await get_first_timestamps_unified(coins)
+        catalog = OhlcvCatalog(Path("caches") / "ohlcvs" / "catalog.sqlite")
+        store = OhlcvStore(Path("caches") / "ohlcvs", catalog)
+        mss = {}
+        coin_symbols = {}
+        coin_source_windows = {}
+        global_start_ts = None
+
+        for coin in coins:
+            if not om.has_coin(coin):
+                logging.info("[%s] v2 local skip missing coin %s", exchange, coin)
+                continue
+            if coin not in first_timestamps_unified:
+                logging.info("[%s] v2 local skip missing unified inception %s", exchange, coin)
+                continue
+
+            first_ts_guess = om.load_first_timestamp(coin)
+            if not first_ts_guess:
+                first_ts_guess = float(first_timestamps_unified[coin])
+            if first_ts_guess > end_ts:
+                continue
+
+            adjusted_start_ts = max(
+                int(effective_start_ts),
+                int(first_timestamps_unified[coin] + min_coin_age_ms),
+                int(first_ts_guess),
+            )
+            if adjusted_start_ts > end_ts:
+                continue
+
+            symbol = om.get_symbol(coin)
+            rng = await _resolve_v2_store_range(
+                om=om,
+                catalog=catalog,
+                store=store,
+                legacy_root=legacy_root,
+                exchange=store_exchange,
+                coin=coin,
+                symbol=symbol,
+                start_ts=adjusted_start_ts,
+                end_ts=end_ts,
+                allow_remote_fetch=True,
+                local_hit_log_label="v2 local hit",
+                remote_fetch_log_label="v2 local fetching missing range",
+            )
+            if rng is None:
+                logging.info("[%s] v2 local incomplete local range for %s; falling back", exchange, coin)
+                return None
+
+            coin_symbols[coin] = symbol
+            coin_source_windows[coin] = (int(rng.timestamps[0]), int(rng.timestamps[-1]))
+            mss[coin] = om.get_market_specific_settings(coin)
+            global_start_ts = adjusted_start_ts if global_start_ts is None else min(global_start_ts, adjusted_start_ts)
+
+        if not coin_symbols:
+            return None
+
+        btc_candidates = [(store_exchange, om)]
+        if store_exchange != "binance":
+            btc_candidates.append(("binance", None))
+
+        btc_prices = None
+        btc_source_exchange = None
+        for btc_exchange, btc_om in btc_candidates:
+            owned_om = btc_om is None
+            if owned_om:
+                btc_om = HLCVManager(
+                    btc_exchange,
+                    ts_to_date(global_start_ts),
+                    end_date,
+                    gap_tolerance_ohlcvs_minutes=require_config_value(
+                        config, "backtest.gap_tolerance_ohlcvs_minutes"
+                    ),
+                )
+                await btc_om.load_markets()
+            try:
+                if not btc_om.has_coin("BTC"):
+                    continue
+                btc_symbol = btc_om.get_symbol("BTC")
+                btc_rng = await _resolve_v2_store_range(
+                    om=btc_om,
+                    catalog=catalog,
+                    store=store,
+                    legacy_root=legacy_root,
+                    exchange=btc_exchange,
+                    coin="BTC",
+                    symbol=btc_symbol,
+                    start_ts=global_start_ts,
+                    end_ts=end_ts,
+                    allow_remote_fetch=True,
+                    local_hit_log_label="v2 local BTC hit",
+                    remote_fetch_log_label="v2 local fetching missing BTC range",
+                )
+                if btc_rng is None:
+                    continue
+                btc_df, _btc_gap_count = _dense_hlcv_frame_from_sparse_v2_range(btc_rng)
+                btc_prices = btc_df["close"].to_numpy(dtype=np.float64, copy=False)
+                btc_source_exchange = btc_exchange
+                break
+            finally:
+                if owned_om:
+                    await btc_om.aclose()
+                    if btc_om.cc:
+                        await btc_om.cc.close()
+
+        if btc_prices is None:
+            return None
+
+        run_id = f"{store_exchange}_{uuid4().hex[:12]}"
+        handle = BacktestDatasetMaterializer(
+            store, Path("caches") / "ohlcvs" / "materialized"
+        ).materialize(
+            exchange=store_exchange,
+            coins=sorted(coin_symbols),
+            symbols_by_coin=coin_symbols,
+            source_windows_by_coin={
+                coin: coin_source_windows[coin] for coin in sorted(coin_symbols)
+            },
+            start_ts=int(global_start_ts),
+            end_ts=int(end_ts),
+            btc_usd_prices=btc_prices,
+            mss={coin: mss[coin] for coin in sorted(coin_symbols)},
+            run_id=run_id,
+            fill_edge_gaps=True,
+        )
+        enriched_mss = handle.mss
+        warmup_provided = max(0, int(max(0, requested_start_ts - int(global_start_ts)) // minute_ms))
+        enriched_mss["__meta__"] = {
+            "requested_start_ts": int(requested_start_ts),
+            "requested_start_date": ts_to_date(requested_start_ts),
+            "effective_start_ts": int(global_start_ts),
+            "effective_start_date": ts_to_date(int(global_start_ts)),
+            "warmup_minutes_requested": int(warmup_minutes),
+            "warmup_minutes_provided": int(warmup_provided),
+            "btc_source_exchange": btc_source_exchange,
+        }
+        logging.info(
+            "[%s] prepared HLCVs from local v2 store for %d coins (%s -> %s)",
+            exchange,
+            len(coin_symbols),
+            ts_to_date(int(global_start_ts)),
+            ts_to_date(int(end_ts)),
+        )
+        return enriched_mss, handle.open_timestamps(), handle.open_hlcvs(), handle.open_btc_usd_prices()
+    finally:
+        await om.aclose()
+        if om.cc:
+            await om.cc.close()
+
+
+async def _resolve_v2_store_range(
+    *,
+    om: HLCVManager,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    legacy_root: Path | None,
+    exchange: str,
+    coin: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    allow_remote_fetch: bool,
+    allow_partial_window: bool = False,
+    local_hit_log_label: str,
+    remote_fetch_log_label: str,
+):
+    plan = plan_local_symbol_range(
+        catalog=catalog,
+        legacy_root=legacy_root,
+        exchange=exchange,
+        timeframe="1m",
+        symbol=symbol,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    if plan.should_try_legacy_import:
+        imported_rows = import_legacy_range_into_store(
+            store=store,
+            legacy_root=legacy_root,
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        logging.info(
+            "[%s] imported %d legacy 1m rows into v2 store for %s (%s -> %s)",
+            exchange,
+            imported_rows,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+    elif plan.blocked_by_persistent_gap and plan.legacy_inspection is not None:
+        # Even when legacy data doesn't fully cover the persistent gap,
+        # import whatever is available so the valid window starts earlier.
+        imported_rows = import_legacy_range_into_store(
+            store=store,
+            legacy_root=legacy_root,
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        if imported_rows > 0:
+            logging.info(
+                "[%s] imported %d partial-coverage legacy 1m rows into v2 store for %s (%s -> %s)",
+                exchange,
+                imported_rows,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+    rng = await _read_v2_range_repairing_corrupt_chunk(
+        om=om,
+        catalog=catalog,
+        store=store,
+        exchange=exchange,
+        coin=coin,
+        symbol=symbol,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        allow_remote_fetch=allow_remote_fetch,
+    )
+    if rng is None:
+        return None
+    if (
+        not rng.valid.all()
+        and rng.valid.any()
+        and legacy_root is not None
+    ):
+        imported_rows = _import_legacy_invalid_windows(
+            store=store,
+            legacy_root=legacy_root,
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            timestamps=rng.timestamps,
+            valid=rng.valid,
+        )
+        if imported_rows > 0:
+            logging.info(
+                "[%s] imported %d legacy 1m rows for invalid v2 windows for %s (%s -> %s)",
+                exchange,
+                imported_rows,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            rng = await _read_v2_range_repairing_corrupt_chunk(
+                om=om,
+                catalog=catalog,
+                store=store,
+                exchange=exchange,
+                coin=coin,
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                allow_remote_fetch=allow_remote_fetch,
+            )
+            if rng is None:
+                return None
+    if rng.valid.all():
+        logging.info(
+            "[%s] %s for %s (%s -> %s)",
+            exchange,
+            local_hit_log_label,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+        return rng
+    invalid_windows = (
+        _iter_invalid_windows(rng.timestamps, rng.valid)
+        if rng.valid.any()
+        else [(int(start_ts), int(end_ts))]
+    )
+    if _has_single_leading_invalid_prefix(rng):
+        first_ts_evidence = await _collect_first_timestamp_evidence(
+            om=om, exchange=exchange, coin=coin, symbol=symbol
+        )
+        authoritative_rng = _extract_authoritative_pre_inception_window(
+            rng, first_ts_evidence
+        )
+        if authoritative_rng is not None:
+            prefix_end_ts = int(authoritative_rng.timestamps[0]) - 60_000
+            if prefix_end_ts >= int(start_ts):
+                catalog.clear_gap_range(
+                    exchange=exchange,
+                    timeframe="1m",
+                    symbol=symbol,
+                    start_ts=int(start_ts),
+                    end_ts=int(end_ts),
+                    reason="pre_inception",
+                )
+                catalog.mark_gap(
+                    exchange=exchange,
+                    timeframe="1m",
+                    symbol=symbol,
+                    start_ts=int(start_ts),
+                    end_ts=prefix_end_ts,
+                    reason="pre_inception",
+                    persistent=True,
+                    retry_count=0,
+                    note="authoritative_first_candle_boundary",
+                )
+            logging.info(
+                "[%s] using authoritative pre-inception boundary for %s (%s -> %s)",
+                exchange,
+                coin,
+                ts_to_date(int(authoritative_rng.timestamps[0])),
+                ts_to_date(int(authoritative_rng.timestamps[-1])),
+            )
+            return authoritative_rng
+    if _range_has_tolerable_internal_sparse_gaps(
+        rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+    ) and not _persistent_gaps_overlap_windows(plan.persistent_gaps, invalid_windows):
+        logging.info(
+            "[%s] %s sparse-valid for %s (%s -> %s)",
+            exchange,
+            local_hit_log_label,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+        return rng
+    overlapping_persistent_gaps = _persistent_gaps_overlapping_windows(
+        plan.persistent_gaps, invalid_windows
+    )
+    if overlapping_persistent_gaps:
+        if all(str(gap.reason) == "pre_inception" for gap in overlapping_persistent_gaps):
+            partial_rng = _extract_single_valid_window(rng) if allow_partial_window else None
+            if partial_rng is not None:
+                logging.info(
+                    "[%s] using partial v2 local window for %s after pre-inception gap (%s -> %s)",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[0])),
+                    ts_to_date(int(partial_rng.timestamps[-1])),
+                )
+                return partial_rng
+            partial_rng = (
+                _extract_single_valid_window(rng)
+                if _pre_inception_gaps_confirm_discovered_boundary(overlapping_persistent_gaps)
+                else None
+            )
+            if partial_rng is not None:
+                logging.info(
+                    "[%s] using confirmed v2 pre-inception boundary for %s (%s -> %s)",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[0])),
+                    ts_to_date(int(partial_rng.timestamps[-1])),
+                )
+                return partial_rng
+            first_ts_evidence = await _collect_first_timestamp_evidence(
+                om=om, exchange=exchange, coin=coin, symbol=symbol
+            )
+            partial_rng = (
+                _extract_single_valid_window(rng)
+                if _pre_inception_gaps_confirm_legacy_mirrored_boundary(
+                    rng, overlapping_persistent_gaps
+                )
+                else None
+            )
+            if partial_rng is not None:
+                logging.info(
+                    "[%s] using legacy mirrored v2 pre-inception boundary for %s (%s -> %s); keeping gap(s) eligible for scheduled retry",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[0])),
+                    ts_to_date(int(partial_rng.timestamps[-1])),
+                )
+                return partial_rng
+            retryable_pre_inception_gaps = [
+                gap for gap in overlapping_persistent_gaps if _gap_retry_due(gap, om)
+            ]
+            if (
+                allow_remote_fetch
+                and retryable_pre_inception_gaps
+                and _pre_inception_gaps_are_stale(
+                    overlapping_persistent_gaps, first_ts_evidence
+                )
+            ):
+                logging.info(
+                    "[%s] retrying stale pre-inception v2 gap(s) for %s (%s -> %s); evidence=%s",
+                    exchange,
+                    coin,
+                    ts_to_date(start_ts),
+                    ts_to_date(end_ts),
+                    _format_first_timestamp_evidence(first_ts_evidence),
+                )
+                fetch_results = await _fetch_invalid_windows_into_v2_store_results(
+                    om=om,
+                    catalog=catalog,
+                    store=store,
+                    exchange=exchange,
+                    coin=coin,
+                    symbol=symbol,
+                    timestamps=rng.timestamps,
+                    valid=rng.valid,
+                    allow_pre_inception_prefix=True,
+                )
+                if any(result.ok for result in fetch_results):
+                    for result in fetch_results:
+                        if not result.ok or result.first_ts is None or result.last_ts is None:
+                            continue
+                        catalog.clear_gap_range(
+                            exchange=exchange,
+                            timeframe="1m",
+                            symbol=symbol,
+                            start_ts=result.first_ts,
+                            end_ts=result.last_ts,
+                            reason="pre_inception",
+                        )
+                        if result.reason == "pre_inception_boundary":
+                            catalog.mark_gap(
+                                exchange=exchange,
+                                timeframe="1m",
+                                symbol=symbol,
+                                start_ts=start_ts,
+                                end_ts=int(result.first_ts) - 60_000,
+                                reason="pre_inception",
+                                persistent=True,
+                                retry_count=0,
+                                note="discovered_first_candle_during_stale_repair",
+                            )
+                    rng = await _read_v2_range_repairing_corrupt_chunk(
+                        om=om,
+                        catalog=catalog,
+                        store=store,
+                        exchange=exchange,
+                        coin=coin,
+                        symbol=symbol,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        allow_remote_fetch=allow_remote_fetch,
+                    )
+                    if rng is None:
+                        return None
+                    if rng.valid.all():
+                        logging.info(
+                            "[%s] %s for %s after stale pre-inception repair (%s -> %s)",
+                            exchange,
+                            local_hit_log_label,
+                            coin,
+                            ts_to_date(start_ts),
+                            ts_to_date(end_ts),
+                        )
+                        return rng
+                    invalid_windows = (
+                        _iter_invalid_windows(rng.timestamps, rng.valid)
+                        if rng.valid.any()
+                        else [(int(start_ts), int(end_ts))]
+                    )
+                    remaining_persistent_gaps = _persistent_gaps_overlapping_windows(
+                        catalog.get_persistent_gaps(
+                            exchange, "1m", symbol, int(start_ts), int(end_ts)
+                        ),
+                        invalid_windows,
+                    )
+                    if _range_has_tolerable_internal_sparse_gaps(
+                        rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+                    ) and not remaining_persistent_gaps:
+                        logging.info(
+                            "[%s] %s sparse-valid for %s after stale pre-inception repair (%s -> %s)",
+                            exchange,
+                            local_hit_log_label,
+                            coin,
+                            ts_to_date(start_ts),
+                            ts_to_date(end_ts),
+                        )
+                        return rng
+                    if any(result.reason == "pre_inception_boundary" for result in fetch_results):
+                        partial_rng = _extract_valid_suffix_window(rng)
+                        if partial_rng is not None:
+                            logging.info(
+                                "[%s] using discovered v2 pre-inception boundary for %s (%s -> %s)",
+                                exchange,
+                                coin,
+                                ts_to_date(int(partial_rng.timestamps[0])),
+                                ts_to_date(int(partial_rng.timestamps[-1])),
+                            )
+                            return partial_rng
+                    overlapping_persistent_gaps = remaining_persistent_gaps
+                raise ValueError(
+                    _format_stale_pre_inception_failure(
+                        catalog=catalog,
+                        exchange=exchange,
+                        coin=coin,
+                        symbol=symbol,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        invalid_windows=invalid_windows,
+                        gaps=overlapping_persistent_gaps,
+                        first_ts_evidence=first_ts_evidence,
+                    )
+                )
+            return None
+        retryable_persistent_gaps = [
+            gap for gap in overlapping_persistent_gaps if _gap_retry_due(gap, om)
+        ]
+        if allow_remote_fetch and retryable_persistent_gaps:
+            logging.info(
+                "[%s] retrying %d persistent v2 gap window(s) for %s (%s -> %s)",
+                exchange,
+                len(invalid_windows),
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            await _fetch_invalid_windows_into_v2_store(
+                om=om,
+                catalog=catalog,
+                store=store,
+                exchange=exchange,
+                coin=coin,
+                symbol=symbol,
+                timestamps=rng.timestamps,
+                valid=rng.valid,
+            )
+            rng = await _read_v2_range_repairing_corrupt_chunk(
+                om=om,
+                catalog=catalog,
+                store=store,
+                exchange=exchange,
+                coin=coin,
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                allow_remote_fetch=allow_remote_fetch,
+            )
+            if rng is None:
+                return None
+            if rng.valid.all():
+                return rng
+            invalid_windows = (
+                _iter_invalid_windows(rng.timestamps, rng.valid)
+                if rng.valid.any()
+                else [(int(start_ts), int(end_ts))]
+            )
+            if _range_has_tolerable_internal_sparse_gaps(
+                rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+            ) and not _persistent_gaps_overlap_windows(plan.persistent_gaps, invalid_windows):
+                return rng
+        if _persistent_gaps_overlap_windows(plan.persistent_gaps, invalid_windows):
+            partial_rng = _usable_partial_coverage_window(
+                rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+            )
+            if partial_rng is not None:
+                valid_idx = np.flatnonzero(partial_rng.valid)
+                logging.info(
+                    "[%s] using verified partial v2 coverage for %s despite known gap(s) (%s -> %s)",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[int(valid_idx[0])])),
+                    ts_to_date(int(partial_rng.timestamps[int(valid_idx[-1])])),
+                )
+                return partial_rng
+            partial_rng = _extract_single_valid_window(rng) if allow_partial_window else None
+            if partial_rng is not None:
+                logging.info(
+                    "[%s] using partial v2 local window for %s despite persistent gap (%s -> %s)",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[0])),
+                    ts_to_date(int(partial_rng.timestamps[-1])),
+                )
+                return partial_rng
+            logging.info(
+                "[%s] v2 local blocked by persistent gap for %s (%s -> %s)",
+                exchange,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return None
+
+    if not allow_remote_fetch:
+        return None
+
+    if rng.valid.any():
+        logging.info(
+            "[%s] %s for %s: %d invalid local window(s) within %s -> %s",
+            exchange,
+            remote_fetch_log_label,
+            coin,
+            len(invalid_windows),
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+        await _fetch_invalid_windows_into_v2_store(
+            om=om,
+            catalog=catalog,
+            store=store,
+            exchange=exchange,
+            coin=coin,
+            symbol=symbol,
+            timestamps=rng.timestamps,
+            valid=rng.valid,
+        )
+        rng = await _read_v2_range_repairing_corrupt_chunk(
+            om=om,
+            catalog=catalog,
+            store=store,
+            exchange=exchange,
+            coin=coin,
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            allow_remote_fetch=allow_remote_fetch,
+        )
+        if rng is None:
+            return None
+        if rng.valid.all():
+            logging.info(
+                "[%s] %s for %s after targeted fetch (%s -> %s)",
+                exchange,
+                local_hit_log_label,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return rng
+        if _range_has_tolerable_internal_sparse_gaps(
+            rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+        ):
+            logging.info(
+                "[%s] %s sparse-valid for %s after targeted fetch (%s -> %s)",
+                exchange,
+                local_hit_log_label,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return rng
+        partial_rng = _usable_partial_coverage_window(
+            rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+        )
+        if partial_rng is not None:
+            valid_idx = np.flatnonzero(partial_rng.valid)
+            logging.info(
+                "[%s] %s partial coverage for %s after targeted fetch (%s -> %s)",
+                exchange,
+                local_hit_log_label,
+                coin,
+                ts_to_date(int(partial_rng.timestamps[int(valid_idx[0])])),
+                ts_to_date(int(partial_rng.timestamps[int(valid_idx[-1])])),
+            )
+            return partial_rng
+        if allow_partial_window:
+            partial_rng = _extract_single_valid_window(rng)
+            if partial_rng is not None:
+                logging.info(
+                    "[%s] using partial v2 local window for %s after targeted fetch (%s -> %s)",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[0])),
+                    ts_to_date(int(partial_rng.timestamps[-1])),
+                )
+                return partial_rng
+        return None
+
+    logging.info(
+        "[%s] %s for %s (%s -> %s)",
+        exchange,
+        remote_fetch_log_label,
+        coin,
+        ts_to_date(start_ts),
+        ts_to_date(end_ts),
+    )
+    if not await _fetch_coin_range_into_v2_store(
+        om=om,
+        catalog=catalog,
+        store=store,
+        exchange=exchange,
+        coin=coin,
+        symbol=symbol,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    ):
+        # The legacy candlestick manager may populate daily legacy shards during
+        # the failed fetch path. Re-check once so those newly written shards can
+        # still repair the v2 store without waiting for a later run.
+        post_fetch_plan = plan_local_symbol_range(
+            catalog=catalog,
+            legacy_root=legacy_root,
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        if post_fetch_plan.should_try_legacy_import:
+            imported_rows = import_legacy_range_into_store(
+                store=store,
+                legacy_root=legacy_root,
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            logging.info(
+                "[%s] imported %d post-fetch legacy 1m rows into v2 store for %s (%s -> %s)",
+                exchange,
+                imported_rows,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            rng = await _read_v2_range_repairing_corrupt_chunk(
+                om=om,
+                catalog=catalog,
+                store=store,
+                exchange=exchange,
+                coin=coin,
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                allow_remote_fetch=allow_remote_fetch,
+            )
+            if rng is None:
+                return None
+            if rng.valid.all():
+                logging.info(
+                    "[%s] %s for %s after post-fetch legacy import (%s -> %s)",
+                    exchange,
+                    local_hit_log_label,
+                    coin,
+                    ts_to_date(start_ts),
+                    ts_to_date(end_ts),
+                )
+                return rng
+            if _range_has_tolerable_internal_sparse_gaps(
+                rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+            ):
+                logging.info(
+                    "[%s] %s sparse-valid for %s after post-fetch legacy import (%s -> %s)",
+                    exchange,
+                    local_hit_log_label,
+                    coin,
+                    ts_to_date(start_ts),
+                    ts_to_date(end_ts),
+                )
+                return rng
+            partial_rng = _usable_partial_coverage_window(
+                rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+            )
+            if partial_rng is not None:
+                valid_idx = np.flatnonzero(partial_rng.valid)
+                logging.info(
+                    "[%s] %s partial coverage for %s after post-fetch legacy import (%s -> %s)",
+                    exchange,
+                    local_hit_log_label,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[int(valid_idx[0])])),
+                    ts_to_date(int(partial_rng.timestamps[int(valid_idx[-1])])),
+                )
+                return partial_rng
+            if allow_partial_window:
+                partial_rng = _extract_single_valid_window(rng)
+                if partial_rng is not None:
+                    logging.info(
+                        "[%s] using partial v2 local window for %s after post-fetch legacy "
+                        "import (%s -> %s)",
+                        exchange,
+                        coin,
+                        ts_to_date(int(partial_rng.timestamps[0])),
+                        ts_to_date(int(partial_rng.timestamps[-1])),
+                    )
+                    return partial_rng
+        return None
+    rng = await _read_v2_range_repairing_corrupt_chunk(
+        om=om,
+        catalog=catalog,
+        store=store,
+        exchange=exchange,
+        coin=coin,
+        symbol=symbol,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        allow_remote_fetch=allow_remote_fetch,
+    )
+    if rng is None:
+        return None
+    if not rng.valid.all():
+        if _range_has_tolerable_internal_sparse_gaps(
+            rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+        ):
+            logging.info(
+                "[%s] %s sparse-valid for %s after fetch (%s -> %s)",
+                exchange,
+                local_hit_log_label,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return rng
+        partial_rng = _usable_partial_coverage_window(
+            rng, getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)
+        )
+        if partial_rng is not None:
+            valid_idx = np.flatnonzero(partial_rng.valid)
+            logging.info(
+                "[%s] %s partial coverage for %s after fetch (%s -> %s)",
+                exchange,
+                local_hit_log_label,
+                coin,
+                ts_to_date(int(partial_rng.timestamps[int(valid_idx[0])])),
+                ts_to_date(int(partial_rng.timestamps[int(valid_idx[-1])])),
+            )
+            return partial_rng
+        if allow_partial_window:
+            partial_rng = _extract_single_valid_window(rng)
+            if partial_rng is not None:
+                logging.info(
+                    "[%s] using partial v2 local window for %s after fetch (%s -> %s)",
+                    exchange,
+                    coin,
+                    ts_to_date(int(partial_rng.timestamps[0])),
+                    ts_to_date(int(partial_rng.timestamps[-1])),
+                )
+                return partial_rng
+        logging.info(
+            "[%s] v2 store still incomplete for %s after fetch (%s -> %s)",
+            exchange,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+        return None
+    return rng
+
+
+async def _read_v2_range_repairing_corrupt_chunk(
+    *,
+    om: HLCVManager,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    exchange: str,
+    coin: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    allow_remote_fetch: bool,
+):
+    try:
+        return store.read_range(exchange, "1m", symbol, start_ts, end_ts)
+    except ValueError as exc:
+        if not _is_repairable_chunk_integrity_error(exc) or not allow_remote_fetch:
+            raise
+        corrupt_chunks = []
+        for chunk in catalog.list_chunks(exchange, "1m", symbol, start_ts, end_ts):
+            try:
+                store.verify_chunk_checksum(chunk)
+            except ValueError as chunk_exc:
+                if not _is_repairable_chunk_integrity_error(chunk_exc):
+                    raise
+                corrupt_chunks.append((chunk, chunk_exc))
+        if not corrupt_chunks:
+            raise
+        logging.warning(
+            "[%s] corrupt v2 chunk(s) for %s; invalidating %d chunk(s) before full-chunk repair: %s",
+            exchange,
+            coin,
+            len(corrupt_chunks),
+            exc,
+        )
+        for chunk, chunk_exc in corrupt_chunks:
+            repair_start_ts = int(chunk.start_ts)
+            repair_end_ts = int(chunk.end_ts)
+            catalog.mark_gap(
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=int(chunk.start_ts),
+                end_ts=int(chunk.end_ts),
+                reason="local_corrupt_chunk",
+                persistent=False,
+                note=str(chunk_exc),
+            )
+            store.invalidate_chunk(chunk)
+            repaired = await _fetch_coin_range_into_v2_store(
+                om=om,
+                catalog=catalog,
+                store=store,
+                exchange=exchange,
+                coin=coin,
+                symbol=symbol,
+                start_ts=repair_start_ts,
+                end_ts=repair_end_ts,
+                allow_unbounded_edge_gaps=True,
+            )
+            if not repaired:
+                return None
+        return store.read_range(exchange, "1m", symbol, start_ts, end_ts)
+
+
+def _extract_single_valid_window(rng):
+    valid_idx = np.flatnonzero(rng.valid)
+    if valid_idx.size == 0:
+        return None
+    start_idx = int(valid_idx[0])
+    end_idx = int(valid_idx[-1])
+    if not rng.valid[start_idx : end_idx + 1].all():
+        return None
+    return type(rng)(
+        timestamps=rng.timestamps[start_idx : end_idx + 1].copy(),
+        values=rng.values[start_idx : end_idx + 1].copy(),
+        valid=np.ones(end_idx - start_idx + 1, dtype=np.bool_),
+    )
+
+
+def _extract_valid_suffix_window(rng):
+    valid_idx = np.flatnonzero(rng.valid)
+    if valid_idx.size == 0:
+        return None
+    start_idx = int(valid_idx[0])
+    end_idx = int(valid_idx[-1])
+    if end_idx != len(rng.valid) - 1:
+        return None
+    return type(rng)(
+        timestamps=rng.timestamps[start_idx:].copy(),
+        values=rng.values[start_idx:].copy(),
+        valid=rng.valid[start_idx:].copy(),
+    )
+
+
+def _extract_authoritative_pre_inception_window(rng, first_ts_evidence: dict[str, int]):
+    valid_idx = np.flatnonzero(rng.valid)
+    if valid_idx.size == 0:
+        return None
+    first_valid_idx = int(valid_idx[0])
+    last_valid_idx = int(valid_idx[-1])
+    if first_valid_idx == 0 or last_valid_idx != len(rng.valid) - 1:
+        return None
+    if not rng.valid[first_valid_idx:].all():
+        return None
+    first_valid_ts = int(rng.timestamps[first_valid_idx])
+    authoritative_keys = (
+        "cm_authoritative_start_ts",
+        "local_first_timestamp",
+        "unified_exchange_first_timestamp",
+    )
+    matching_authoritative_ts = [
+        int(first_ts_evidence[key])
+        for key in authoritative_keys
+        if key in first_ts_evidence
+        and abs(first_valid_ts - int(first_ts_evidence[key])) <= 60_000
+    ]
+    if not matching_authoritative_ts:
+        return None
+    return _extract_single_valid_window(rng)
+
+
+def _has_single_leading_invalid_prefix(rng) -> bool:
+    valid_idx = np.flatnonzero(rng.valid)
+    if valid_idx.size == 0:
+        return False
+    first_valid_idx = int(valid_idx[0])
+    if first_valid_idx == 0:
+        return False
+    return int(valid_idx[-1]) == len(rng.valid) - 1 and bool(rng.valid[first_valid_idx:].all())
+
+
+def _usable_partial_coverage_window(rng, gap_tolerance_minutes: float):
+    valid_idx = np.flatnonzero(rng.valid)
+    if valid_idx.size == 0:
+        return None
+    if not _has_large_internal_sparse_gap(rng, gap_tolerance_minutes):
+        return rng
+    return _extract_longest_contiguous_valid_window(rng)
+
+
+def _has_large_internal_sparse_gap(rng, gap_tolerance_minutes: float) -> bool:
+    valid_idx = np.flatnonzero(rng.valid)
+    if valid_idx.size == 0:
+        return False
+    first_valid_ts = int(rng.timestamps[int(valid_idx[0])])
+    last_valid_ts = int(rng.timestamps[int(valid_idx[-1])])
+    max_gap_bars = max(0, int(float(gap_tolerance_minutes)))
+    for window_start, window_end in _iter_invalid_windows(rng.timestamps, rng.valid):
+        if int(window_end) < first_valid_ts or int(window_start) > last_valid_ts:
+            continue
+        window_bars = int((int(window_end) - int(window_start)) // 60_000) + 1
+        if window_bars > max_gap_bars:
+            return True
+    return False
+
+
+def _extract_longest_contiguous_valid_window(rng):
+    valid = np.asarray(rng.valid, dtype=bool)
+    if not valid.any():
+        return None
+    padded = np.concatenate(([False], valid, [False]))
+    changes = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+    if starts.size == 0:
+        return None
+    lengths = ends - starts
+    best = int(np.argmax(lengths))
+    start_idx = int(starts[best])
+    end_idx = int(ends[best])
+    return type(rng)(
+        timestamps=rng.timestamps[start_idx:end_idx].copy(),
+        values=rng.values[start_idx:end_idx].copy(),
+        valid=np.ones(end_idx - start_idx, dtype=np.bool_),
+    )
+
+
+def _iter_invalid_windows(timestamps: np.ndarray, valid: np.ndarray) -> list[tuple[int, int]]:
+    invalid_ts = np.asarray(timestamps)[~np.asarray(valid, dtype=bool)]
+    if invalid_ts.size == 0:
+        return []
+    windows: list[tuple[int, int]] = []
+    start = prev = int(invalid_ts[0])
+    for raw_ts in invalid_ts[1:]:
+        ts = int(raw_ts)
+        if ts == prev + 60_000:
+            prev = ts
+            continue
+        windows.append((start, prev))
+        start = prev = ts
+    windows.append((start, prev))
+    return windows
+
+
+def _range_has_tolerable_internal_sparse_gaps(rng, gap_tolerance_minutes: float) -> bool:
+    if rng.valid.all():
+        return True
+    if not rng.valid.any():
+        return False
+    max_gap_bars = max(0, int(float(gap_tolerance_minutes)))
+    for window_start, window_end in _iter_invalid_windows(rng.timestamps, rng.valid):
+        window_bars = int((int(window_end) - int(window_start)) // 60_000) + 1
+        if window_bars > max_gap_bars:
+            return False
+    return True
+
+
+def _dense_hlcv_frame_from_sparse_v2_range(rng) -> tuple[pd.DataFrame, int]:
+    valid = np.asarray(rng.valid, dtype=bool)
+    df = pd.DataFrame(
+        {
+            "timestamp": rng.timestamps.astype(np.int64),
+            "high": rng.values[:, 0].astype(np.float64, copy=False),
+            "low": rng.values[:, 1].astype(np.float64, copy=False),
+            "close": rng.values[:, 2].astype(np.float64, copy=False),
+            "volume": rng.values[:, 3].astype(np.float64, copy=False),
+            "valid": valid,
+        }
+    )
+    gap_count = int((~valid).sum())
+    if gap_count:
+        df.loc[~valid, ["high", "low", "close", "volume"]] = np.nan
+    return df.reset_index(drop=True), gap_count
+
+
+def _persistent_gaps_overlap_windows(gaps, windows: list[tuple[int, int]]) -> bool:
+    return bool(_persistent_gaps_overlapping_windows(gaps, windows))
+
+
+def _persistent_gaps_overlapping_windows(gaps, windows: list[tuple[int, int]]) -> list:
+    overlaps = []
+    for gap in gaps:
+        if not bool(gap.persistent):
+            continue
+        gap_start = int(gap.start_ts)
+        gap_end = int(gap.end_ts)
+        for window_start, window_end in windows:
+            if gap_start <= int(window_end) and gap_end >= int(window_start):
+                overlaps.append(gap)
+                break
+    return overlaps
+
+
+async def _maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _coerce_positive_ts(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        ts = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return ts if ts > 0 else None
+
+
+async def _collect_first_timestamp_evidence(
+    *,
+    om: HLCVManager,
+    exchange: str,
+    coin: str,
+    symbol: str,
+) -> dict[str, int]:
+    evidence: dict[str, int] = {}
+    loader = getattr(om, "load_first_timestamp", None)
+    if callable(loader):
+        try:
+            ts = _coerce_positive_ts(await _maybe_await(loader(coin)))
+            if ts is not None:
+                evidence["local_first_timestamp"] = ts
+        except Exception as exc:
+            logging.debug("[%s] failed loading local first timestamp for %s: %s", exchange, coin, exc)
+
+    cm = getattr(om, "cm", None)
+    cm_loader = getattr(cm, "_get_authoritative_start_ts", None)
+    if callable(cm_loader):
+        try:
+            ts = _coerce_positive_ts(await _maybe_await(cm_loader(symbol)))
+            if ts is not None:
+                evidence["cm_authoritative_start_ts"] = ts
+        except Exception as exc:
+            logging.debug(
+                "[%s] failed loading CandlestickManager authoritative start for %s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+
+    for key, exchange_arg in (
+        ("unified_exchange_first_timestamp", to_ccxt_exchange_id(exchange)),
+        ("unified_global_first_timestamp", None),
+    ):
+        try:
+            first_timestamps = await get_first_timestamps_unified([coin], exchange=exchange_arg)
+            ts = _coerce_positive_ts(first_timestamps.get(coin) if first_timestamps else None)
+            if ts is not None:
+                evidence[key] = ts
+        except Exception as exc:
+            logging.debug(
+                "[%s] failed loading %s for %s: %s",
+                exchange,
+                key,
+                coin,
+                exc,
+            )
+    return evidence
+
+
+def _pre_inception_gaps_are_stale(gaps, first_ts_evidence: dict[str, int]) -> bool:
+    authoritative_keys = (
+        "local_first_timestamp",
+        "cm_authoritative_start_ts",
+        "unified_exchange_first_timestamp",
+    )
+    authoritative_ts = [
+        int(first_ts_evidence[key])
+        for key in authoritative_keys
+        if key in first_ts_evidence
+    ]
+    if not authoritative_ts:
+        return False
+    earliest_authoritative_ts = min(authoritative_ts)
+    return any(
+        earliest_authoritative_ts <= int(gap.end_ts)
+        and not _pre_inception_gap_confirms_discovered_boundary(gap)
+        for gap in gaps
+    )
+
+
+_CONFIRMED_PRE_INCEPTION_BOUNDARY_NOTES = {
+    "authoritative_first_candle_boundary",
+    "discovered_first_candle_during_stale_repair",
+}
+
+_LEGACY_MIRRORED_PRE_INCEPTION_BOUNDARY_NOTES = {
+    "mirrored_from_candlestick_manager",
+}
+
+
+def _pre_inception_gap_confirms_discovered_boundary(gap) -> bool:
+    return str(getattr(gap, "note", "") or "") in _CONFIRMED_PRE_INCEPTION_BOUNDARY_NOTES
+
+
+def _pre_inception_gaps_confirm_discovered_boundary(gaps) -> bool:
+    return bool(gaps) and all(_pre_inception_gap_confirms_discovered_boundary(gap) for gap in gaps)
+
+
+def _pre_inception_gaps_confirm_legacy_mirrored_boundary(rng, gaps) -> bool:
+    if not bool(gaps) or not _has_single_leading_invalid_prefix(rng):
+        return False
+    accepted_notes = (
+        _CONFIRMED_PRE_INCEPTION_BOUNDARY_NOTES
+        | _LEGACY_MIRRORED_PRE_INCEPTION_BOUNDARY_NOTES
+    )
+    return all(str(getattr(gap, "note", "") or "") in accepted_notes for gap in gaps)
+
+
+def _gap_retry_due(gap, om=None) -> bool:
+    if bool(getattr(om, "force_refetch_gaps", False)):
+        return True
+    next_retry_at = getattr(gap, "next_retry_at", None)
+    if next_retry_at is None:
+        return True
+    try:
+        retry_ts = int(next_retry_at)
+    except (TypeError, ValueError):
+        return True
+    return retry_ts <= int(time.time() * 1000)
+
+
+def _format_first_timestamp_evidence(first_ts_evidence: dict[str, int]) -> str:
+    if not first_ts_evidence:
+        return "{}"
+    parts = [
+        f"{key}={ts_to_date(int(value))}"
+        for key, value in sorted(first_ts_evidence.items())
+    ]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _format_gap_ranges(gaps) -> str:
+    if not gaps:
+        return "[]"
+    return "[" + ", ".join(
+        (
+            f"{gap.reason}:{ts_to_date(int(gap.start_ts))}"
+            f"->{ts_to_date(int(gap.end_ts))}"
+            f":persistent={bool(gap.persistent)}"
+            f":retry_count={int(gap.retry_count or 0)}"
+        )
+        for gap in gaps
+    ) + "]"
+
+
+def _format_windows(windows: list[tuple[int, int]]) -> str:
+    if not windows:
+        return "[]"
+    return "[" + ", ".join(
+        f"{ts_to_date(int(start_ts))}->{ts_to_date(int(end_ts))}"
+        for start_ts, end_ts in windows
+    ) + "]"
+
+
+def _format_fetch_attempts(attempts) -> str:
+    if not attempts:
+        return "[]"
+    return "[" + ", ".join(
+        (
+            f"{attempt.outcome}:{ts_to_date(int(attempt.start_ts))}"
+            f"->{ts_to_date(int(attempt.end_ts))}"
+            f":note={attempt.note or ''}"
+        )
+        for attempt in attempts[-5:]
+    ) + "]"
+
+
+def _format_stale_pre_inception_failure(
+    *,
+    catalog: OhlcvCatalog,
+    exchange: str,
+    coin: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    invalid_windows: list[tuple[int, int]],
+    gaps,
+    first_ts_evidence: dict[str, int],
+) -> str:
+    attempts = catalog.list_fetch_attempts(exchange, "1m", symbol, start_ts, end_ts)
+    return (
+        f"{exchange} strict v2 HLCV repair failed for stale pre-inception gap "
+        f"coin={coin} symbol={symbol} "
+        f"requested={ts_to_date(int(start_ts))}->{ts_to_date(int(end_ts))} "
+        f"invalid_windows={_format_windows(invalid_windows)} "
+        f"persistent_gaps={_format_gap_ranges(gaps)} "
+        f"first_timestamp_evidence={_format_first_timestamp_evidence(first_ts_evidence)} "
+        f"recent_fetch_attempts={_format_fetch_attempts(attempts)}"
+    )
+
+
+def _is_repairable_chunk_integrity_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return (
+        "checksum mismatch" in message
+        or "checksum missing" in message
+    )
+
+
+def _import_legacy_invalid_windows(
+    *,
+    store: OhlcvStore,
+    legacy_root: Path,
+    exchange: str,
+    timeframe: str,
+    symbol: str,
+    timestamps: np.ndarray,
+    valid: np.ndarray,
+) -> int:
+    imported_rows = 0
+    for window_start_ts, window_end_ts in _iter_invalid_windows(timestamps, valid):
+        imported_rows += import_legacy_range_into_store(
+            store=store,
+            legacy_root=legacy_root,
+            exchange=exchange,
+            timeframe=timeframe,
+            symbol=symbol,
+            start_ts=window_start_ts,
+            end_ts=window_end_ts,
+        )
+    return imported_rows
+
+
+async def _fetch_invalid_windows_into_v2_store(
+    *,
+    om: HLCVManager,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    exchange: str,
+    coin: str,
+    symbol: str,
+    timestamps: np.ndarray,
+    valid: np.ndarray,
+) -> bool:
+    results = await _fetch_invalid_windows_into_v2_store_results(
+        om=om,
+        catalog=catalog,
+        store=store,
+        exchange=exchange,
+        coin=coin,
+        symbol=symbol,
+        timestamps=timestamps,
+        valid=valid,
+    )
+    return any(result.ok for result in results)
+
+
+async def _fetch_invalid_windows_into_v2_store_results(
+    *,
+    om: HLCVManager,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    exchange: str,
+    coin: str,
+    symbol: str,
+    timestamps: np.ndarray,
+    valid: np.ndarray,
+    allow_pre_inception_prefix: bool = False,
+) -> list[V2FetchResult]:
+    results: list[V2FetchResult] = []
+    full_start_ts = int(timestamps[0])
+    full_end_ts = int(timestamps[-1])
+    context_ms = max(
+        60_000,
+        int(float(getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)) * 60_000),
+    )
+    for window_start_ts, window_end_ts in _iter_invalid_windows(timestamps, valid):
+        fetch_start_ts = max(full_start_ts, int(window_start_ts) - context_ms)
+        fetch_end_ts = min(full_end_ts, int(window_end_ts) + context_ms)
+        raw_result = await _fetch_coin_range_into_v2_store(
+            om=om,
+            catalog=catalog,
+            store=store,
+            exchange=exchange,
+            coin=coin,
+            symbol=symbol,
+            start_ts=fetch_start_ts,
+            end_ts=fetch_end_ts,
+            allow_pre_inception_prefix=allow_pre_inception_prefix,
+        )
+        result = (
+            raw_result
+            if isinstance(raw_result, V2FetchResult)
+            else V2FetchResult(bool(raw_result), "ok" if raw_result else "failed")
+        )
+        results.append(result)
+        if not result:
+            break
+    return results
+
+
+async def _fetch_coin_range_into_v2_store(
+    *,
+    om: HLCVManager,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    exchange: str,
+    coin: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    allow_unbounded_edge_gaps: bool = False,
+    allow_pre_inception_prefix: bool = False,
+) -> V2FetchResult:
+    interval_ms = 60_000
+    if hasattr(om, "update_timestamp_range"):
+        om.update_timestamp_range(start_ts, end_ts)
+    else:
+        om.update_date_range(start_ts, end_ts)
+    fetch_started = time.perf_counter()
+    attempt = len(catalog.list_fetch_attempts(exchange, "1m", symbol, start_ts, end_ts)) + 1
+    try:
+        v2_fetcher = getattr(om, "fetch_ohlcvs_for_v2_store", None)
+        if callable(v2_fetcher):
+            df = await v2_fetcher(coin, start_ts=start_ts, end_ts=end_ts)
+        else:
+            df = await om.get_ohlcvs(coin)
+    except Exception as exc:
+        latency_ms = int(round((time.perf_counter() - fetch_started) * 1000.0))
+        catalog.record_fetch_attempt(
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            attempt=attempt,
+            outcome="exception",
+            latency_ms=latency_ms,
+            note=f"{type(exc).__name__}: {exc}",
+        )
+        _sync_persistent_cm_gaps_to_v2_catalog(
+            catalog=catalog,
+            om=om,
+            symbol=symbol,
+            exchange=exchange,
+            timeframe="1m",
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        raise
+    latency_ms = int(round((time.perf_counter() - fetch_started) * 1000.0))
+    if df.empty:
+        catalog.record_fetch_attempt(
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            attempt=attempt,
+            outcome="empty",
+            latency_ms=latency_ms,
+        )
+        _sync_persistent_cm_gaps_to_v2_catalog(
+            catalog=catalog,
+            om=om,
+            symbol=symbol,
+            exchange=exchange,
+            timeframe="1m",
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        logging.info(
+            "[%s] v2 fetch returned empty for %s (%s -> %s)",
+            exchange,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+        return V2FetchResult(False, "empty")
+    ts_raw = pd.to_numeric(df["timestamp"], errors="coerce").to_numpy()
+    if ts_raw.size == 0:
+        ts = np.array([], dtype=np.int64)
+    elif not np.all(np.isfinite(ts_raw)):
+        catalog.record_fetch_attempt(
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            attempt=attempt,
+            outcome="gaps",
+            latency_ms=latency_ms,
+            note="invalid_timestamp_values",
+        )
+        return V2FetchResult(False, "invalid_timestamp_values")
+    else:
+        ts = ts_raw.astype(np.int64, copy=False)
+    if ts.size == 0:
+        catalog.record_fetch_attempt(
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            attempt=attempt,
+            outcome="empty",
+            latency_ms=latency_ms,
+            note="empty_timestamp_array",
+        )
+        return V2FetchResult(False, "empty_timestamp_array")
+    request_start_ts = int(start_ts)
+    request_end_ts = int(end_ts)
+    gap_tolerance_bars = max(
+        0, int(float(getattr(om, "gap_tolerance_ohlcvs_minutes", 120.0)))
+    )
+    if np.any(ts % interval_ms != 0):
+        unaligned_count = int(np.count_nonzero(ts % interval_ms != 0))
+        catalog.record_fetch_attempt(
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            attempt=attempt,
+            outcome="gaps",
+            latency_ms=latency_ms,
+            note=f"unaligned_timestamps count={unaligned_count} first={ts[:10].tolist()} last={ts[-10:].tolist()}",
+        )
+        return V2FetchResult(False, "unaligned_timestamps")
+
+    raw_intervals = np.diff(ts) if ts.size > 1 else np.array([], dtype=np.int64)
+    raw_duplicate_count = int(pd.Series(ts).duplicated().sum()) if ts.size else 0
+    raw_descending_count = int(np.count_nonzero(raw_intervals < 0))
+    clipped_count = int(np.count_nonzero((ts < request_start_ts) | (ts > request_end_ts)))
+    if raw_duplicate_count or raw_descending_count or clipped_count:
+        df = df.copy()
+        df["timestamp"] = ts
+        df["_fetch_order"] = np.arange(len(df), dtype=np.int64)
+        df = df[(df["timestamp"] >= request_start_ts) & (df["timestamp"] <= request_end_ts)]
+        conflicting_duplicate_count, conflicting_duplicate_samples = (
+            _conflicting_duplicate_ohlcv_timestamps(df)
+        )
+        if conflicting_duplicate_count:
+            catalog.record_fetch_attempt(
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                attempt=attempt,
+                outcome="gaps",
+                latency_ms=latency_ms,
+                note=(
+                    "conflicting_duplicate_timestamps "
+                    f"count={conflicting_duplicate_count} samples={conflicting_duplicate_samples}"
+                ),
+            )
+            _sync_persistent_cm_gaps_to_v2_catalog(
+                catalog=catalog,
+                om=om,
+                symbol=symbol,
+                exchange=exchange,
+                timeframe="1m",
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            logging.info(
+                "[%s] v2 fetch returned conflicting duplicate timestamps for %s (%s -> %s)",
+                exchange,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return V2FetchResult(
+                False,
+                "conflicting_duplicate_timestamps",
+                first_ts=int(df["timestamp"].min()) if not df.empty else None,
+                last_ts=int(df["timestamp"].max()) if not df.empty else None,
+            )
+        df = df.sort_values(["timestamp", "_fetch_order"], kind="mergesort")
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        df = df.drop(columns=["_fetch_order"]).reset_index(drop=True)
+        ts = df["timestamp"].astype(np.int64, copy=False).to_numpy()
+        if ts.size == 0:
+            catalog.record_fetch_attempt(
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                attempt=attempt,
+                outcome="empty",
+                latency_ms=latency_ms,
+                note=(
+                    "empty_after_timestamp_normalization "
+                    f"duplicates={raw_duplicate_count} descending={raw_descending_count} clipped={clipped_count}"
+                ),
+            )
+            return V2FetchResult(False, "empty_after_timestamp_normalization")
+        logging.info(
+            "[%s] normalized v2 fetch timestamps for %s: duplicates=%d descending=%d clipped=%d rows=%d",
+            exchange,
+            coin,
+            raw_duplicate_count,
+            raw_descending_count,
+            clipped_count,
+            len(ts),
+        )
+    if ts[0] < request_start_ts or ts[-1] > request_end_ts:
+        catalog.record_fetch_attempt(
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            attempt=attempt,
+            outcome="range_mismatch",
+            latency_ms=latency_ms,
+            note=f"got {int(ts[0])} -> {int(ts[-1])}",
+        )
+        _sync_persistent_cm_gaps_to_v2_catalog(
+            catalog=catalog,
+            om=om,
+            symbol=symbol,
+            exchange=exchange,
+            timeframe="1m",
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        logging.info(
+            "[%s] v2 fetch range mismatch for %s expected %s -> %s got %s -> %s",
+            exchange,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+            ts_to_date(int(ts[0])),
+            ts_to_date(int(ts[-1])),
+        )
+        return V2FetchResult(
+            False,
+            "range_mismatch",
+            first_ts=int(ts[0]),
+            last_ts=int(ts[-1]),
+        )
+    leading_missing_bars = int((int(ts[0]) - request_start_ts) // interval_ms)
+    trailing_missing_bars = int((request_end_ts - int(ts[-1])) // interval_ms)
+    sparse_missing_bars = leading_missing_bars + trailing_missing_bars
+    max_missing_bars = 0
+    has_internal_gaps = False
+    if ts.size > 1:
+        intervals = np.diff(ts)
+        if np.any(intervals <= 0) or np.any(intervals % interval_ms != 0):
+            duplicate_count = int(np.count_nonzero(intervals == 0))
+            descending_count = int(np.count_nonzero(intervals < 0))
+            unaligned_step_count = int(np.count_nonzero(intervals % interval_ms != 0))
+            largest_steps = sorted(
+                (int(step) for step in intervals if step > interval_ms),
+                reverse=True,
+            )[:20]
+            catalog.record_fetch_attempt(
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                attempt=attempt,
+                outcome="gaps",
+                latency_ms=latency_ms,
+                note=(
+                    "non_monotonic_or_unaligned_timestamps "
+                    f"duplicates={duplicate_count} descending={descending_count} "
+                    f"unaligned_steps={unaligned_step_count} "
+                    f"first={ts[:20].tolist()} last={ts[-20:].tolist()} largest_steps={largest_steps}"
+                ),
+            )
+            _sync_persistent_cm_gaps_to_v2_catalog(
+                catalog=catalog,
+                om=om,
+                symbol=symbol,
+                exchange=exchange,
+                timeframe="1m",
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            logging.info(
+                "[%s] v2 fetch returned malformed timestamps for %s (%s -> %s)",
+                exchange,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+            return V2FetchResult(
+                False,
+                "non_monotonic_or_unaligned_timestamps",
+                first_ts=int(ts[0]),
+                last_ts=int(ts[-1]),
+                leading_missing_bars=leading_missing_bars,
+                trailing_missing_bars=trailing_missing_bars,
+            )
+        missing_by_gap = np.maximum((intervals // interval_ms) - 1, 0)
+        sparse_missing_bars += int(missing_by_gap.sum())
+        max_missing_bars = int(missing_by_gap.max(initial=0))
+        has_internal_gaps = bool(max_missing_bars > 0)
+        if max_missing_bars > gap_tolerance_bars:
+            catalog.record_fetch_attempt(
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                attempt=attempt,
+                outcome="gaps",
+                latency_ms=latency_ms,
+                note=f"max_missing_bars={max_missing_bars} tolerance={gap_tolerance_bars}",
+            )
+            _sync_persistent_cm_gaps_to_v2_catalog(
+                catalog=catalog,
+                om=om,
+                symbol=symbol,
+                exchange=exchange,
+                timeframe="1m",
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            logging.info(
+                "[%s] v2 fetch returned internal gaps for %s (%s -> %s); writing available rows",
+                exchange,
+                coin,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
+
+    pre_inception_prefix_boundary = (
+        allow_pre_inception_prefix
+        and leading_missing_bars > gap_tolerance_bars
+        and trailing_missing_bars == 0
+    )
+    leading_unavailable = leading_missing_bars > gap_tolerance_bars and not pre_inception_prefix_boundary
+    if leading_unavailable:
+        logging.info(
+            "[%s] v2 fetch has leading unavailable rows for %s (%s -> %s); writing available rows",
+            exchange,
+            coin,
+            ts_to_date(start_ts),
+            ts_to_date(end_ts),
+        )
+    values = np.column_stack(
+        [
+            df["high"].astype(np.float32, copy=False).to_numpy(),
+            df["low"].astype(np.float32, copy=False).to_numpy(),
+            df["close"].astype(np.float32, copy=False).to_numpy(),
+            df["volume"].astype(np.float32, copy=False).to_numpy(),
+        ]
+    )
+    store.write_rows(exchange, "1m", symbol, ts, values)
+    if sparse_missing_bars:
+        _mark_sparse_fetch_gaps(
+            catalog=catalog,
+            exchange=exchange,
+            timeframe="1m",
+            symbol=symbol,
+            request_start_ts=request_start_ts,
+            request_end_ts=request_end_ts,
+            ts=ts,
+            attempt=attempt,
+            leading_reason="pre_inception" if pre_inception_prefix_boundary else "leading_unavailable",
+            mark_leading_unavailable=leading_missing_bars > gap_tolerance_bars,
+        )
+    outcome = "sparse_ok" if sparse_missing_bars else "ok"
+    reason = "ok"
+    if pre_inception_prefix_boundary:
+        outcome = "pre_inception_boundary"
+        reason = "pre_inception_boundary"
+    elif leading_unavailable:
+        outcome = "leading_unavailable"
+        reason = "leading_unavailable"
+    elif trailing_missing_bars > gap_tolerance_bars and not has_internal_gaps:
+        outcome = "trailing_unavailable"
+        reason = "trailing_unavailable"
+    elif has_internal_gaps:
+        reason = "internal_gaps"
+    catalog.record_fetch_attempt(
+        exchange=exchange,
+        timeframe="1m",
+        symbol=symbol,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        attempt=attempt,
+        outcome=outcome,
+        latency_ms=latency_ms,
+        note=(
+            f"rows={len(ts)} missing_bars={sparse_missing_bars} "
+            f"edge_missing_bars={leading_missing_bars},{trailing_missing_bars} "
+            f"normalized_duplicates={raw_duplicate_count} "
+            f"normalized_descending={raw_descending_count} clipped_rows={clipped_count}"
+        ),
+    )
+    return V2FetchResult(
+        True,
+        reason,
+        wrote_rows=int(len(ts)),
+        first_ts=int(ts[0]),
+        last_ts=int(ts[-1]),
+        leading_missing_bars=leading_missing_bars,
+        trailing_missing_bars=trailing_missing_bars,
+        max_internal_missing_bars=max_missing_bars,
+    )
+
+
+def _mark_sparse_fetch_gaps(
+    *,
+    catalog: OhlcvCatalog,
+    exchange: str,
+    timeframe: str,
+    symbol: str,
+    request_start_ts: int,
+    request_end_ts: int,
+    ts: np.ndarray,
+    attempt: int,
+    leading_reason: str,
+    mark_leading_unavailable: bool = True,
+) -> None:
+    interval_ms = 60_000 if str(timeframe) == "1m" else timeframe_to_interval_ms(timeframe)
+    sorted_ts = np.asarray(ts, dtype=np.int64)
+    if sorted_ts.size == 0:
+        return
+    gaps: list[tuple[int, int, str]] = []
+    first_ts = int(sorted_ts[0])
+    last_ts = int(sorted_ts[-1])
+    if first_ts > int(request_start_ts) and (
+        str(leading_reason) == "pre_inception" or bool(mark_leading_unavailable)
+    ):
+        gaps.append((int(request_start_ts), first_ts - interval_ms, leading_reason))
+    if sorted_ts.size > 1:
+        intervals = np.diff(sorted_ts)
+        gap_indices = np.flatnonzero(intervals > interval_ms)
+        for idx in gap_indices:
+            gap_start = int(sorted_ts[int(idx)] + interval_ms)
+            gap_end = int(sorted_ts[int(idx) + 1] - interval_ms)
+            if gap_end >= gap_start:
+                gaps.append((gap_start, gap_end, "internal_gap"))
+    if last_ts < int(request_end_ts):
+        gaps.append((last_ts + interval_ms, int(request_end_ts), "trailing_unavailable"))
+    for gap_start, gap_end, reason in gaps:
+        if gap_end < gap_start:
+            continue
+        catalog.mark_gap(
+            exchange=exchange,
+            timeframe=timeframe,
+            symbol=symbol,
+            start_ts=gap_start,
+            end_ts=gap_end,
+            reason=reason,
+            persistent=True,
+            retry_count=int(attempt),
+            note="confirmed_by_v2_fetch",
+        )
+
+
+def _sync_persistent_cm_gaps_to_v2_catalog(
+    *,
+    catalog: OhlcvCatalog,
+    om: HLCVManager,
+    symbol: str,
+    exchange: str,
+    timeframe: str,
+    start_ts: int,
+    end_ts: int,
+) -> None:
+    cm = getattr(om, "cm", None)
+    if cm is None or not hasattr(cm, "get_gap_summary"):
+        return
+    try:
+        summary = cm.get_gap_summary(symbol)
+    except Exception:
+        return
+    for gap in summary.get("gaps", []):
+        if not gap.get("persistent"):
+            continue
+        gap_start = max(int(start_ts), int(gap["start_ts"]))
+        gap_end = min(int(end_ts), int(gap["end_ts"]))
+        if gap_end < gap_start:
+            continue
+        catalog.mark_gap(
+            exchange=exchange,
+            timeframe=timeframe,
+            symbol=symbol,
+            start_ts=gap_start,
+            end_ts=gap_end,
+            reason=str(gap.get("reason") or "persistent_gap"),
+            persistent=True,
+            retry_count=int(gap.get("retry_count", 0)),
+            note="mirrored_from_candlestick_manager",
+        )
 
 
 async def prepare_hlcvs_internal(
@@ -612,32 +3022,32 @@ async def prepare_hlcvs_internal(
     per_coin_warmups = compute_per_coin_warmup_minutes(config)
     default_warm = int(per_coin_warmups.get("__default__", 0))
 
-    cache_dir = Path(f"./caches/hlcvs_data/{uuid4().hex[:16]}")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    coin_metadata = {}
-    valid_coins = {}
+    valid_coin_data = {}
     global_start_time = float("inf")
     global_end_time = float("-inf")
     await om.load_markets()
     min_coin_age_ms = 1000 * 60 * 60 * 24 * minimum_coin_age_days
+    tradfi_for_stock_perps = _has_tradfi_provider_config()
 
     progress = ProgressTracker(len(coins), f"{exchange} fetching candles")
     progress.maybe_log(force=True)
 
     # Async helper to fetch a single coin's data with all validation
     async def fetch_coin_data(coin: str, sem: asyncio.Semaphore):
-        """Fetch and validate data for a single coin. Returns (coin, metadata, file_path, data_bounds) or None."""
+        """Fetch and validate data for a single coin. Returns (coin, data, data_bounds) or None."""
         async with sem:  # Rate limiting
             try:
                 adjusted_start_ts = int(effective_start_ts)
+                is_stock_perp_coin = coin.startswith("xyz:")
 
                 # Validation: check if coin exists
                 if not om.has_coin(coin):
                     _pct_log("info", progress.pct(), f"{exchange} coin {coin} missing, skipping")
                     return None
 
-                if coin not in first_timestamps_unified:
+                if coin not in first_timestamps_unified and not (
+                    is_stock_perp_coin and tradfi_for_stock_perps
+                ):
                     _pct_log(
                         "info",
                         progress.pct(),
@@ -646,7 +3056,9 @@ async def prepare_hlcvs_internal(
                     return None
 
                 # Minimum coin age validation
-                if minimum_coin_age_days > 0.0:
+                if minimum_coin_age_days > 0.0 and not (
+                    is_stock_perp_coin and tradfi_for_stock_perps
+                ):
                     try:
                         first_ts = await om.get_first_timestamp(coin)
                     except Exception as e:
@@ -698,24 +3110,24 @@ async def prepare_hlcvs_internal(
                 if len(data) == 0:
                     return None
 
-                # Validate no gaps
-                assert (np.diff(data[:, 0]) == interval_ms).all(), f"gaps in hlcv data {coin}"
-
-                # Save to cache
-                file_path = cache_dir / f"{coin}.npy"
-                dump_ohlcv_data(data, str(file_path))
-
-                # Prepare metadata
-                metadata = {
-                    "start_time": int(data[0, 0]),
-                    "end_time": int(data[-1, 0]),
-                    "length": len(data),
-                }
+                diffs = np.diff(data[:, 0].astype(np.int64, copy=False))
+                bad_steps = np.flatnonzero(diffs != interval_ms)
+                if bad_steps.size:
+                    first_bad_idx = int(bad_steps[0])
+                    raise HlcvsDataIntegrityError(
+                        f"{exchange} non-contiguous HLCV data for {coin}: "
+                        f"first_bad_step={first_bad_idx} "
+                        f"ts={int(data[first_bad_idx, 0])}->{int(data[first_bad_idx + 1, 0])} "
+                        f"step_ms={int(diffs[first_bad_idx])} expected_ms={interval_ms} "
+                        f"bad_steps={int(bad_steps.size)}"
+                    )
 
                 data_bounds = (data[0, 0], data[-1, 0])
 
-                return (coin, metadata, file_path, data_bounds)
+                return (coin, data, data_bounds)
 
+            except HlcvsDataIntegrityError:
+                raise
             except Exception as e:
                 _pct_log("error", progress.pct(), f"error with get_ohlcvs for {coin} {e}. Skipping")
                 traceback.print_exc()
@@ -733,38 +3145,46 @@ async def prepare_hlcvs_internal(
     for result in results:
         progress.maybe_log()
 
+        if isinstance(result, HlcvsDataIntegrityError):
+            raise result
         if result is None or isinstance(result, Exception):
             progress.update()
             continue
 
-        coin, metadata, file_path, data_bounds = result
-        coin_metadata[coin] = metadata
-        valid_coins[coin] = file_path
+        coin, data, data_bounds = result
+        valid_coin_data[coin] = data
         global_start_time = min(global_start_time, data_bounds[0])
         global_end_time = max(global_end_time, data_bounds[1])
         progress.update()
 
     progress.log_done()
 
-    if not valid_coins:
+    if not valid_coin_data:
+        logging.error(
+            "[%s] no valid coins found with data for %s -> %s (coins=%s)",
+            exchange,
+            ts_to_date(effective_start_ts),
+            ts_to_date(end_ts),
+            ",".join(coins),
+        )
         raise ValueError("No valid coins found with data")
 
     n_timesteps = int((global_end_time - global_start_time) / interval_ms) + 1
-    n_coins = len(valid_coins)
     timestamps = np.arange(global_start_time, global_end_time + interval_ms, interval_ms)
-    unified_array = np.full((n_timesteps, n_coins, 4), np.nan, dtype=np.float64)
     valid_index_ranges = {}
+    aligned_values_by_coin = {}
 
     logging.info(
-        f"{exchange} Unifying data for {len(valid_coins)} coin{'s' if len(valid_coins) > 1 else ''} into single numpy array..."
+        f"{exchange} Aligning data for {len(valid_coin_data)} coin{'s' if len(valid_coin_data) > 1 else ''} into shared payload..."
     )
-    for i, coin in enumerate(valid_coins):
-        file_path = valid_coins[coin]
-        ohlcv = np.load(file_path)
+    for coin in valid_coin_data:
+        ohlcv = valid_coin_data[coin]
         start_idx = int((ohlcv[0, 0] - global_start_time) / interval_ms)
         end_idx = start_idx + len(ohlcv)
         coin_data = ohlcv[:, 1:]
-        unified_array[start_idx:end_idx, i, :] = coin_data
+        aligned = np.full((n_timesteps, 4), np.nan, dtype=np.float64)
+        aligned[start_idx:end_idx, :] = coin_data
+        aligned_values_by_coin[coin] = aligned
         first_idx = int(start_idx)
         last_idx = int(end_idx - 1)
         warm_minutes = int(per_coin_warmups.get(coin, default_warm))
@@ -772,18 +3192,11 @@ async def prepare_hlcvs_internal(
         if trade_start_idx > last_idx:
             trade_start_idx = last_idx
         valid_index_ranges[coin] = (first_idx, last_idx)
-
-        os.remove(file_path)
-
-    try:
-        os.rmdir(cache_dir)
-    except OSError:
-        pass
     mss = {}
-    for coin in sorted(valid_coins):
+    for coin in sorted(valid_coin_data):
         meta = om.get_market_specific_settings(coin)
         first_idx, last_idx = valid_index_ranges.get(
-            coin, (unified_array.shape[0], unified_array.shape[0])
+            coin, (n_timesteps, n_timesteps)
         )
         meta["first_valid_index"] = first_idx
         meta["last_valid_index"] = last_idx
@@ -794,18 +3207,31 @@ async def prepare_hlcvs_internal(
             trade_start_idx = last_idx
         meta["trade_start_index"] = trade_start_idx
         mss[coin] = meta
-    return mss, timestamps, unified_array
+    return mss, timestamps, aligned_values_by_coin
 
 
-async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_gaps: bool = False):
+async def prepare_hlcvs_combined(
+    config,
+    forced_sources=None,
+    market_settings_sources=None,
+    *,
+    force_refetch_gaps: bool = False,
+):
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
-    exchanges_to_consider = [normalize_exchange_name(e) for e in backtest_exchanges]
+    exchanges_to_consider = [to_ccxt_exchange_id(e) for e in backtest_exchanges]
     forced_sources = forced_sources or {}
     normalized_forced_sources = {
-        str(coin): normalize_exchange_name(exchange)
+        str(coin): to_ccxt_exchange_id(exchange)
         for coin, exchange in forced_sources.items()
         if exchange
     }
+    market_settings_sources = market_settings_sources or {}
+    normalized_mss_sources = {
+        str(coin): to_ccxt_exchange_id(exchange)
+        for coin, exchange in market_settings_sources.items()
+        if exchange
+    }
+    ohlcv_exchanges = sorted(set(exchanges_to_consider) | set(normalized_forced_sources.values()))
 
     requested_start_date = require_config_value(config, "backtest.start_date")
     requested_start_ts = int(date_to_ts(requested_start_date))
@@ -824,6 +3250,13 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
             f"combined applying warmup: {warmup_minutes} minutes -> fetch start {effective_start_date}, "
             f"requested start {requested_start_date}"
         )
+    logging.info(
+        "combined starting v2-aware candle preparation across %d exchange(s) for %d candidate coin(s)",
+        len(set(ohlcv_exchanges)),
+        len(
+            effective_backtest_data_coins(config)
+        ),
+    )
 
     om_dict: Dict[str, HLCVManager] = {}
     for ex in exchanges_to_consider:
@@ -839,9 +3272,11 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
                 config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
             ),
             force_refetch_gaps=force_refetch_gaps,
+            ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
         )
     extra_forced = set(normalized_forced_sources.values()) - set(exchanges_to_consider)
-    for ex in extra_forced:
+    extra_mss = set(normalized_mss_sources.values()) - set(exchanges_to_consider) - extra_forced
+    for ex in extra_forced | extra_mss:
         om_dict[ex] = HLCVManager(
             ex,
             effective_start_date,
@@ -854,33 +3289,52 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
                 config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
             ),
             force_refetch_gaps=force_refetch_gaps,
+            ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
         )
     btc_om: Optional[HLCVManager] = None
+    legacy_root_cfg = Path(
+        config.get("backtest", {}).get("ohlcv_source_dir") or Path("caches") / "ohlcv"
+    )
+    legacy_root = legacy_root_cfg if legacy_root_cfg.exists() else None
+    catalog = OhlcvCatalog(Path("caches") / "ohlcvs" / "catalog.sqlite")
+    store = OhlcvStore(Path("caches") / "ohlcvs", catalog)
 
     try:
-        mss, timestamps, unified_array = await _prepare_hlcvs_combined_impl(
+        mss, timestamps, aligned_values_by_coin = await _prepare_hlcvs_combined_impl(
             config,
             om_dict,
             effective_start_ts,
             requested_start_ts,
             end_ts,
             normalized_forced_sources,
+            normalized_mss_sources,
+            force_refetch_gaps=force_refetch_gaps,
+            ohlcv_exchanges=ohlcv_exchanges,
+            catalog=catalog,
+            store=store,
+            legacy_root=legacy_root,
         )
 
-        btc_exchange = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
-        btc_om = HLCVManager(
-            btc_exchange,
-            effective_start_date,
-            end_date,
+        btc_df, btc_source_exchange = await _load_combined_btc_prices(
+            exchanges_to_consider=exchanges_to_consider,
+            timestamps=timestamps,
+            effective_start_date=effective_start_date,
+            end_date=end_date,
             gap_tolerance_ohlcvs_minutes=require_config_value(
                 config, "backtest.gap_tolerance_ohlcvs_minutes"
             ),
+            force_refetch_gaps=force_refetch_gaps,
+            catalog=catalog,
+            store=store,
+            legacy_root=legacy_root,
         )
-        # Align BTC date range to actual timestamps (mirrors single-exchange case)
-        btc_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
-        btc_df = await btc_om.get_ohlcvs("BTC")
+        btc_om = None
+
         if btc_df.empty:
-            raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
+            primary = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
+            raise ValueError(f"Failed to fetch BTC/USD prices from {primary} (and binanceusdm fallback)")
+
+        logging.info("using BTC/USD benchmark source: %s", btc_source_exchange)
 
         btc_df = (
             btc_df.set_index("timestamp")
@@ -892,6 +3346,7 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
         btc_usd_prices = btc_df["close"].values
 
         warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // minute_ms))
+        candidate_report = mss.pop("__candidate_report__", [])
         mss["__meta__"] = {
             "requested_start_ts": int(requested_start_ts),
             "requested_start_date": ts_to_date(requested_start_ts),
@@ -899,9 +3354,29 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
             "effective_start_date": ts_to_date(int(timestamps[0])),
             "warmup_minutes_requested": int(warmup_minutes),
             "warmup_minutes_provided": int(warmup_provided),
+            "btc_source_exchange": btc_source_exchange,
+            "candidate_report": candidate_report,
         }
 
-        return mss, timestamps, unified_array, btc_usd_prices
+        run_id = f"combined_{uuid4().hex[:12]}"
+        handle = materialize_frames(
+            output_root=Path("caches") / "ohlcvs" / "materialized",
+            exchange="combined",
+            coins=sorted([coin for coin in mss.keys() if not coin.startswith("__")]),
+            timestamps=timestamps,
+            aligned_values_by_coin=aligned_values_by_coin,
+            btc_usd_prices=btc_usd_prices,
+            mss={coin: mss[coin] for coin in sorted([c for c in mss.keys() if not c.startswith('__')])},
+            run_id=run_id,
+        )
+        enriched_mss = handle.mss
+        enriched_mss["__meta__"] = mss["__meta__"]
+        return (
+            enriched_mss,
+            handle.open_timestamps(),
+            handle.open_hlcvs(),
+            handle.open_btc_usd_prices(),
+        )
     finally:
         for om in om_dict.values():
             await om.aclose()
@@ -920,17 +3395,25 @@ async def _prepare_hlcvs_combined_impl(
     _requested_start_ts: int,
     end_ts: int,
     forced_sources: Dict[str, str],
+    market_settings_sources: Optional[Dict[str, str]] = None,
+    *,
+    force_refetch_gaps: bool,
+    ohlcv_exchanges: Optional[Sequence[str]] = None,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    legacy_root: Path | None,
 ):
-    approved = require_live_value(config, "approved_coins")
-    coins = sorted(
-        set(symbol_to_coin(c) for c in approved["long"])
-        | set(symbol_to_coin(c) for c in approved["short"])
-    )
-    exchanges_to_consider = sorted(list(om_dict.keys()))
+    market_settings_sources = market_settings_sources or {}
+    coins = effective_backtest_data_coins(config)
+    orig_coins = list(coins)
+    if ohlcv_exchanges is not None:
+        exchanges_to_consider = [ex for ex in ohlcv_exchanges if ex in om_dict]
+    else:
+        exchanges_to_consider = sorted(list(om_dict.keys()))
     minimum_coin_age_days = float(require_live_value(config, "minimum_coin_age_days"))
     interval_ms = 60_000
     min_coin_age_ms = 1000 * 60 * 60 * 24 * minimum_coin_age_days
-
+    tradfi_for_stock_perps = _has_tradfi_provider_config()
     first_timestamps_unified = await get_first_timestamps_unified(coins)
 
     per_coin_warmups = compute_per_coin_warmup_minutes(config)
@@ -938,174 +3421,58 @@ async def _prepare_hlcvs_combined_impl(
 
     chosen_data_per_coin = {}
     chosen_mss_per_coin = {}
+    candidate_report: list[dict] = []
 
     # Preload markets
     await asyncio.gather(*[om.load_markets() for om in om_dict.values()])
-
-    # Normalize stock perp coins: convert plain tickers to xyz: prefixed for hyperliquid
-    def normalize_stock_perp_coin(coin: str, forced_exchange: Optional[str]) -> str:
-        """Convert plain ticker to xyz: prefix if it's a stock perp on hyperliquid."""
-        if forced_exchange != "hyperliquid":
-            return coin
-        if coin.startswith("xyz:"):
-            return coin  # Already prefixed
-        # Check if xyz:TICKER exists on hyperliquid
-        hl_om = om_dict.get("hyperliquid")
-        if hl_om and hl_om.markets:
-            xyz_coin = f"xyz:{coin}"
-            # Check if the xyz: prefixed version maps to a valid symbol
-            xyz_symbol = coin_to_symbol(xyz_coin, "hyperliquid")
-            if xyz_symbol and xyz_symbol in hl_om.markets:
-                logging.info(f"Normalizing stock perp coin: {coin} -> {xyz_coin}")
-                return xyz_coin
-        return coin
-
-    # Apply normalization to coins
-    normalized_coins = []
-    for coin in coins:
-        # Get the forced exchange for this coin (checking both with and without xyz: prefix)
-        forced_ex = forced_sources.get(coin)
-        if forced_ex is None and coin.startswith("xyz:"):
-            forced_ex = forced_sources.get(coin[4:])  # Check without prefix
-        elif forced_ex is None and not coin.startswith("xyz:"):
-            forced_ex = forced_sources.get(f"xyz:{coin}")  # Check with prefix
-        normalized_coin = normalize_stock_perp_coin(coin, forced_ex)
-        normalized_coins.append(normalized_coin)
-
-    # Deduplicate and update coins list
-    coins = sorted(set(normalized_coins))
-
-    # Update first_timestamps for normalized coins
-    for orig, norm in zip(orig_coins, normalized_coins):
-        if orig != norm and orig in first_timestamps_unified and norm not in first_timestamps_unified:
-            first_timestamps_unified[norm] = first_timestamps_unified[orig]
+    coins = _normalize_combined_coins(coins, forced_sources, om_dict, first_timestamps_unified)
 
     progress = ProgressTracker(len(coins), "combined fetching candles")
     progress.maybe_log(force=True)
-
-    # Async helper to process a single coin across all candidate exchanges
-    async def process_coin(coin: str, sem: asyncio.Semaphore):
-        """Fetch coin data from all candidate exchanges and select the best one."""
-        async with sem:  # Rate limiting
-            try:
-                if coin not in first_timestamps_unified:
-                    return None
-
-                coin_fts = int(first_timestamps_unified[coin])
-                effective_start_ts = max(int(base_start_ts), coin_fts + int(min_coin_age_ms))
-                if effective_start_ts >= end_ts:
-                    logging.info(
-                        "%s: skipping - effective start %s >= end %s "
-                        "(coin first available: %s, min_age=%d days)",
-                        coin,
-                        ts_to_date(effective_start_ts),
-                        ts_to_date(end_ts),
-                        ts_to_date(coin_fts),
-                        int(minimum_coin_age_days),
-                    )
-                    return None
-                if effective_start_ts > base_start_ts:
-                    logging.info(
-                        "%s: adjusting start from %s to %s (coin first available: %s, min_age=%d days)",
-                        coin,
-                        ts_to_date(base_start_ts),
-                        ts_to_date(effective_start_ts),
-                        ts_to_date(coin_fts),
-                        int(minimum_coin_age_days),
-                    )
-
-                # Try matching coin directly, then try base coin without xyz: prefix
-                forced_exchange = forced_sources.get(coin)
-                if forced_exchange is None and coin.startswith("xyz:"):
-                    base_coin = coin[4:]  # Remove "xyz:" prefix
-                    forced_exchange = forced_sources.get(base_coin)
-                candidate_exchanges = [forced_exchange] if forced_exchange else exchanges_to_consider
-                for ex in candidate_exchanges:
-                    if ex not in om_dict:
-                        raise ValueError(f"Unknown exchange '{ex}' requested for coin {coin}")
-
-                # Fetch from all candidate exchanges in parallel
-                tasks = []
-                position_map = {ex0: (1 + i) for i, ex0 in enumerate(exchanges_to_consider)}
-                for ex in candidate_exchanges:
-                    tasks.append(
-                        asyncio.create_task(
-                            fetch_data_for_coin_and_exchange(
-                                coin,
-                                ex,
-                                om_dict[ex],
-                                effective_start_ts,
-                                end_ts,
-                                progress_position=position_map.get(ex, 1),
-                            )
-                        )
-                    )
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Filter successful results
-                exchange_candidates = []
-                for r in results:
-                    if r is None or isinstance(r, Exception):
-                        continue
-                    ex, df, coverage_count, gap_count, total_volume = r
-                    exchange_candidates.append((ex, df, coverage_count, gap_count, total_volume))
-
-                if not exchange_candidates:
-                    if forced_exchange:
-                        raise ValueError(
-                            f"No exchange data found for coin {coin} on forced exchange {forced_exchange}."
-                        )
-                    logging.info(f"No exchange data found at all for coin {coin}. Skipping.")
-                    return None
-
-                # Select best exchange
-                if forced_exchange:
-                    chosen = [c for c in exchange_candidates if c[0] == forced_exchange]
-                    if not chosen:
-                        raise ValueError(
-                            f"Forced exchange {forced_exchange} returned no usable data for coin {coin}."
-                        )
-                    best_exchange, best_df, best_cov, best_gaps, best_vol = chosen[0]
-                elif len(exchange_candidates) == 1:
-                    best_exchange, best_df, best_cov, best_gaps, best_vol = exchange_candidates[0]
-                else:
-                    exchange_candidates.sort(key=lambda x: (x[2], -x[3], x[4]), reverse=True)
-                    best_exchange, best_df, best_cov, best_gaps, best_vol = exchange_candidates[0]
-
-                logging.info(f"{coin} exchange preference: {[x[0] for x in exchange_candidates]}")
-
-                # Prepare market settings
-                mss = om_dict[best_exchange].get_market_specific_settings(coin)
-                mss["exchange"] = denormalize_exchange_name(best_exchange)
-                warm_minutes = int(per_coin_warmups.get(coin, default_warm))
-                mss["warmup_minutes"] = warm_minutes
-
-                return (coin, best_df, mss)
-
-            except Exception as e:
-                logging.error(f"Error processing coin {coin}: {e}")
-                traceback.print_exc()
-                return None
 
     # Parallelize coin processing with rate limiting
     # Use semaphore of 6 to respect API rate limits across all exchanges
     COIN_CONCURRENCY = 6
     sem = asyncio.Semaphore(COIN_CONCURRENCY)
 
-    tasks = [process_coin(coin, sem) for coin in coins]
+    tasks = [
+        _resolve_combined_coin(
+            coin=coin,
+            sem=sem,
+            base_start_ts=base_start_ts,
+            end_ts=end_ts,
+            first_timestamps_unified=first_timestamps_unified,
+            minimum_coin_age_days=minimum_coin_age_days,
+            min_coin_age_ms=min_coin_age_ms,
+            tradfi_for_stock_perps=tradfi_for_stock_perps,
+            forced_sources=forced_sources,
+            market_settings_sources=market_settings_sources,
+            exchanges_to_consider=exchanges_to_consider,
+            om_dict=om_dict,
+            per_coin_warmups=per_coin_warmups,
+            default_warm=default_warm,
+            force_refetch_gaps=force_refetch_gaps,
+            catalog=catalog,
+            store=store,
+            legacy_root=legacy_root,
+            candidate_report=candidate_report,
+        )
+        for coin in coins
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Process results
     for result in results:
         progress.maybe_log()
 
-        if result is None or isinstance(result, Exception):
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
             progress.update()
             continue
 
-        coin, df, mss = result
-        chosen_data_per_coin[coin] = df
-        chosen_mss_per_coin[coin] = mss
+        chosen_data_per_coin[result.coin] = result.best_df
+        chosen_mss_per_coin[result.coin] = result.market_settings
         progress.update()
 
     progress.log_done()
@@ -1126,18 +3493,30 @@ async def _prepare_hlcvs_combined_impl(
     )
     end_date_for_volume_ratios = ts_to_date(global_end_time)
 
-    exchanges_with_data = sorted(set([chosen_mss_per_coin[coin]["exchange"] for coin in valid_coins]))
+    # Use OHLCV sources for volume ratio calculation, not market settings sources
+    exchanges_with_data = sorted(
+        set(
+            [
+                chosen_mss_per_coin[coin].get("ohlcv_source", chosen_mss_per_coin[coin]["exchange"])
+                for coin in valid_coins
+            ]
+        )
+    )
     exchange_volume_ratios = await compute_exchange_volume_ratios(
         exchanges_with_data,
         valid_coins,
         start_date_for_volume_ratios,
         end_date_for_volume_ratios,
-        # om_dict keys are normalized (e.g. "binanceusdm"), but exchanges_with_data are denormalized
-        {ex: om_dict[normalize_exchange_name(ex)] for ex in exchanges_with_data},
+        # om_dict keys are ccxt IDs (e.g. "binanceusdm"), but exchanges_with_data use standard names
+        {ex: om_dict[to_ccxt_exchange_id(ex)] for ex in exchanges_with_data},
     )
     exchanges_counts = defaultdict(int)
     for coin in chosen_mss_per_coin:
-        exchanges_counts[chosen_mss_per_coin[coin]["exchange"]] += 1
+        # Use OHLCV source for volume normalization, not market settings source
+        ohlcv_exchange = chosen_mss_per_coin[coin].get(
+            "ohlcv_source", chosen_mss_per_coin[coin]["exchange"]
+        )
+        exchanges_counts[ohlcv_exchange] += 1
     reference_exchange = sorted(exchanges_counts.items(), key=lambda x: x[1])[-1][0]
     exchange_volume_ratios_mapped = defaultdict(dict)
     if len(exchanges_counts) == 1:
@@ -1149,23 +3528,61 @@ async def _prepare_hlcvs_combined_impl(
             exchange_volume_ratios_mapped[ex1][ex1] = 1.0
             exchange_volume_ratios_mapped[ex0][ex0] = 1.0
 
-    pprint.pprint(dict(exchange_volume_ratios_mapped))
+    # Log volume normalization ratios (used to scale volumes when combining multi-exchange data)
+    if len(exchanges_counts) > 1:
+        ratio_summary = ", ".join(
+            f"{ex}={exchange_volume_ratios_mapped[ex][reference_exchange]:.3f}"
+            for ex in sorted(exchanges_counts.keys())
+            if ex != reference_exchange and ex in exchange_volume_ratios_mapped
+        )
+        logging.info(
+            "volume normalization: reference=%s ratios=[%s] (coins per exchange: %s)",
+            reference_exchange,
+            ratio_summary,
+            ", ".join(f"{ex}={cnt}" for ex, cnt in sorted(exchanges_counts.items())),
+        )
 
-    unified_array = np.full((n_timesteps, n_coins, 4), np.nan, dtype=np.float64)
+    # Log exchange assignment summary (which exchange was chosen for which coins)
+    if len(exchanges_counts) > 1:
+        coins_by_exchange = defaultdict(list)
+        for coin in valid_coins:
+            # Use OHLCV source for grouping, not market settings source
+            ohlcv_ex = chosen_mss_per_coin[coin].get(
+                "ohlcv_source", chosen_mss_per_coin[coin]["exchange"]
+            )
+            coins_by_exchange[ohlcv_ex].append(symbol_to_coin(coin))
+        for ex in sorted(coins_by_exchange.keys()):
+            coins_list = coins_by_exchange[ex]
+            logging.info(
+                "[combined] chose %s for %d coins: %s",
+                ex,
+                len(coins_list),
+                ", ".join(sorted(coins_list)),
+            )
+
+    aligned_values_by_coin = {}
 
     for i, coin in enumerate(valid_coins):
         df = chosen_data_per_coin[coin].copy()
         df = df.set_index("timestamp").reindex(timestamps)
-        exchange_for_this_coin = chosen_mss_per_coin[coin]["exchange"]
+        # Use OHLCV source for volume normalization, not market settings source
+        exchange_for_this_coin = chosen_mss_per_coin[coin].get(
+            "ohlcv_source", chosen_mss_per_coin[coin]["exchange"]
+        )
         scaling_factor = exchange_volume_ratios_mapped[exchange_for_this_coin][reference_exchange]
         df["volume"] *= scaling_factor
 
         coin_data = df[["high", "low", "close", "volume"]].values
-        unified_array[:, i, :] = coin_data
-        start_idx = int(
-            (chosen_data_per_coin[coin].timestamp.iloc[0] - global_start_time) / interval_ms
-        )
-        end_idx = start_idx + len(chosen_data_per_coin[coin]) - 1
+        aligned_values_by_coin[coin] = np.asarray(coin_data, dtype=np.float64)
+        if "valid" in df.columns:
+            valid_mask = df["valid"].eq(True).to_numpy(dtype=bool)
+        else:
+            valid_mask = ~np.isnan(coin_data[:, 0])
+        valid_idx = np.flatnonzero(valid_mask)
+        if valid_idx.size == 0:
+            raise ValueError(f"combined selected {coin} with no valid HLCV rows")
+        start_idx = int(valid_idx[0])
+        end_idx = int(valid_idx[-1])
         chosen_mss_per_coin[coin]["first_valid_index"] = start_idx
         chosen_mss_per_coin[coin]["last_valid_index"] = end_idx
         first_idx = int(start_idx)
@@ -1176,7 +3593,513 @@ async def _prepare_hlcvs_combined_impl(
             trade_start_idx = last_idx
         chosen_mss_per_coin[coin]["trade_start_index"] = trade_start_idx
 
-    return chosen_mss_per_coin, timestamps, unified_array
+    chosen_mss_per_coin["__candidate_report__"] = sorted(
+        candidate_report,
+        key=lambda item: (
+            str(item.get("coin", "")),
+            str(item.get("exchange", "")),
+            str(item.get("status", "")),
+        ),
+    )
+    return chosen_mss_per_coin, timestamps, aligned_values_by_coin
+
+
+def _normalize_combined_coins(
+    coins: Sequence[str],
+    forced_sources: Dict[str, str],
+    om_dict: Dict[str, HLCVManager],
+    first_timestamps_unified: dict,
+) -> list[str]:
+    def normalize_stock_perp_coin(coin: str, forced_exchange: Optional[str]) -> str:
+        if forced_exchange != "hyperliquid":
+            return coin
+        if coin.startswith("xyz:"):
+            return coin
+        hl_om = om_dict.get("hyperliquid")
+        if hl_om and hl_om.markets:
+            xyz_coin = f"xyz:{coin}"
+            xyz_symbol = coin_to_symbol(xyz_coin, "hyperliquid")
+            if xyz_symbol and xyz_symbol in hl_om.markets:
+                logging.info(f"Normalizing stock perp coin: {coin} -> {xyz_coin}")
+                return xyz_coin
+        return coin
+
+    normalized_coins = []
+    for coin in coins:
+        forced_ex = forced_sources.get(coin)
+        if forced_ex is None and coin.startswith("xyz:"):
+            forced_ex = forced_sources.get(coin[4:])
+        elif forced_ex is None and not coin.startswith("xyz:"):
+            forced_ex = forced_sources.get(f"xyz:{coin}")
+        normalized_coin = normalize_stock_perp_coin(coin, forced_ex)
+        normalized_coins.append(normalized_coin)
+        if normalized_coin != coin and coin in first_timestamps_unified:
+            first_timestamps_unified.setdefault(normalized_coin, first_timestamps_unified[coin])
+    return sorted(set(normalized_coins))
+
+
+def _plan_combined_coin(
+    *,
+    coin: str,
+    base_start_ts: int,
+    end_ts: int,
+    first_timestamps_unified: dict,
+    minimum_coin_age_days: float,
+    min_coin_age_ms: int,
+    tradfi_for_stock_perps: bool,
+    forced_sources: Dict[str, str],
+    exchanges_to_consider: Sequence[str],
+) -> Optional[CombinedCoinPlan]:
+    is_stock_perp_coin = coin.startswith("xyz:")
+    if coin not in first_timestamps_unified and not (is_stock_perp_coin and tradfi_for_stock_perps):
+        return None
+
+    if is_stock_perp_coin and tradfi_for_stock_perps:
+        effective_start_ts = int(base_start_ts)
+        coin_fts = None
+    else:
+        coin_fts = int(first_timestamps_unified[coin])
+        effective_start_ts = max(int(base_start_ts), coin_fts + int(min_coin_age_ms))
+    if effective_start_ts > end_ts:
+        logging.info(
+            "%s: skipping - effective start %s > end %s (coin first available: %s, min_age=%d days)",
+            coin,
+            ts_to_date(effective_start_ts),
+            ts_to_date(end_ts),
+            ts_to_date(coin_fts) if coin_fts is not None else "tradfi",
+            int(minimum_coin_age_days),
+        )
+        return None
+    if effective_start_ts > base_start_ts:
+        logging.info(
+            "%s: adjusting start from %s to %s (coin first available: %s, min_age=%d days)",
+            coin,
+            ts_to_date(base_start_ts),
+            ts_to_date(effective_start_ts),
+            ts_to_date(coin_fts) if coin_fts is not None else "tradfi",
+            int(minimum_coin_age_days),
+        )
+
+    forced_exchange = forced_sources.get(coin)
+    if forced_exchange is None and coin.startswith("xyz:"):
+        forced_exchange = forced_sources.get(coin[4:])
+    candidate_exchanges = (
+        (forced_exchange,) if forced_exchange is not None else tuple(exchanges_to_consider)
+    )
+    return CombinedCoinPlan(
+        coin=coin,
+        effective_start_ts=int(effective_start_ts),
+        forced_exchange=forced_exchange,
+        candidate_exchanges=tuple(candidate_exchanges),
+    )
+
+
+def _pick_best_combined_candidate(
+    coin: str,
+    forced_exchange: Optional[str],
+    candidates: list[CombinedExchangeCandidate],
+) -> CombinedExchangeCandidate:
+    if not candidates:
+        raise ValueError(f"No exchange data found at all for coin {coin}. Skipping.")
+    if forced_exchange:
+        chosen = [candidate for candidate in candidates if candidate.exchange == forced_exchange]
+        if not chosen:
+            raise ValueError(
+                f"Forced exchange {forced_exchange} returned no usable data for coin {coin}."
+            )
+        return chosen[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: (
+            1 if candidate.full_range else 0,
+            candidate.coverage_count,
+            -candidate.gap_count,
+            candidate.total_volume,
+        ),
+        reverse=True,
+    )
+    return ranked[0]
+
+
+def _combined_summary_from_result(
+    *,
+    coin: str,
+    exchange: str,
+    symbol: Optional[str],
+    result,
+    effective_start_ts: int,
+    end_ts: int,
+    source_layer: str,
+) -> tuple[CombinedExchangeCandidate, CombinedCandidateSummary]:
+    ex, df, coverage_count, gap_count, total_volume = result
+    first_ts = int(df["timestamp"].iloc[0]) if not df.empty else None
+    last_ts = int(df["timestamp"].iloc[-1]) if not df.empty else None
+    requested_rows = int((int(end_ts) - int(effective_start_ts)) // 60_000) + 1
+    remaining_gap_count = max(0, requested_rows - int(coverage_count))
+    full_range = (
+        first_ts == int(effective_start_ts)
+        and last_ts == int(end_ts)
+        and int(gap_count) == 0
+        and remaining_gap_count == 0
+    )
+    effective_gap_count = int(gap_count) if full_range else max(int(gap_count), remaining_gap_count)
+    status = "eligible" if full_range else "partial"
+    remaining_gaps = ()
+    if not full_range:
+        gaps = []
+        if first_ts is not None and first_ts > int(effective_start_ts):
+            gaps.append({"start_ts": int(effective_start_ts), "end_ts": int(first_ts - 60_000)})
+        if last_ts is not None and last_ts < int(end_ts):
+            gaps.append({"start_ts": int(last_ts + 60_000), "end_ts": int(end_ts)})
+        remaining_gaps = tuple(gaps)
+    summary = CombinedCandidateSummary(
+        coin=coin,
+        exchange=ex,
+        symbol=symbol,
+        status=status,
+        rows=int(len(df)),
+        coverage_count=int(coverage_count),
+        gap_count=effective_gap_count,
+        total_volume=float(total_volume),
+        first_ts=first_ts,
+        last_ts=last_ts,
+        source_layers_used=(source_layer,),
+        remaining_gaps=remaining_gaps,
+        reason=None if full_range else "partial_window",
+        gap_class=None if full_range else "remote_fetch_gap",
+    )
+    candidate = CombinedExchangeCandidate(
+        exchange=ex,
+        df=df,
+        coverage_count=int(coverage_count),
+        gap_count=effective_gap_count,
+        total_volume=float(total_volume),
+        full_range=full_range,
+        summary=summary,
+    )
+    return candidate, summary
+
+
+def _ineligible_combined_summary(
+    *,
+    coin: str,
+    exchange: str,
+    symbol: Optional[str],
+    reason: str,
+    gap_class: str,
+    effective_start_ts: int,
+    end_ts: int,
+) -> CombinedCandidateSummary:
+    return CombinedCandidateSummary(
+        coin=coin,
+        exchange=exchange,
+        symbol=symbol,
+        status="ineligible",
+        rows=0,
+        coverage_count=0,
+        gap_count=int((int(end_ts) - int(effective_start_ts)) // 60_000) + 1,
+        total_volume=0.0,
+        first_ts=None,
+        last_ts=None,
+        source_layers_used=(),
+        remaining_gaps=({"start_ts": int(effective_start_ts), "end_ts": int(end_ts)},),
+        reason=reason,
+        gap_class=gap_class,
+    )
+
+
+def _resolve_combined_market_settings(
+    *,
+    coin: str,
+    best_exchange: str,
+    market_settings_sources: Dict[str, str],
+    om_dict: Dict[str, HLCVManager],
+    per_coin_warmups: dict,
+    default_warm: int,
+) -> dict:
+    settings_exchange = market_settings_sources.get(coin, best_exchange)
+    if settings_exchange != best_exchange:
+        settings_om = om_dict.get(settings_exchange)
+        if settings_om is None:
+            logging.warning(
+                f"{coin}: market_settings_sources exchange '{settings_exchange}' not available, "
+                f"falling back to OHLCV source '{best_exchange}'"
+            )
+            settings_exchange = best_exchange
+        else:
+            try:
+                settings_om.get_symbol(coin)
+            except Exception:
+                logging.warning(
+                    f"{coin}: not listed on market_settings_sources exchange '{settings_exchange}', "
+                    f"falling back to OHLCV source '{best_exchange}'"
+                )
+                settings_exchange = best_exchange
+
+    mss = om_dict[settings_exchange].get_market_specific_settings(coin)
+    mss["exchange"] = to_standard_exchange_name(settings_exchange)
+    if settings_exchange != best_exchange:
+        mss["ohlcv_source"] = to_standard_exchange_name(best_exchange)
+        logging.info(f"{coin}: OHLCV from {best_exchange}, market settings from {settings_exchange}")
+    mss["warmup_minutes"] = int(per_coin_warmups.get(coin, default_warm))
+    return mss
+
+
+async def _resolve_combined_coin(
+    *,
+    coin: str,
+    sem: asyncio.Semaphore,
+    base_start_ts: int,
+    end_ts: int,
+    first_timestamps_unified: dict,
+    minimum_coin_age_days: float,
+    min_coin_age_ms: int,
+    tradfi_for_stock_perps: bool,
+    forced_sources: Dict[str, str],
+    market_settings_sources: Dict[str, str],
+    exchanges_to_consider: Sequence[str],
+    om_dict: Dict[str, HLCVManager],
+    per_coin_warmups: dict,
+    default_warm: int,
+    force_refetch_gaps: bool,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    legacy_root: Path | None,
+    candidate_report: list[dict] | None = None,
+) -> Optional[CombinedCoinResolution]:
+    async with sem:
+        plan = _plan_combined_coin(
+            coin=coin,
+            base_start_ts=base_start_ts,
+            end_ts=end_ts,
+            first_timestamps_unified=first_timestamps_unified,
+            minimum_coin_age_days=minimum_coin_age_days,
+            min_coin_age_ms=min_coin_age_ms,
+            tradfi_for_stock_perps=tradfi_for_stock_perps,
+            forced_sources=forced_sources,
+            exchanges_to_consider=exchanges_to_consider,
+        )
+        if plan is None:
+            return None
+        for ex in plan.candidate_exchanges:
+            if ex not in om_dict:
+                raise ValueError(f"Unknown exchange '{ex}' requested for coin {coin}")
+
+        try:
+            candidates = await _load_combined_coin_candidates(
+                plan=plan,
+                om_dict=om_dict,
+                end_ts=end_ts,
+                force_refetch_gaps=force_refetch_gaps,
+                catalog=catalog,
+                store=store,
+                legacy_root=legacy_root,
+                exchanges_to_consider=exchanges_to_consider,
+                candidate_report=candidate_report,
+            )
+            if not candidates:
+                if plan.forced_exchange:
+                    raise ValueError(
+                        f"No exchange data found for coin {coin} on forced exchange {plan.forced_exchange}."
+                    )
+                logging.info(f"No exchange data found at all for coin {coin}. Skipping.")
+                return None
+
+            best_candidate = _pick_best_combined_candidate(coin, plan.forced_exchange, candidates)
+            logging.info(
+                f"{coin} exchange preference: {[candidate.exchange for candidate in candidates]}"
+            )
+            market_settings = _resolve_combined_market_settings(
+                coin=coin,
+                best_exchange=best_candidate.exchange,
+                market_settings_sources=market_settings_sources,
+                om_dict=om_dict,
+                per_coin_warmups=per_coin_warmups,
+                default_warm=default_warm,
+            )
+            return CombinedCoinResolution(
+                coin=coin,
+                best_exchange=best_candidate.exchange,
+                best_df=best_candidate.df,
+                market_settings=market_settings,
+                candidates=tuple(candidates),
+            )
+        except Exception as e:
+            logging.error(f"Error processing coin {coin}: {e}")
+            traceback.print_exc()
+            if plan.forced_exchange:
+                raise
+            return None
+
+
+async def _load_combined_coin_candidates(
+    *,
+    plan: CombinedCoinPlan,
+    om_dict: Dict[str, HLCVManager],
+    end_ts: int,
+    force_refetch_gaps: bool,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    legacy_root: Path | None,
+    exchanges_to_consider: Sequence[str],
+    candidate_report: list[dict] | None = None,
+) -> list[CombinedExchangeCandidate]:
+    tasks = []
+    position_map = {ex0: (1 + i) for i, ex0 in enumerate(exchanges_to_consider)}
+    for ex in plan.candidate_exchanges:
+        tasks.append(
+            asyncio.create_task(
+                fetch_data_for_coin_and_exchange(
+                    plan.coin,
+                    ex,
+                    om_dict[ex],
+                    plan.effective_start_ts,
+                    end_ts,
+                    progress_position=position_map.get(ex, 1),
+                    catalog=catalog,
+                    store=store,
+                    legacy_root=legacy_root,
+                    use_v2_local=True,
+                )
+            )
+        )
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    if plan.forced_exchange:
+        forced_idx = plan.candidate_exchanges.index(plan.forced_exchange)
+        forced_result = results[forced_idx]
+        if isinstance(forced_result, Exception):
+            raise RuntimeError(
+                f"Forced exchange {plan.forced_exchange} failed for coin {plan.coin}"
+            ) from forced_result
+
+    candidates: list[CombinedExchangeCandidate] = []
+    for ex, result in zip(plan.candidate_exchanges, results):
+        symbol = None
+        try:
+            symbol = om_dict[ex].get_symbol(plan.coin) if om_dict[ex].has_coin(plan.coin) else None
+        except Exception:
+            symbol = None
+        if isinstance(result, Exception):
+            summary = _ineligible_combined_summary(
+                coin=plan.coin,
+                exchange=ex,
+                symbol=symbol,
+                reason=f"api_error:{type(result).__name__}",
+                gap_class="api_error",
+                effective_start_ts=plan.effective_start_ts,
+                end_ts=end_ts,
+            )
+            if candidate_report is not None:
+                candidate_report.append(summary.to_dict())
+            continue
+        if result is None:
+            summary = _ineligible_combined_summary(
+                coin=plan.coin,
+                exchange=ex,
+                symbol=symbol,
+                reason="unavailable",
+                gap_class="unknown",
+                effective_start_ts=plan.effective_start_ts,
+                end_ts=end_ts,
+            )
+            if candidate_report is not None:
+                candidate_report.append(summary.to_dict())
+            continue
+        source_layer = "v2_store"
+        candidate, summary = _combined_summary_from_result(
+            coin=plan.coin,
+            exchange=ex,
+            symbol=symbol,
+            result=result,
+            effective_start_ts=plan.effective_start_ts,
+            end_ts=end_ts,
+            source_layer=source_layer,
+        )
+        candidates.append(candidate)
+        if candidate_report is not None:
+            candidate_report.append(summary.to_dict())
+    return candidates
+
+
+async def _load_combined_btc_prices(
+    *,
+    exchanges_to_consider: Sequence[str],
+    timestamps: np.ndarray,
+    effective_start_date: str,
+    end_date: str,
+    gap_tolerance_ohlcvs_minutes: float,
+    force_refetch_gaps: bool,
+    catalog: OhlcvCatalog,
+    store: OhlcvStore,
+    legacy_root: Path | None,
+) -> tuple[pd.DataFrame, Optional[str]]:
+    btc_candidates = [
+        exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
+    ]
+    if "binanceusdm" not in btc_candidates:
+        btc_candidates.append("binanceusdm")
+
+    btc_source_exchange = None
+    for btc_exchange in btc_candidates:
+        btc_om = HLCVManager(
+            btc_exchange,
+            effective_start_date,
+            end_date,
+            gap_tolerance_ohlcvs_minutes=gap_tolerance_ohlcvs_minutes,
+            force_refetch_gaps=force_refetch_gaps,
+        )
+        try:
+            btc_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
+            logging.info(
+                "loading BTC/USD prices from %s for range %s to %s",
+                btc_exchange,
+                ts_to_date(int(timestamps[0])),
+                ts_to_date(int(timestamps[-1])),
+            )
+            await btc_om.load_markets()
+            if not btc_om.has_coin("BTC"):
+                continue
+            btc_symbol = btc_om.get_symbol("BTC")
+            btc_rng = await _resolve_v2_store_range(
+                om=btc_om,
+                catalog=catalog,
+                store=store,
+                legacy_root=legacy_root,
+                exchange=to_standard_exchange_name(btc_exchange),
+                coin="BTC",
+                symbol=btc_symbol,
+                start_ts=int(timestamps[0]),
+                end_ts=int(timestamps[-1]),
+                allow_remote_fetch=True,
+                local_hit_log_label="combined BTC v2 local hit",
+                remote_fetch_log_label="combined BTC fetching missing range",
+            )
+            btc_df = (
+                pd.DataFrame(
+                    {
+                        "timestamp": btc_rng.timestamps,
+                        "close": btc_rng.values[:, 2].astype(np.float64, copy=False),
+                    }
+                )
+                if btc_rng is not None
+                else pd.DataFrame()
+            )
+            if not btc_df.empty:
+                btc_source_exchange = btc_exchange
+                return btc_df, btc_source_exchange
+            logging.warning(
+                "BTC/USD fetch returned empty for %s (start=%s end=%s)",
+                btc_exchange,
+                btc_om.start_date,
+                btc_om.end_date,
+            )
+        finally:
+            await btc_om.aclose()
+            if btc_om.cc:
+                await btc_om.cc.close()
+    return pd.DataFrame(), btc_source_exchange
 
 
 async def fetch_data_for_coin_and_exchange(
@@ -1187,6 +4110,10 @@ async def fetch_data_for_coin_and_exchange(
     end_ts: int,
     *,
     progress_position: int = 1,
+    catalog: OhlcvCatalog | None = None,
+    store: OhlcvStore | None = None,
+    legacy_root: Path | None = None,
+    use_v2_local: bool = False,
 ):
     t0 = time.monotonic()
     # Calculate approximate number of days for better visibility
@@ -1202,7 +4129,7 @@ async def fetch_data_for_coin_and_exchange(
         return None
 
     logging.info(
-        "%s candles fetch start coin=%s range=%s..%s (~%d days)",
+        "%s candles load start coin=%s range=%s..%s (~%d days)",
         ex,
         coin,
         ts_to_date(effective_start_ts),
@@ -1212,12 +4139,49 @@ async def fetch_data_for_coin_and_exchange(
 
     if not om.has_coin(coin):
         logging.info(
-            "%s candles fetch skip coin=%s reason=missing_market elapsed_s=%.1f",
+            "%s candles load skip coin=%s reason=missing_market elapsed_s=%.1f",
             ex,
             coin,
             time.monotonic() - t0,
         )
         return None
+    if use_v2_local and catalog is not None and store is not None:
+        symbol = om.get_symbol(coin)
+        rng = await _resolve_v2_store_range(
+            om=om,
+            catalog=catalog,
+            store=store,
+            legacy_root=legacy_root,
+            exchange=to_standard_exchange_name(ex),
+            coin=coin,
+            symbol=symbol,
+            start_ts=effective_start_ts,
+            end_ts=end_ts,
+            allow_remote_fetch=True,
+            allow_partial_window=True,
+            local_hit_log_label="combined v2 local hit",
+            remote_fetch_log_label="combined v2 fetching missing range",
+        )
+        if rng is None:
+            logging.info(
+                "%s candles load unavailable coin=%s elapsed_s=%.1f",
+                ex,
+                coin,
+                time.monotonic() - t0,
+            )
+            return None
+        df, gap_count = _dense_hlcv_frame_from_sparse_v2_range(rng)
+        coverage_count = int(rng.valid.sum())
+        total_volume = float(df["volume"].sum())
+        logging.info(
+            "%s candles load ok coin=%s rows=%d gaps=%d source=v2_store elapsed_s=%.1f",
+            ex,
+            coin,
+            coverage_count,
+            gap_count,
+            time.monotonic() - t0,
+        )
+        return (ex, df, coverage_count, gap_count, total_volume)
     om.update_date_range(effective_start_ts, end_ts)
     try:
         df = await om.get_ohlcvs(coin)
@@ -1225,7 +4189,7 @@ async def fetch_data_for_coin_and_exchange(
         logging.warning(f"Error retrieving {coin} from {ex}: {e}")
         traceback.print_exc()
         logging.info(
-            "%s candles fetch failed coin=%s elapsed_s=%.1f",
+            "%s candles load failed coin=%s elapsed_s=%.1f",
             ex,
             coin,
             time.monotonic() - t0,
@@ -1233,7 +4197,7 @@ async def fetch_data_for_coin_and_exchange(
         return None
     if df.empty:
         logging.info(
-            "%s candles fetch empty coin=%s elapsed_s=%.1f",
+            "%s candles load empty coin=%s elapsed_s=%.1f",
             ex,
             coin,
             time.monotonic() - t0,
@@ -1242,7 +4206,7 @@ async def fetch_data_for_coin_and_exchange(
     df = df[(df.timestamp >= effective_start_ts) & (df.timestamp <= end_ts)].reset_index(drop=True)
     if df.empty:
         logging.info(
-            "%s candles fetch empty_after_clip coin=%s elapsed_s=%.1f",
+            "%s candles load empty_after_clip coin=%s elapsed_s=%.1f",
             ex,
             coin,
             time.monotonic() - t0,
@@ -1253,7 +4217,7 @@ async def fetch_data_for_coin_and_exchange(
     gap_count = sum((gap // 60_000) - 1 for gap in intervals if gap > 60_000)
     total_volume = df["volume"].sum()
     logging.info(
-        "%s candles fetch ok coin=%s rows=%d gaps=%d elapsed_s=%.1f",
+        "%s candles load ok coin=%s rows=%d gaps=%d source=remote elapsed_s=%.1f",
         ex,
         coin,
         coverage_count,

@@ -34,13 +34,13 @@ To customize behavior for a new exchange:
 import asyncio
 import math
 import time
-import traceback
+from copy import deepcopy
 
 from passivbot import Passivbot, logging, custom_id_to_snake
 import ccxt.pro as ccxt_pro
 import ccxt.async_support as ccxt_async
 from procedures import assert_correct_ccxt_version
-from config_utils import require_live_value
+from config.access import get_optional_live_value, require_live_value
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
 
@@ -96,6 +96,8 @@ class CCXTBot(Passivbot):
     def __init__(self, config: dict):
         super().__init__(config)
         self.quote = self.user_info.get("quote", "USDT")
+        self._live_margin_modes = {}
+        self._blocked_margin_symbols_warned = set()
 
     # ═══════════════════ ORDER WATCHING HOOKS ═══════════════════
 
@@ -196,6 +198,7 @@ class CCXTBot(Passivbot):
 
         config = {k: v for k, v in self.user_info.items() if k not in passivbot_fields}
         config["enableRateLimit"] = True
+        config.setdefault("timeout", 30000)  # 30 s — CCXT default ~10 s is too tight on cold boot
 
         # Remap legacy credential field names to CCXT-native names for backwards compatibility
         legacy_mappings = {
@@ -235,8 +238,9 @@ class CCXTBot(Passivbot):
         ccxt_config = self._build_ccxt_config()
         user_options = self.user_info.get("options", {})
 
-        # REST client
-        exchange_class = getattr(ccxt_async, self.exchange)
+        # REST client — prefer futures-specific id (e.g. binanceusdm) over generic name
+        ccxt_id = getattr(self, "exchange_ccxt_id", self.exchange)
+        exchange_class = getattr(ccxt_async, ccxt_id)
         self.cca = exchange_class(ccxt_config)
         self.cca.options.update(self._build_ccxt_options())
         self.cca.options.update(user_options)
@@ -245,7 +249,7 @@ class CCXTBot(Passivbot):
 
         # WebSocket client - optional, enables faster order updates
         if self.ws_enabled:
-            ws_class = getattr(ccxt_pro, self.exchange)
+            ws_class = getattr(ccxt_pro, ccxt_id)
             self.ccp = ws_class(ccxt_config)
             self.ccp.options.update(self._build_ccxt_options())
             self.ccp.options.update(user_options)
@@ -271,23 +275,6 @@ class CCXTBot(Passivbot):
         else:
             logging.info(f"{self.exchange}: watchOrders not supported in CCXT, using REST polling")
 
-    async def determine_utc_offset(self, verbose=True):
-        """Derive the exchange server time offset using CCXT's fetch_time().
-
-        Overrides base class which expects fetch_balance() to return timestamp.
-        """
-        from utils import utc_ms
-
-        try:
-            server_time = await self.cca.fetch_time()
-            self.utc_offset = round((server_time - utc_ms()) / (1000 * 60 * 60)) * (1000 * 60 * 60)
-            if verbose:
-                logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
-        except Exception as e:
-            # Log once per session to avoid hourly noise (e.g., Hyperliquid doesn't support fetchTime)
-            self.log_once(f"Could not fetch server time: {e}, using 0 offset")
-            self.utc_offset = 0
-
     async def fetch_balance(self) -> float:
         """Template method: Fetch account balance for quote currency.
 
@@ -296,13 +283,19 @@ class CCXTBot(Passivbot):
         - _get_balance(): Extract balance value
 
         Returns:
-            float: Total balance in quote currency, or 0.0 if not found.
+            float: Total balance in quote currency.
 
         Raises:
-            Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
+            Exception: On API errors or missing required balance fields
+                (caller handles via restart_bot_on_too_many_errors).
         """
         fetched = await self._do_fetch_balance()
         return self._get_balance(fetched)
+
+    async def capture_balance_snapshot(self) -> tuple[dict, float]:
+        """Fetch balance once and derive normalized value from the same payload."""
+        fetched = await self._do_fetch_balance()
+        return fetched, self._get_balance(deepcopy(fetched))
 
     async def _do_fetch_balance(self) -> dict:
         """Hook: Call exchange API for balance.
@@ -323,7 +316,16 @@ class CCXTBot(Passivbot):
         Default: CCXT unified format total[quote]
         Override: Exchange-specific field paths (e.g., info.totalCrossWalletBalance)
         """
-        return float(fetched.get("total", {}).get(self.quote, 0))
+        total = fetched.get("total")
+        if not isinstance(total, dict):
+            raise KeyError(
+                f"{self.exchange}: fetch_balance response missing 'total' mapping for quote {self.quote}"
+            )
+        if self.quote not in total:
+            raise KeyError(
+                f"{self.exchange}: fetch_balance response missing total[{self.quote!r}]"
+            )
+        return float(total[self.quote])
 
     async def fetch_positions(self) -> list:
         """Template method: Fetch all open positions.
@@ -341,6 +343,11 @@ class CCXTBot(Passivbot):
         """
         fetched = await self._do_fetch_positions()
         return self._normalize_positions(fetched)
+
+    async def capture_positions_snapshot(self) -> tuple[list, list]:
+        """Fetch positions once and derive normalized positions from the same payload."""
+        fetched = await self._do_fetch_positions()
+        return fetched, self._normalize_positions(deepcopy(fetched))
 
     async def _do_fetch_positions(self) -> list:
         """Hook: Call exchange API for positions.
@@ -367,14 +374,17 @@ class CCXTBot(Passivbot):
         for elm in fetched:
             contracts = float(elm.get("contracts", 0))
             if contracts != 0:
-                positions.append(
-                    {
-                        "symbol": elm["symbol"],
-                        "position_side": self._get_position_side(elm),
-                        "size": contracts,
-                        "price": float(elm.get("entryPrice", 0)),
-                    }
-                )
+                normalized = {
+                    "symbol": elm["symbol"],
+                    "position_side": self._get_position_side(elm),
+                    "size": contracts,
+                    "price": float(elm.get("entryPrice", 0)),
+                }
+                margin_mode = self._extract_live_margin_mode(elm)
+                if margin_mode is not None:
+                    normalized["margin_mode"] = margin_mode
+                    self._record_live_margin_mode(normalized["symbol"], margin_mode)
+                positions.append(normalized)
         return positions
 
     def _get_position_side(self, elm: dict) -> str:
@@ -384,6 +394,27 @@ class CCXTBot(Passivbot):
         Override: Exchange-specific logic (e.g., info.positionSide)
         """
         return elm.get("side", "long").lower()
+
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
+        """Hook: Call exchange API for open orders."""
+        exchange = getattr(self, "exchange", "unknown")
+        sym_str = symbol if symbol else "all symbols"
+        logging.debug(f"{exchange}: fetching open orders for {sym_str}")
+        t0 = time.time()
+        fetched = await self.cca.fetch_open_orders(symbol=symbol)
+        elapsed_ms = (time.time() - t0) * 1000
+        logging.debug(
+            f"{exchange}: fetch_open_orders completed in {elapsed_ms:.1f}ms, {len(fetched)} orders"
+        )
+        return fetched
+
+    def _normalize_open_orders(self, fetched: list) -> list:
+        """Hook: Transform raw open orders to passivbot format."""
+        for elm in fetched:
+            elm["position_side"] = self._get_position_side_for_order(elm)
+            elm["qty"] = elm["amount"]
+            self._record_live_margin_mode_from_payload(elm)
+        return sorted(fetched, key=lambda x: x["timestamp"])
 
     async def fetch_open_orders(self, symbol: str = None) -> list:
         """Fetch open orders, optionally filtered by symbol.
@@ -397,18 +428,13 @@ class CCXTBot(Passivbot):
         Raises:
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
         """
-        sym_str = symbol if symbol else "all symbols"
-        logging.debug(f"{self.exchange}: fetching open orders for {sym_str}")
-        t0 = time.time()
-        fetched = await self.cca.fetch_open_orders(symbol=symbol)
-        elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(
-            f"{self.exchange}: fetch_open_orders completed in {elapsed_ms:.1f}ms, {len(fetched)} orders"
-        )
-        for elm in fetched:
-            elm["position_side"] = self._get_position_side_for_order(elm)
-            elm["qty"] = elm["amount"]
-        return sorted(fetched, key=lambda x: x["timestamp"])
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return self._normalize_open_orders(fetched)
+
+    async def capture_open_orders_snapshot(self, symbol: str = None) -> tuple[list, list]:
+        """Fetch open orders once and derive normalized orders from the same payload."""
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return fetched, self._normalize_open_orders(deepcopy(fetched))
 
     async def watch_orders(self):
         """Template method: Watch for order updates.
@@ -425,25 +451,34 @@ class CCXTBot(Passivbot):
             return
 
         logging.info(f"[ws] {self.exchange}: starting order watch")
+        consecutive_failures = 0
         while True:
             try:
                 if self.stop_websocket:
                     break
                 raw_orders = await self._do_watch_orders()
+                consecutive_failures = 0
                 normalized = [self._normalize_order_update(o) for o in raw_orders]
                 self.handle_order_update(normalized)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
+                consecutive_failures += 1
                 self._health_ws_reconnects += 1
-                logging.warning(
-                    "[ws] %s: connection lost (reconnect #%d), retrying in 1s: %s",
-                    self.exchange,
-                    self._health_ws_reconnects,
-                    type(e).__name__,
+                clock_synced = await self._maybe_recover_exchange_time_sync(
+                    e, source="watch_orders"
                 )
-                logging.debug("[ws] %s: full exception: %s", self.exchange, e)
-                logging.debug("".join(traceback.format_exc()))
-                await asyncio.sleep(1)
-                logging.info("[ws] %s: reconnecting...", self.exchange)
+                retry_delay_s = min(60.0, 2 ** max(0, consecutive_failures - 1))
+                self._log_ws_reconnect(
+                    reconnect_no=self._health_ws_reconnects,
+                    retry_delay_s=retry_delay_s,
+                    reason="time_sync" if clock_synced else "connection_lost",
+                    exc=e,
+                )
+                await Passivbot._sleep_unless_shutdown(
+                    self, retry_delay_s, stage="watch_orders_reconnect"
+                )
+                logging.debug("[ws] %s: reconnecting...", self.exchange)
 
     async def update_exchange_config(self):
         """Set exchange to hedge mode if supported.
@@ -455,17 +490,18 @@ class CCXTBot(Passivbot):
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
         """
         if not self.cca.has.get("setPositionMode"):
-            logging.info(f"{self.exchange} does not support setPositionMode, skipping")
+            logging.debug("[config] %s does not support setPositionMode, skipping", self.exchange)
             return
 
         logging.debug(
-            f"{self.exchange}: setting position mode to hedge via CCXT set_position_mode(True)"
+            "[config] %s: setting position mode to hedge via CCXT set_position_mode(True)",
+            self.exchange,
         )
         t0 = time.time()
         res = await self.cca.set_position_mode(True)
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: set_position_mode completed in {elapsed_ms:.1f}ms")
-        logging.info(f"Set hedge mode: {res}")
+        logging.debug("[config] %s: set_position_mode completed in %.1fms", self.exchange, elapsed_ms)
+        logging.debug("[config] set hedge mode response: %s", res)
 
     def _should_set_margin_mode(self, symbol: str) -> bool:
         """Hook: Should we call set_margin_mode for this symbol?
@@ -474,6 +510,166 @@ class CCXTBot(Passivbot):
         Override: Return False if exchange doesn't support/need it
         """
         return self.cca.has.get("setMarginMode", False)
+
+    def _get_margin_mode_preference(self) -> str:
+        """Return normalized live.margin_mode_preference.
+
+        Isolated-margin entry support is intentionally disabled for now. Existing live
+        isolated positions/orders are still preserved and manageable after restart.
+        """
+        config = getattr(self, "config", {}) or {}
+        raw = get_optional_live_value(config, "margin_mode_preference", "cross")
+        pref = str(raw).strip().lower() if raw is not None else "cross"
+        aliases = {
+            "auto": "cross",
+            "auto_cross": "cross",
+            "auto_cross_preferred": "cross",
+            "cross": "cross",
+            "auto_isolated": "isolated_disabled",
+            "auto_isolated_preferred": "isolated_disabled",
+            "isolated": "isolated_disabled",
+        }
+        if pref in aliases:
+            normalized = aliases[pref]
+        else:
+            normalized = "cross"
+        if normalized == "isolated_disabled":
+            if not getattr(self, "_margin_mode_preference_warned", False):
+                logging.warning(
+                    "live.margin_mode_preference=%r requested isolated margin, but isolated entry support is currently disabled; using cross-only behavior",
+                    raw,
+                )
+                self._margin_mode_preference_warned = True
+            return "cross"
+        if normalized == "cross":
+            return "cross"
+        if not getattr(self, "_margin_mode_preference_warned", False):
+            logging.warning(
+                "Invalid live.margin_mode_preference=%r; using cross-only behavior",
+                raw,
+            )
+            self._margin_mode_preference_warned = True
+        return "cross"
+
+    def _normalize_margin_mode(self, value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "isolated" if value else "cross"
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        if text in {"0", "cross", "crossed", "cross_margin", "cross margin"}:
+            return "cross"
+        if text in {"1", "isolated", "isolate", "isolated_margin", "isolated margin"}:
+            return "isolated"
+        if "isol" in text:
+            return "isolated"
+        if "cross" in text:
+            return "cross"
+        return None
+
+    def _extract_live_margin_mode(self, payload: dict | None) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        candidates = [
+            payload.get("margin_mode"),
+            payload.get("marginMode"),
+            payload.get("marginType"),
+            payload.get("tradeMode"),
+            payload.get("tdMode"),
+            payload.get("mgnMode"),
+        ]
+        info = payload.get("info")
+        if isinstance(info, dict):
+            candidates.extend(
+                [
+                    info.get("margin_mode"),
+                    info.get("marginMode"),
+                    info.get("marginType"),
+                    info.get("tradeMode"),
+                    info.get("tdMode"),
+                    info.get("mgnMode"),
+                ]
+            )
+            position = info.get("position")
+            if isinstance(position, dict):
+                leverage = position.get("leverage")
+                if isinstance(leverage, dict):
+                    candidates.append(leverage.get("type"))
+        for candidate in candidates:
+            normalized = self._normalize_margin_mode(candidate)
+            if normalized is not None:
+                return normalized
+        if payload.get("isolated") is not None:
+            return self._normalize_margin_mode(bool(payload.get("isolated")))
+        if isinstance(info, dict) and info.get("isolated") is not None:
+            return self._normalize_margin_mode(bool(info.get("isolated")))
+        return None
+
+    def _record_live_margin_mode(self, symbol: str | None, margin_mode: str | None) -> None:
+        if not symbol or not margin_mode:
+            return
+        normalized = self._normalize_margin_mode(margin_mode)
+        if normalized in {"cross", "isolated"}:
+            self._live_margin_modes[str(symbol)] = normalized
+
+    def _record_live_margin_mode_from_payload(
+        self, payload: dict | None, symbol: str | None = None
+    ) -> None:
+        if not isinstance(payload, dict):
+            return
+        target_symbol = symbol or payload.get("symbol")
+        self._record_live_margin_mode(target_symbol, self._extract_live_margin_mode(payload))
+
+    def _has_live_symbol_state(self, symbol: str) -> bool:
+        pos = getattr(self, "positions", {}).get(symbol, {})
+        if abs(float(pos.get("long", {}).get("size", 0.0) or 0.0)) > 0.0:
+            return True
+        if abs(float(pos.get("short", {}).get("size", 0.0) or 0.0)) > 0.0:
+            return True
+        if symbol in getattr(self, "open_orders", {}) and self.open_orders.get(symbol):
+            return True
+        return False
+
+    def _get_margin_capability(self, symbol: str) -> str:
+        """Return one of: both, cross_only, isolated_only."""
+        if self._requires_isolated_margin(symbol):
+            return "isolated_only"
+
+        market = getattr(self, "markets_dict", {}).get(symbol, {})
+        margin_modes = market.get("marginModes", {})
+        if isinstance(margin_modes, dict):
+            cross = margin_modes.get("cross")
+            isolated = margin_modes.get("isolated")
+            if cross is True and isolated is True:
+                return "both"
+            if cross is True and isolated is False:
+                return "cross_only"
+            if cross is False and isolated is True:
+                return "isolated_only"
+        return "both"
+
+    def _resolve_margin_policy_for_symbol(self, symbol: str) -> dict:
+        """Resolve actual mode to apply plus whether new entries must be blocked."""
+        live_margin_mode = getattr(self, "_live_margin_modes", {}).get(symbol)
+        if self._has_live_symbol_state(symbol) and live_margin_mode in {"cross", "isolated"}:
+            capability = self._get_margin_capability(symbol)
+            return {
+                "mode": live_margin_mode,
+                "blocked": False,
+                "capability": capability,
+                "live_margin_mode": live_margin_mode,
+            }
+        capability = self._get_margin_capability(symbol)
+        preference = self._get_margin_mode_preference()
+        if capability == "isolated_only":
+            return {
+                "mode": "isolated",
+                "blocked": preference == "cross",
+                "capability": capability,
+            }
+        return {"mode": "cross", "blocked": False, "capability": capability}
 
     def _requires_isolated_margin(self, symbol: str) -> bool:
         """Check if a symbol requires isolated margin mode.
@@ -510,9 +706,7 @@ class CCXTBot(Passivbot):
         Returns:
             "isolated" or "cross"
         """
-        if self._requires_isolated_margin(symbol):
-            return "isolated"
-        return "cross"
+        return self._resolve_margin_policy_for_symbol(symbol)["mode"]
 
     def _calc_min_isolated_leverage(self) -> int:
         """Calculate minimum leverage required for isolated margin positions.
@@ -549,9 +743,36 @@ class CCXTBot(Passivbot):
             Leverage to use (capped by max_leverage for the symbol)
         """
         configured = int(self.config_get(["live", "leverage"], symbol=symbol))
-        max_lev = getattr(self, "max_leverage", {}).get(symbol, configured)
+        raw_max_lev = (getattr(self, "max_leverage", {}) or {}).get(symbol)
+        if raw_max_lev is None:
+            warned = getattr(self, "_missing_max_leverage_warned", set())
+            if symbol not in warned:
+                logging.warning(
+                    "%s: max leverage unavailable from exchange metadata; using configured leverage %sx",
+                    symbol,
+                    configured,
+                )
+                warned.add(symbol)
+                self._missing_max_leverage_warned = warned
+            max_lev = configured
+        else:
+            try:
+                max_lev_float = float(raw_max_lev)
+            except (TypeError, ValueError, OverflowError) as e:
+                raise ValueError(
+                    f"{symbol}: invalid max leverage from exchange metadata: {raw_max_lev!r}"
+                ) from e
+            if not math.isfinite(max_lev_float) or max_lev_float <= 0.0:
+                raise ValueError(
+                    f"{symbol}: invalid max leverage from exchange metadata: {raw_max_lev!r}"
+                )
+            max_lev = int(max_lev_float)
+            if max_lev <= 0:
+                raise ValueError(
+                    f"{symbol}: invalid max leverage from exchange metadata: {raw_max_lev!r}"
+                )
 
-        if self._requires_isolated_margin(symbol):
+        if self._get_margin_mode_for_symbol(symbol) == "isolated":
             min_lev = self._calc_min_isolated_leverage()
             leverage = max(configured, min_lev)
 
@@ -570,6 +791,30 @@ class CCXTBot(Passivbot):
             return leverage
 
         return min(configured, max_lev)
+
+    def _filter_approved_symbols(self, pside: str, symbols: set[str]) -> set[str]:
+        symbols = super()._filter_approved_symbols(pside, symbols)
+        kept = set()
+        for symbol in symbols:
+            policy = self._resolve_margin_policy_for_symbol(symbol)
+            if not policy["blocked"]:
+                kept.add(symbol)
+                continue
+            warn_key = (pside, symbol, policy["capability"])
+            if warn_key in self._blocked_margin_symbols_warned:
+                continue
+            self._blocked_margin_symbols_warned.add(warn_key)
+            blocked_reason = (
+                "isolated-only" if policy["capability"] == "isolated_only" else "cross-only"
+            )
+            logging.warning(
+                "[margin] disabling %s %s for new entries: isolated margin support is currently disabled and this symbol is %s on %s. Existing positions/orders remain manageable.",
+                pside,
+                symbol,
+                blocked_reason,
+                getattr(self, "exchange", "this exchange"),
+            )
+        return kept
 
     async def update_exchange_config_by_symbols(self, symbols: list):
         """Set leverage and margin mode for each symbol.
@@ -611,15 +856,31 @@ class CCXTBot(Passivbot):
         from CCXT's unified market structure.
         """
         super().set_market_specific_settings()
-        for symbol, market in self.markets_dict.items():
+        for symbol in sorted(self.symbols_requiring_market_sizing()):
+            market = self.markets_dict[symbol]
             self.symbol_ids[symbol] = market["id"]
             self.min_costs[symbol] = market["limits"]["cost"]["min"] or 0.1
-            self.min_qtys[symbol] = (
-                market["precision"]["amount"]
-                if market["limits"]["amount"]["min"] is None
-                else market["limits"]["amount"]["min"]
-            )
-            self.qty_steps[symbol] = market["precision"]["amount"]
+            qty_step = market["precision"]["amount"]
+            raw_min_qty = market["limits"]["amount"]["min"]
+            if raw_min_qty is None:
+                raw_min_qty = qty_step
+            if raw_min_qty is None:
+                raise ValueError(
+                    f"{symbol}: missing min qty and qty step in exchange market metadata"
+                )
+            raw_min_qty = float(raw_min_qty)
+            if not math.isfinite(raw_min_qty):
+                raise ValueError(
+                    f"{symbol}: invalid min qty in exchange market metadata: {raw_min_qty!r}"
+                )
+            if raw_min_qty <= 0.0 and qty_step is not None and qty_step > 0.0:
+                raw_min_qty = qty_step
+            if raw_min_qty <= 0.0:
+                raise ValueError(
+                    f"{symbol}: invalid min qty in exchange market metadata: {raw_min_qty!r}"
+                )
+            self.min_qtys[symbol] = raw_min_qty
+            self.qty_steps[symbol] = qty_step
             self.price_steps[symbol] = market["precision"]["price"]
             self.c_mults[symbol] = market.get("contractSize", 1)
 
@@ -651,6 +912,24 @@ class CCXTBot(Passivbot):
         elapsed_ms = (time.time() - t0) * 1000
         logging.debug(
             f"{self.exchange}: fetch_tickers completed in {elapsed_ms:.1f}ms, {len(result)} tickers"
+        )
+        return result
+
+    async def fetch_tickers_for_symbols(self, symbols: list[str]) -> dict:
+        """Fetch current ticker data for a specific symbol set when supported cheaply."""
+        fetched = await self._do_fetch_tickers_for_symbols(symbols)
+        return self._normalize_tickers(fetched)
+
+    async def _do_fetch_tickers_for_symbols(self, symbols: list[str]) -> dict:
+        """Hook: call CCXT's fetch_tickers(symbols) for exchanges where bulk misses markets."""
+        logging.debug(
+            f"{self.exchange}: fetching tickers via CCXT fetch_tickers(symbols), n={len(symbols)}"
+        )
+        t0 = time.time()
+        result = await self.cca.fetch_tickers(symbols)
+        elapsed_ms = (time.time() - t0) * 1000
+        logging.debug(
+            f"{self.exchange}: fetch_tickers(symbols) completed in {elapsed_ms:.1f}ms, {len(result)} tickers"
         )
         return result
 

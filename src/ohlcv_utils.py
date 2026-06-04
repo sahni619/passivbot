@@ -144,6 +144,31 @@ def dump_daily_ohlcv_data(data, filepath: str, start_ts: int, interval_ms: int =
 
 
 def load_ohlcv_data(filepath: str) -> pd.DataFrame:
+    path = str(filepath)
+    if path.lower().endswith(".npz"):
+        with np.load(path) as data:
+            if "candles" not in data:
+                raise ValueError(f"Missing 'candles' key in {filepath}")
+            arr = data["candles"]
+        if not isinstance(arr, np.ndarray) or arr.dtype.names is None:
+            raise ValueError(f"Expected structured dtype in {filepath}")
+        required = ("ts", "o", "h", "l", "c", "bv")
+        missing = [name for name in required if name not in arr.dtype.names]
+        if missing:
+            raise ValueError(f"Missing fields {missing} in {filepath}")
+        df = pd.DataFrame(
+            {
+                "timestamp": arr["ts"].astype(np.int64),
+                "open": arr["o"].astype(float),
+                "high": arr["h"].astype(float),
+                "low": arr["l"].astype(float),
+                "close": arr["c"].astype(float),
+                "volume": arr["bv"].astype(float),
+            }
+        )
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        return ensure_millis_df(df)
+
     arr = np.load(filepath, allow_pickle=True)
     columns = ["timestamp", "open", "high", "low", "close", "volume"]
     arr_deduplicated = deduplicate_rows(arr)
@@ -200,6 +225,88 @@ def attempt_gap_fix_ohlcvs(
         new_df[col] = new_df[col].fillna(new_df.close)
     new_df["volume"] = new_df["volume"].fillna(0.0)
     return new_df.reset_index().rename(columns={"index": "timestamp"})
+
+
+def aggregate_hlcvs(candles_1m: np.ndarray, interval: int) -> np.ndarray:
+    """
+    Aggregate 1m HLCV candles to coarser interval.
+
+    Args:
+        candles_1m: Array of shape (n_timesteps, n_coins, 4) for HLCV or
+            (n_timesteps, n_coins, 5) for OHLCV (open, high, low, close, volume).
+        interval: Number of 1m candles to combine (e.g., 5 for 5m candles)
+
+    Returns:
+        Aggregated array of shape (n_timesteps // interval, n_coins, 4) in HLCV order.
+    """
+    if interval <= 1:
+        return candles_1m
+    if candles_1m.ndim != 3:
+        raise ValueError(f"Expected 3D candle array, got ndim={candles_1m.ndim}")
+    if candles_1m.shape[-1] == 5:
+        # Drop open; keep HLCV
+        candles = candles_1m[:, :, 1:]
+    elif candles_1m.shape[-1] == 4:
+        candles = candles_1m
+    else:
+        raise ValueError(f"Expected HLCV/OHLCV last-dim 4 or 5, got {candles_1m.shape[-1]}")
+    n_timesteps = candles.shape[0]
+    n_out = n_timesteps // interval
+    if n_out == 0:
+        raise ValueError(f"Not enough candles ({n_timesteps}) for interval {interval}")
+    truncated = candles[: n_out * interval]
+    reshaped = truncated.reshape(n_out, interval, *candles.shape[1:])
+    # HLCV indices: 0=high, 1=low, 2=close, 3=volume
+    aggregated = np.stack(
+        [
+            reshaped[:, :, :, 0].max(axis=1),  # high: max across interval
+            reshaped[:, :, :, 1].min(axis=1),  # low: min across interval
+            reshaped[:, -1, :, 2],  # close: last candle's close
+            reshaped[:, :, :, 3].sum(axis=1),  # volume: sum across interval
+        ],
+        axis=-1,
+    )
+    return aggregated
+
+
+def align_and_aggregate_hlcvs(
+    hlcvs: np.ndarray,
+    timestamps: np.ndarray | None,
+    btc_usd_prices: np.ndarray | None,
+    interval: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int]:
+    """
+    Align candles to interval boundaries (by trimming leading bars) and aggregate.
+
+    Returns aggregated HLCVs, timestamps, BTC/USD prices, and number of 1m bars trimmed.
+    """
+    if interval <= 1:
+        return hlcvs, timestamps, btc_usd_prices, 0
+    offset_bars = 0
+    if timestamps is not None and len(timestamps) > 0:
+        interval_ms = interval * 60_000
+        first_ts = int(timestamps[0])
+        remainder = first_ts % interval_ms
+        if remainder != 0:
+            offset_ms = interval_ms - remainder
+            offset_bars = int(offset_ms // 60_000)
+            if offset_bars >= hlcvs.shape[0]:
+                raise ValueError(
+                    f"Not enough candles to align to interval {interval} (offset {offset_bars})"
+                )
+            hlcvs = hlcvs[offset_bars:]
+            timestamps = timestamps[offset_bars:]
+            if btc_usd_prices is not None and len(btc_usd_prices) >= offset_bars:
+                btc_usd_prices = btc_usd_prices[offset_bars:]
+    hlcvs_agg = aggregate_hlcvs(hlcvs, interval)
+    n_out = hlcvs_agg.shape[0]
+    ts_agg = None
+    btc_agg = None
+    if timestamps is not None:
+        ts_agg = timestamps[::interval][:n_out]
+    if btc_usd_prices is not None:
+        btc_agg = btc_usd_prices[interval - 1 :: interval][:n_out]
+    return hlcvs_agg, ts_agg, btc_agg, offset_bars
 
 
 __all__ = [

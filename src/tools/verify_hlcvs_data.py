@@ -9,7 +9,7 @@ Summarise every dataset located under the default cache directory::
 
 Summarise a specific dataset and return the output in JSON format::
 
-    python -m src.tools.verify_hlcvs_data summarize caches/hlcvs_data/68153d270ccd83d4 --json
+    python -m src.tools.verify_hlcvs_data summarize caches/hlcvs_data/binance__BTC_ETH__2024-01-01_to_2025-01-01__68153d270ccd83d4 --json
 
 Compare two datasets and list each metric that differs::
 
@@ -31,7 +31,6 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 from tqdm.auto import tqdm
 from datetime import datetime, UTC
-
 
 DEFAULT_ROOT = Path("caches/hlcvs_data")
 
@@ -263,8 +262,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Inspect and verify cached HLCVS datasets.",
         formatter_class=argparse.RawTextHelpFormatter,
-        epilog=textwrap.dedent(
-            """
+        epilog=textwrap.dedent("""
             Commonly used flags:
               summarize                  --fast  --json
               compare                    --fast
@@ -274,8 +272,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
               compare-historical-hashes  --apply  --local-root PATH
 
             Tip: every sub-command also supports -h/--help for full details.
-            """
-        ).strip(),
+            """).strip(),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="command")
 
@@ -288,7 +285,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="*",
         type=Path,
         default=[DEFAULT_ROOT],
-        help="Dataset directories or a root directory containing dataset hashes.",
+        help="Dataset directories or a root directory containing cached dataset directories.",
     )
     summary_parser.add_argument(
         "--fast",

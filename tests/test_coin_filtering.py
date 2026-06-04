@@ -30,6 +30,8 @@ class CoinFilterHarness(Passivbot):
         self._age_ok = age_ok or {}
         self._live_flags = {"filter_by_min_effective_cost": filter_min_cost_flag}
         self.warn_triggered = False
+        self.positions = {}
+        self.config = {"live": {}}
 
     # ---- overrides for get_filtered_coins dependencies ----
 
@@ -66,7 +68,7 @@ class CoinFilterHarness(Passivbot):
     async def calc_volumes(self, _pside, symbols):
         return {sym: self._volumes[sym] for sym in symbols}
 
-    async def calc_log_range(self, _pside, eligible_symbols):
+    async def calc_log_range(self, _pside, eligible_symbols, max_age_ms=None, max_network_fetches=None):
         return {sym: self._log_ranges[sym] for sym in eligible_symbols}
 
     def is_pside_enabled(self, _pside):
@@ -154,3 +156,227 @@ async def test_non_forager_returns_sorted_candidates():
     )
     coins = await bot.get_filtered_coins("long")
     assert coins == ["AAA", "BBB", "CCC"]
+
+
+def test_split_forager_budget_by_side_round_robins_remainder():
+    bot = Passivbot.__new__(Passivbot)
+    first = bot._split_forager_budget_by_side(1, ["long", "short"])
+    second = bot._split_forager_budget_by_side(1, ["long", "short"])
+    assert first in ({"long": 1, "short": 0}, {"long": 0, "short": 1})
+    assert second in ({"long": 1, "short": 0}, {"long": 0, "short": 1})
+    assert first != second
+
+
+class _CMColdCacheOnlyStub:
+    def __init__(self):
+        self.calls = 0
+
+    def get_last_refresh_ms(self, _symbol):
+        return 0
+
+    async def get_latest_ema_metrics(self, _symbol, spans_by_metric, **_kwargs):
+        self.calls += 1
+        return {k: 1.0 for k in spans_by_metric}
+
+
+@pytest.mark.asyncio
+async def test_calc_log_range_respects_cache_only_budget_for_cold_symbols():
+    bot = Passivbot.__new__(Passivbot)
+    bot.config = {"live": {}}
+    bot.cm = _CMColdCacheOnlyStub()
+    bot.open_orders = {}
+    bot.positions = {}
+    bot.bot_value = (
+        lambda _pside, key: 12.0
+        if key in ("filter_volatility_ema_span", "filter_volume_ema_span")
+        else 0.0
+    )
+    bot.has_position = lambda *_args, **_kwargs: False
+    out = await bot.calc_log_range(
+        "long",
+        eligible_symbols=["AAA", "BBB", "CCC"],
+        max_age_ms=60_000,
+        max_network_fetches=0,
+    )
+    assert out == {"AAA": 0.0, "BBB": 0.0, "CCC": 0.0}
+    assert bot.cm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_calc_volumes_and_log_ranges_respects_cache_only_budget_for_cold_symbols():
+    bot = Passivbot.__new__(Passivbot)
+    bot.config = {"live": {}}
+    bot.cm = _CMColdCacheOnlyStub()
+    bot.open_orders = {}
+    bot.positions = {}
+    bot.bot_value = (
+        lambda _pside, key: 12.0
+        if key in ("filter_volatility_ema_span", "filter_volume_ema_span")
+        else 0.0
+    )
+    bot.has_position = lambda *_args, **_kwargs: False
+    volumes, log_ranges = await bot.calc_volumes_and_log_ranges(
+        "long",
+        symbols=["AAA", "BBB", "CCC"],
+        max_age_ms=60_000,
+        max_network_fetches=0,
+    )
+    assert volumes == {"AAA": 0.0, "BBB": 0.0, "CCC": 0.0}
+    assert log_ranges == {"AAA": 0.0, "BBB": 0.0, "CCC": 0.0}
+    assert bot.cm.calls == 0
+
+
+def test_log_min_effective_cost_blocks_includes_concrete_numbers(monkeypatch):
+    bot = Passivbot.__new__(Passivbot)
+    bot._min_effective_cost_last_log_ms = {}
+    bot._min_effective_cost_log_interval_ms = 900_000
+    bot.is_pside_enabled = lambda pside: pside == "long"
+
+    seen = []
+    monkeypatch.setattr(
+        "passivbot.logging.info",
+        lambda msg, *args: seen.append(msg % args)
+        if str(msg).startswith("[entry]")
+        else None,
+    )
+
+    out = {
+        "diagnostics": {
+            "min_effective_cost_blocks": [
+                {
+                    "symbol_idx": 0,
+                    "pside": "long",
+                    "balance": 51.154957,
+                    "effective_limit": 1.5,
+                    "entry_initial_qty_pct": 0.0192,
+                    "projected_initial_cost": 1.4732627616,
+                    "effective_min_cost": 10.1,
+                }
+            ]
+        }
+    }
+    bot._log_min_effective_cost_blocks(out, {0: "BTC/USDC:USDC"})
+    assert len(seen) == 1
+    assert "BTC long" in seen[0]
+    assert "notional wanted/required=1.473263/10.100000" in seen[0]
+    assert "action=skip_create" in seen[0]
+    assert "docs/configuration.md#filter_by_min_effective_cost" in seen[0]
+
+
+def test_log_min_effective_cost_blocks_debug_includes_full_context(monkeypatch):
+    bot = Passivbot.__new__(Passivbot)
+    bot._min_effective_cost_last_log_ms = {}
+    bot._min_effective_cost_log_interval_ms = 900_000
+    bot.is_pside_enabled = lambda pside: pside == "long"
+
+    seen = []
+    monkeypatch.setattr(
+        "passivbot.logging.debug",
+        lambda msg, *args: seen.append(msg % args)
+        if str(msg).startswith("[entry]")
+        else None,
+    )
+
+    out = {
+        "diagnostics": {
+            "min_effective_cost_blocks": [
+                {
+                    "symbol_idx": 0,
+                    "pside": "long",
+                    "balance": 51.154957,
+                    "effective_limit": 1.5,
+                    "entry_initial_qty_pct": 0.0192,
+                    "projected_initial_cost": 1.4732627616,
+                    "effective_min_cost": 10.1,
+                }
+            ]
+        }
+    }
+    bot._log_min_effective_cost_blocks(out, {0: "BTC/USDC:USDC"})
+    assert len(seen) == 1
+    assert "symbol=BTC pside=long" in seen[0]
+    assert "projected_initial_cost=1.473263" in seen[0]
+    assert "required_effective_min_cost=10.100000" in seen[0]
+    assert "balance=51.154957" in seen[0]
+    assert "live.filter_by_min_effective_cost=false" in seen[0]
+    assert "override_may_create_exchange-min-sized_entries" in seen[0]
+
+
+def test_log_min_effective_cost_blocks_is_throttled(monkeypatch):
+    bot = Passivbot.__new__(Passivbot)
+    bot._min_effective_cost_last_log_ms = {}
+    bot._min_effective_cost_log_interval_ms = 900_000
+    bot.is_pside_enabled = lambda _pside: True
+
+    seen = []
+    monkeypatch.setattr(
+        "passivbot.logging.info",
+        lambda msg, *args: seen.append(msg % args)
+        if str(msg).startswith("[entry]")
+        else None,
+    )
+
+    out = {
+        "diagnostics": {
+            "min_effective_cost_blocks": [
+                {
+                    "symbol_idx": 0,
+                    "pside": "long",
+                    "balance": 51.154957,
+                    "effective_limit": 1.5,
+                    "entry_initial_qty_pct": 0.0192,
+                    "projected_initial_cost": 1.4732627616,
+                    "effective_min_cost": 10.1,
+                }
+            ]
+        }
+    }
+    idx_to_symbol = {0: "BTC/USDC:USDC"}
+    bot._log_min_effective_cost_blocks(out, idx_to_symbol)
+    bot._log_min_effective_cost_blocks(out, idx_to_symbol)
+    assert len(seen) == 1
+
+
+def test_log_min_effective_cost_blocks_throttles_symbol_across_set_changes(monkeypatch):
+    bot = Passivbot.__new__(Passivbot)
+    bot._min_effective_cost_last_log_ms = {}
+    bot._min_effective_cost_log_interval_ms = 900_000
+    bot.is_pside_enabled = lambda _pside: True
+
+    seen = []
+    monkeypatch.setattr("passivbot.utc_ms", lambda: 1_000_000)
+    monkeypatch.setattr(
+        "passivbot.logging.info",
+        lambda msg, *args: seen.append(msg % args)
+        if str(msg).startswith("[entry]")
+        else None,
+    )
+
+    def block(symbol_idx):
+        return {
+            "symbol_idx": symbol_idx,
+            "pside": "long",
+            "balance": 51.154957,
+            "effective_limit": 1.5,
+            "entry_initial_qty_pct": 0.0192,
+            "projected_initial_cost": 1.4732627616,
+            "effective_min_cost": 10.1,
+        }
+
+    idx_to_symbol = {
+        0: "BTC/USDC:USDC",
+        1: "LINK/USDC:USDC",
+        2: "BCH/USDC:USDC",
+    }
+    bot._log_min_effective_cost_blocks(
+        {"diagnostics": {"min_effective_cost_blocks": [block(0), block(1)]}},
+        idx_to_symbol,
+    )
+    bot._log_min_effective_cost_blocks(
+        {"diagnostics": {"min_effective_cost_blocks": [block(2), block(0)]}},
+        idx_to_symbol,
+    )
+
+    assert sum("BTC long" in line for line in seen) == 1
+    assert sum("LINK long" in line for line in seen) == 1
+    assert sum("BCH long" in line for line in seen) == 1

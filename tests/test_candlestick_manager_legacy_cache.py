@@ -2,7 +2,24 @@ import os
 import numpy as np
 import pytest
 
-from candlestick_manager import CandlestickManager, ONE_MIN_MS, CANDLE_DTYPE
+from candlestick_manager import CandlestickManager, ONE_MIN_MS, CANDLE_DTYPE, _sanitize_symbol
+
+
+def test_dangling_legacy_ohlcv_symlink_is_repaired(tmp_path):
+    cache_dir = tmp_path / "caches"
+    cache_dir.mkdir()
+    ohlcv_link = cache_dir / "ohlcv"
+    missing_target = tmp_path / "deleted_central_ohlcv"
+    try:
+        ohlcv_link.symlink_to(missing_target, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    CandlestickManager(exchange=None, exchange_name="binance", cache_dir=str(cache_dir))
+
+    assert ohlcv_link.exists()
+    assert ohlcv_link.is_dir()
+    assert not ohlcv_link.is_symlink()
 
 
 @pytest.mark.asyncio
@@ -170,3 +187,63 @@ def test_partial_but_continuous_legacy_day_does_not_block_primary_overlay_write(
 
     # With strict legacy completeness, this MUST be written.
     assert os.path.exists(cm._shard_path(symbol, day, tf="1m"))
+
+
+def test_global_legacy_migration_covers_all_exchanges(tmp_path, monkeypatch):
+    """Global migration should migrate legacy shards for all exchanges on first init."""
+    monkeypatch.chdir(tmp_path)
+
+    day = "2021-03-01"
+    start_ts = 1614556800000  # 2021-03-01 00:00:00 UTC
+
+    legacy_binance = tmp_path / "historical_data" / "ohlcvs_binanceusdm" / "BTC"
+    legacy_binance.mkdir(parents=True, exist_ok=True)
+    legacy_bybit = tmp_path / "historical_data" / "ohlcvs_bybit" / "ETH"
+    legacy_bybit.mkdir(parents=True, exist_ok=True)
+
+    legacy = np.array(
+        [
+            [start_ts, 1.0, 2.0, 0.5, 1.5, 10.0],
+            [start_ts + ONE_MIN_MS, 1.5, 2.5, 1.0, 2.0, 12.0],
+        ],
+        dtype=np.float64,
+    )
+    np.save(legacy_binance / f"{day}.npy", legacy)
+    np.save(legacy_bybit / f"{day}.npy", legacy)
+
+    CandlestickManager(exchange=None, exchange_name="binanceusdm", cache_dir=str(tmp_path / "caches"))
+
+    binance_symbol = _sanitize_symbol("BTC/USDT:USDT")
+    bybit_symbol = _sanitize_symbol("ETH/USDT:USDT")
+    binance_target = tmp_path / "caches" / "ohlcv" / "binance" / "1m" / binance_symbol / f"{day}.npy"
+    bybit_target = tmp_path / "caches" / "ohlcv" / "bybit" / "1m" / bybit_symbol / f"{day}.npy"
+
+    assert binance_target.exists()
+    assert bybit_target.exists()
+
+
+def test_quarantines_invalid_root_level_timeframe_cache_artifacts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    tf_root = tmp_path / "caches" / "ohlcv" / "bybit" / "1m"
+    tf_root.mkdir(parents=True, exist_ok=True)
+    root_day = tf_root / "2021-02-04.npy"
+    np.save(root_day, np.array([[1612396800000, 1, 1, 1, 1, 1]], dtype=np.float64))
+    root_index = tf_root / "index.json"
+    root_index.write_text('{"shards": {}}', encoding="utf-8")
+
+    symbol_dir = tf_root / _sanitize_symbol("XMR/USDT:USDT")
+    symbol_dir.mkdir(parents=True, exist_ok=True)
+    symbol_day = symbol_dir / "2022-01-14.npy"
+    np.save(symbol_day, np.array([[1642118400000, 1, 1, 1, 1, 1]], dtype=np.float64))
+
+    CandlestickManager(exchange=None, exchange_name="bybit", cache_dir=str(tmp_path / "caches"))
+
+    quarantine_root = tmp_path / "caches" / "ohlcv" / "_quarantine_root_level"
+    quarantined = list(quarantine_root.rglob("*"))
+
+    assert not root_day.exists()
+    assert not root_index.exists()
+    assert symbol_day.exists()
+    assert any(p.name == "2021-02-04.npy" for p in quarantined)
+    assert any(p.name == "index.json" for p in quarantined)

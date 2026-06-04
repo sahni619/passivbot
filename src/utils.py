@@ -8,6 +8,7 @@ import asyncio
 import hjson
 import inspect
 import time
+import warnings
 from collections import defaultdict
 from typing import Dict, Any, List, Union, Optional
 import re
@@ -19,8 +20,10 @@ from custom_endpoint_overrides import (
     apply_rest_overrides_to_ccxt,
     resolve_custom_endpoint_override,
 )
-from config_transform import record_transform
 
+warnings.filterwarnings(
+    "ignore", message="timeout has no effect in blocking mode", module="portalocker"
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -89,7 +92,7 @@ def _cleanup_stale_symbol_map_locks() -> None:
                 age = now - stat.st_mtime
                 if age > threshold:
                     lock_path.unlink()
-                    logging.info("removed stale symbol map lock %s (age %.1fs)", lock_path, age)
+                    logging.debug("removed stale symbol map lock %s (age %.1fs)", lock_path, age)
             except FileNotFoundError:
                 continue
             except Exception as exc:
@@ -439,7 +442,7 @@ def filter_markets(markets: dict, exchange: str, quote=None, verbose=False) -> (
     eligible = {}
     ineligible = {}
     reasons = {}
-    quote = get_quote(normalize_exchange_name(exchange), quote)
+    quote = get_quote(to_ccxt_exchange_id(exchange), quote)
     for k, v in markets.items():
         if not v["active"]:
             ineligible[k] = v
@@ -464,10 +467,15 @@ def filter_markets(markets: dict, exchange: str, quote=None, verbose=False) -> (
     if verbose:
         for line in sorted(set(reasons.values())):
             syms = [k for k in reasons if reasons[k] == line]
+            log = (
+                logging.debug
+                if line in {"not active", "wrong quote", "not swap", "not linear"}
+                else logging.info
+            )
             if len(syms) > 12:
-                logging.info(f"{line}: {len(syms)} symbols")
+                log(f"{line}: {len(syms)} symbols")
             elif len(syms) > 0:
-                logging.info(f"{line}: {','.join(sorted(set([s for s in syms])))}")
+                log(f"{line}: {','.join(sorted(set([s for s in syms])))}")
 
     return eligible, ineligible, reasons
 
@@ -492,7 +500,7 @@ async def load_markets(
     """
     # Prefer cc.id when a ccxt instance is supplied, otherwise use the provided exchange string.
     # Denormalize to use canonical form for cache paths (e.g., "binance" not "binanceusdm")
-    ex = denormalize_exchange_name(getattr(cc, "id", None) or exchange or "")
+    ex = to_standard_exchange_name(getattr(cc, "id", None) or exchange or "")
     markets_path = os.path.join("caches", ex, "markets.json")
 
     # Try cache first
@@ -538,9 +546,9 @@ async def load_markets(
     return markets
 
 
-def normalize_exchange_name(exchange: str) -> str:
+def to_ccxt_exchange_id(exchange: str) -> str:
     """
-    Normalize an exchange id to its USD-margined perpetual futures id when available.
+    Convert a short exchange name to its ccxt USD-margined perpetual futures id.
 
     Examples:
     - "binance" -> "binanceusdm"
@@ -571,10 +579,9 @@ def normalize_exchange_name(exchange: str) -> str:
     return ex
 
 
-def denormalize_exchange_name(exchange: str) -> str:
+def to_standard_exchange_name(exchange: str) -> str:
     """
-    Convert a ccxt futures exchange id back to the canonical short form used in configs,
-    caches, and logs.
+    Convert a ccxt exchange id to the canonical short form used in configs, caches, and logs.
 
     Examples:
     - "binanceusdm" -> "binance"
@@ -593,13 +600,38 @@ def denormalize_exchange_name(exchange: str) -> str:
     return ex
 
 
+# Deprecated aliases for backward compatibility - will be removed in a future release
+def normalize_exchange_name(exchange: str) -> str:
+    """Deprecated: Use to_ccxt_exchange_id() instead."""
+    import warnings
+
+    warnings.warn(
+        "normalize_exchange_name() is deprecated, use to_ccxt_exchange_id() instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return to_ccxt_exchange_id(exchange)
+
+
+def denormalize_exchange_name(exchange: str) -> str:
+    """Deprecated: Use to_standard_exchange_name() instead."""
+    import warnings
+
+    warnings.warn(
+        "denormalize_exchange_name() is deprecated, use to_standard_exchange_name() instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return to_standard_exchange_name(exchange)
+
+
 def load_ccxt_instance(exchange_id: str, enable_rate_limit: bool = True, timeout_ms: int = 60_000):
     """
     Return a ccxt async-support exchange instance for the given exchange id.
 
     The returned instance should be closed by the caller with: await cc.close()
     """
-    ex = normalize_exchange_name(exchange_id)
+    ex = to_ccxt_exchange_id(exchange_id)
     try:
         cc = getattr(ccxt, ex)(
             {
@@ -644,7 +676,7 @@ def get_quote(exchange, quote=None):
     if quote is not None:
         return quote
     # Legacy hardcoded defaults for backward compatibility
-    exchange = normalize_exchange_name(exchange)
+    exchange = to_ccxt_exchange_id(exchange)
     return "USDC" if exchange in ["hyperliquid", "defx", "paradex"] else "USDT"
 
 
@@ -735,6 +767,28 @@ def _build_coin_symbol_maps(markets, quote):
     Build coin_to_symbol_map (as dict of lists) and symbol_to_coin_map from markets data.
     This function is pure and performs no disk I/O.
     """
+
+    def _namespaced_aliases(base: str, market: dict) -> set[str]:
+        aliases = set()
+        if not isinstance(base, str) or not base:
+            return aliases
+        is_namespaced_hip3 = bool((market.get("info") or {}).get("hip3")) or base.startswith(
+            ("XYZ-", "xyz:")
+        )
+        if not is_namespaced_hip3:
+            return aliases
+        if ":" in base:
+            prefix, ticker = base.split(":", 1)
+            if prefix and ticker:
+                aliases.add(ticker)
+                aliases.add(f"{prefix.upper()}-{ticker}")
+        elif "-" in base:
+            prefix, ticker = base.split("-", 1)
+            if prefix and ticker:
+                aliases.add(ticker)
+                aliases.add(f"{prefix.lower()}:{ticker}")
+        return aliases
+
     coin_to_symbol_map = defaultdict(set)
     symbol_to_coin_map = {}
     for k, v in markets.items():
@@ -758,16 +812,7 @@ def _build_coin_symbol_maps(markets, quote):
                     variants.add(cleaned)
                     if not coin:
                         coin = cleaned
-                    # Handle HIP-3 stock perps: XYZ-TSLA -> TSLA
-                    # Also handle xyz:TSLA format from CCXT
-                    if base.startswith("XYZ-"):
-                        ticker = base[4:]  # Extract TSLA from XYZ-TSLA
-                        variants.add(ticker)
-                        variants.add(f"xyz:{ticker}")  # Also map xyz:TSLA
-                    elif base.startswith("xyz:"):
-                        ticker = base[4:]  # Extract TSLA from xyz:TSLA
-                        variants.add(ticker)
-                        variants.add(f"XYZ-{ticker}")  # Also map XYZ-TSLA
+                    variants.update(_namespaced_aliases(base, v))
             symbol_to_coin_map[k] = coin
             for variant in variants:
                 existing = symbol_to_coin_map.get(variant)
@@ -919,12 +964,12 @@ def create_coin_symbol_map_cache(exchange: str, markets, quote=None, verbose=Tru
                     except Exception:
                         pass
             except portalocker.LockException:
-                logging.warning(
-                    "Could not acquire lock for %s, skipping write", coin_to_symbol_map_path
+                logging.info(
+                    "[mapping] could not acquire lock for %s, skipping write", coin_to_symbol_map_path
                 )
 
         except portalocker.LockException:
-            logging.warning("Could not acquire lock for symbol map cache update, skipping")
+            logging.info("[mapping] could not acquire lock for symbol map cache update, skipping")
             return False
 
         return True
@@ -933,14 +978,14 @@ def create_coin_symbol_map_cache(exchange: str, markets, quote=None, verbose=Tru
         return False
 
 
-def coin_to_symbol(coin, exchange, quote=None):
+def coin_to_symbol(coin, exchange, quote=None, verbose=True):
     # caches coin_to_symbol_map in memory and reloads if file changes
     if coin == "":
         return ""
     # Denormalize to use canonical form for cache paths (e.g., "binance" not "binanceusdm")
-    ex = denormalize_exchange_name(exchange or "")
+    ex = to_standard_exchange_name(exchange or "")
     quote = get_quote(ex, quote)
-    coin_sanitized = symbol_to_coin(coin)
+    coin_sanitized = symbol_to_coin(coin, verbose=verbose)
     fallback = f"{coin_sanitized}/{quote}:{quote}"
     try:
         loaded = _load_coin_to_symbol_map(ex)
@@ -948,40 +993,44 @@ def coin_to_symbol(coin, exchange, quote=None):
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
-            logging.info(
-                "Multiple candidates for %s (raw=%s): %s",
-                coin_sanitized,
-                coin,
-                candidates,
-            )
+            if verbose:
+                logging.info(
+                    "Multiple candidates for %s (raw=%s): %s",
+                    coin_sanitized,
+                    coin,
+                    candidates,
+                )
             return candidates[0]
         if loaded:
             # map present but coin missing
             warn_key = (ex, coin_sanitized)
             if warn_key not in _COIN_TO_SYMBOL_FALLBACKS:
-                logging.warning(
-                    "No mapping for %s (raw=%s) on %s; using fallback %s",
-                    coin_sanitized,
-                    coin,
-                    ex,
-                    fallback,
-                )
+                if verbose:
+                    logging.warning(
+                        "No mapping for %s (raw=%s) on %s; using fallback %s",
+                        coin_sanitized,
+                        coin,
+                        ex,
+                        fallback,
+                    )
                 _COIN_TO_SYMBOL_FALLBACKS.add(warn_key)
         else:
             warn_key = (ex, coin_sanitized)
             if warn_key not in _COIN_TO_SYMBOL_FALLBACKS:
-                logging.warning(
-                    "coin_to_symbol map for %s missing; using fallback for %s (raw=%s) -> %s",
-                    ex,
-                    coin_sanitized,
-                    coin,
-                    fallback,
-                )
+                if verbose:
+                    logging.warning(
+                        "coin_to_symbol map for %s missing; using fallback for %s (raw=%s) -> %s",
+                        ex,
+                        coin_sanitized,
+                        coin,
+                        fallback,
+                    )
                 _COIN_TO_SYMBOL_FALLBACKS.add(warn_key)
     except Exception as e:
-        logging.error(
-            "error with coin_to_symbol %s (raw=%s) %s: %s", coin_sanitized, coin, exchange, e
-        )
+        if verbose:
+            logging.error(
+                "error with coin_to_symbol %s (raw=%s) %s: %s", coin_sanitized, coin, exchange, e
+            )
     return fallback
 
 
@@ -1048,6 +1097,46 @@ def _diff_snapshot(before, after):
     return {"old": _snapshot(before), "new": _snapshot(after)}
 
 
+def _resolve_fake_scenario_path(config) -> Optional[str]:
+    live = config.get("live", {}) if isinstance(config, dict) else {}
+    scenario_path = live.get("fake_scenario_path")
+    if scenario_path:
+        return scenario_path
+    user = live.get("user")
+    if not user:
+        return None
+    from procedures import load_user_info
+
+    user_info = load_user_info(user)
+    return user_info.get("fake_scenario_path")
+
+
+def _load_fake_approved_coins(config, *, quote=None):
+    live = config.get("live", {}) if isinstance(config, dict) else {}
+    scenario_path = _resolve_fake_scenario_path(config)
+    if not scenario_path:
+        raise ValueError(
+            "fake exchange approved_coins='all' requires live.fake_scenario_path "
+            "or api-keys fake_scenario_path during startup"
+        )
+    from exchanges.fake import load_fake_scenario
+
+    scenario = load_fake_scenario(scenario_path)
+    symbols_config = scenario.get("symbols")
+    if not isinstance(symbols_config, dict) or not symbols_config:
+        raise ValueError("Fake scenario must define symbols to expand approved_coins='all'")
+    approved_coins = []
+    for symbol in symbols_config:
+        if quote is not None:
+            symbol_quote = str(symbol).split("/", 1)[1].split(":", 1)[0]
+            if symbol_quote != str(quote):
+                continue
+        coin = symbol_to_coin(symbol)
+        if coin:
+            approved_coins.append(coin)
+    return sorted(set(approved_coins))
+
+
 async def format_approved_ignored_coins(config, exchanges: [str], quote=None, verbose=True):
     if isinstance(exchanges, str):
         exchanges = [exchanges]
@@ -1059,45 +1148,46 @@ async def format_approved_ignored_coins(config, exchanges: [str], quote=None, ve
     if approved_source is None:
         approved_source = _require_live_value(config, "approved_coins")
     coin_sources["approved_coins"] = deepcopy(approved_source)
-    if approved_source in [
-        [""],
-        [],
-        None,
-        "",
-        0,
-        0.0,
-        {"long": [], "short": []},
-        {"long": "", "short": ""},
-        {"long": [""], "short": [""]},
-    ]:
-        if bool(_require_live_value(config, "empty_means_all_approved")):
+    ac = normalize_coins_source(approved_source, allow_all=True)
+    needs_market_expansion = any(
+        _coins_source_side_is_all(ac[pside]) for pside in ("long", "short")
+    )
+
+    approved_coins_sorted = None
+    if needs_market_expansion:
+        approved_coins = set()
+        standard_exchanges = []
+        for ex in exchanges:
+            if str(ex).lower() == "fake":
+                approved_coins.update(_load_fake_approved_coins(config, quote=quote))
+            else:
+                standard_exchanges.append(ex)
+        if standard_exchanges:
             marketss = await asyncio.gather(
-                *[load_markets(ex, verbose=False, quote=quote) for ex in exchanges]
+                *[load_markets(ex, verbose=False, quote=quote) for ex in standard_exchanges]
             )
-            marketss = [filter_markets(m, ex, quote=quote)[0] for m, ex in zip(marketss, exchanges)]
-            approved_coins = set()
+            marketss = [
+                filter_markets(m, ex, quote=quote)[0] for m, ex in zip(marketss, standard_exchanges)
+            ]
             for markets in marketss:
                 for symbol in markets:
                     approved_coins.add(symbol_to_coin(symbol, verbose=verbose))
-            approved_coins_sorted = sorted([x for x in approved_coins if x])
-            config["live"]["approved_coins"] = {
-                "long": approved_coins_sorted,
-                "short": approved_coins_sorted,
-            }
+        approved_coins_sorted = sorted([x for x in approved_coins if x])
+
+    config["live"]["approved_coins"] = {}
+    for pside in ("long", "short"):
+        if _coins_source_side_is_all(ac[pside]):
+            config["live"]["approved_coins"][pside] = list(approved_coins_sorted or [])
         else:
-            # leave empty
-            config["live"]["approved_coins"] = {"long": [], "short": []}
-    else:
-        ac = normalize_coins_source(approved_source)
-        config["live"]["approved_coins"] = {
-            pside: [cf for x in ac[pside] if (cf := symbol_to_coin(x))] for pside in ac
-        }
+            config["live"]["approved_coins"][pside] = [
+                cf for x in ac[pside] if (cf := symbol_to_coin(x))
+            ]
 
     ignored_source = coin_sources.get("ignored_coins", config.get("live", {}).get("ignored_coins"))
     if ignored_source is None:
         ignored_source = _require_live_value(config, "ignored_coins")
     coin_sources["ignored_coins"] = deepcopy(ignored_source)
-    ic = normalize_coins_source(ignored_source)
+    ic = normalize_coins_source(ignored_source, allow_all=False)
     config["live"]["ignored_coins"] = {
         pside: [cf for x in ic[pside] if (cf := symbol_to_coin(x))] for pside in ic
     }
@@ -1106,6 +1196,8 @@ async def format_approved_ignored_coins(config, exchanges: [str], quote=None, ve
     ignored_diff = _diff_snapshot(before_ignored, config["live"]["ignored_coins"])
     sources_diff = _diff_snapshot(before_sources, config.get("_coins_sources", {}))
     if approved_diff or ignored_diff or sources_diff:
+        from config_transform import record_transform
+
         details = {"exchanges": list(exchanges)}
         if approved_diff:
             details["approved_coins"] = approved_diff
@@ -1116,7 +1208,11 @@ async def format_approved_ignored_coins(config, exchanges: [str], quote=None, ve
         record_transform(config, "format_approved_ignored_coins", details)
 
 
-def normalize_coins_source(src):
+def _coins_source_side_is_all(value) -> bool:
+    return isinstance(value, list) and len(value) == 1 and str(value[0]).strip().lower() == "all"
+
+
+def normalize_coins_source(src, *, allow_all: bool = True):
     """
     Always return: {'long': [symbols…], 'short': [symbols…]}
     – Handles:
@@ -1124,6 +1220,7 @@ def normalize_coins_source(src):
         • lists/tuples containing paths or strings
         • dicts with 'long' / 'short' keys whose values may themselves
           be strings, lists, or paths to external lists
+        • explicit 'all' sentinel for approved coins
     """
 
     # --------------------------------------------------------------------- #
@@ -1140,6 +1237,38 @@ def normalize_coins_source(src):
             elif item is not None:
                 out.append(str(item).strip())
         return out
+
+    def _parse_jsonish(raw: str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        if raw[0] not in "[{" or raw[-1] not in "]}":
+            return None
+        parsed = None
+        try:
+            import hjson
+
+            parsed = hjson.loads(raw)
+        except Exception:
+            parsed = None
+        if parsed is None:
+            try:
+                import json
+
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+        return parsed
+
+    def _maybe_parse_jsonish(val):
+        if isinstance(val, str):
+            parsed = _parse_jsonish(val)
+            return parsed if parsed is not None else val
+        if isinstance(val, (list, tuple)) and val and all(isinstance(x, str) for x in val):
+            joined = ",".join(x.strip() for x in val if x.strip())
+            parsed = _parse_jsonish(joined)
+            return parsed if parsed is not None else val
+        return val
 
     def _load_if_file(x):
         """
@@ -1172,23 +1301,51 @@ def normalize_coins_source(src):
         3. Flatten & split with _expand so we end up with a clean list.
         """
         value = _load_if_file(value)
+        value = _maybe_parse_jsonish(value)
 
-        if isinstance(value, dict) and sorted(value.keys()) == ["long", "short"]:
+        if isinstance(value, dict) and set(value).issubset({"long", "short"}):
             value = value.get(side, [])
+
+        if value in (None, "", [], (), {}, {"long": [], "short": []}):
+            return []
 
         # guarantee a sensible sequence for _expand
         if not isinstance(value, (list, tuple)):
             value = [value]
 
-        return _expand(value)
+        expanded = _expand(value)
+        if not expanded:
+            return []
+        if allow_all and len(expanded) == 1 and expanded[0].strip().lower() == "all":
+            return ["all"]
+        return expanded
 
     # --------------------------------------------------------------------- #
     #  Main logic                                                           #
     # --------------------------------------------------------------------- #
     src = _load_if_file(src)  # try to load *src* itself
+    src = _maybe_parse_jsonish(src)
 
     # Case 1 – already a dict with 'long' & 'short' keys
-    if isinstance(src, dict) and sorted(src.keys()) == ["long", "short"]:
+    if isinstance(src, dict):
+        if not src:
+            return {"long": [], "short": []}
+        if set(src).issubset({"long", "short"}):
+            return {
+                "long": _normalize_side(src.get("long", []), "long"),
+                "short": _normalize_side(src.get("short", []), "short"),
+            }
+
+    if src in (None, "", [], (), {}):
+        return {"long": [], "short": []}
+
+    if allow_all:
+        global_tokens = _normalize_side(src, "long")
+        if _coins_source_side_is_all(global_tokens):
+            return {"long": ["all"], "short": ["all"]}
+
+    # Case 1 – already a dict with 'long' / 'short' keys (including partial)
+    if isinstance(src, dict) and set(src).issubset({"long", "short"}):
         return {
             "long": _normalize_side(src.get("long", []), "long"),
             "short": _normalize_side(src.get("short", []), "short"),
@@ -1196,8 +1353,8 @@ def normalize_coins_source(src):
 
     # Case 2 – anything else is treated the same for both sides
     return {
-        "long": _normalize_side(src, "long"),
-        "short": _normalize_side(src, "short"),
+        "long": global_tokens if allow_all else _normalize_side(src, "long"),
+        "short": global_tokens if allow_all else _normalize_side(src, "short"),
     }
 
 
@@ -1311,3 +1468,37 @@ async def get_first_ohlcv_iteratively(cc, symbol):
         return daily_chunk[0]
 
     return best_candle
+
+
+def deep_get(d, key_path, *args):
+    """
+    Retrieves a value from a nested dict using dot notation.
+    Handles keys that may contain dots via greedy matching.
+    """
+    # Check if a default was provided via *args
+    has_default = len(args) > 0
+    default = args[0] if has_default else None
+
+    segments = key_path.split(".")
+    current = d
+
+    i = 0
+    while i < len(segments):
+        found = False
+
+        # Greedy look-ahead: try to find the longest matching key
+        for j in range(i + 1, len(segments) + 1):
+            candidate_key = ".".join(segments[i:j])
+
+            if isinstance(current, dict) and candidate_key in current:
+                current = current[candidate_key]
+                i = j  # Jump the pointer forward
+                found = True
+                break
+
+        if not found:
+            if has_default:
+                return default
+            raise KeyError(f"Path segment '{segments[i]}' not found in '{key_path}'")
+
+    return current

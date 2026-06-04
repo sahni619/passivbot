@@ -1,4 +1,5 @@
 # tests/exchanges/test_ccxt_bot.py
+import logging
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -50,6 +51,39 @@ class TestCCXTBotSessionCreation:
         assert config["privateKey"] == "0xDEF456"
         assert "apiKey" not in config  # Not provided
 
+    def test_build_ccxt_config_default_timeout(self):
+        """Should set a default timeout of 30 000 ms when user_info has no timeout."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {
+            "exchange": "bybit",
+            "apiKey": "k",
+            "secret": "s",
+            "quote": "USDT",
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["timeout"] == 30000
+
+    def test_build_ccxt_config_user_timeout_not_overridden(self):
+        """User-supplied timeout in user_info must take precedence over the default."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {
+            "exchange": "bybit",
+            "apiKey": "k",
+            "secret": "s",
+            "quote": "USDT",
+            "timeout": 60000,
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["timeout"] == 60000
+
 
 class TestCCXTBotFetchBalance:
     """Test CCXTBot balance fetching."""
@@ -76,8 +110,8 @@ class TestCCXTBotFetchBalance:
         assert balance == 1000.50
 
     @pytest.mark.asyncio
-    async def test_fetch_balance_returns_zero_when_missing(self):
-        """Should return 0 when quote currency not in balance."""
+    async def test_fetch_balance_raises_when_quote_missing(self):
+        """Should fail loudly when quote currency is missing from total balance."""
         from exchanges.ccxt_bot import CCXTBot
 
         # Use __new__ to bypass complex Passivbot initialization
@@ -91,9 +125,10 @@ class TestCCXTBotFetchBalance:
             }
         )
 
-        balance = await bot.fetch_balance()
-
-        assert balance == 0.0
+        with pytest.raises(
+            KeyError, match=r"testexchange: fetch_balance response missing total\['USDC'\]"
+        ):
+            await bot.fetch_balance()
 
 
 class TestCCXTBotFetchPositions:
@@ -399,6 +434,101 @@ class TestCCXTBotUpdateExchangeConfigBySymbols:
             await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT"])
 
 
+class TestCCXTBotExecuteCancellation:
+    """Tests for execute_cancellation."""
+
+    @pytest.mark.asyncio
+    async def test_treats_bybit_order_not_exists_as_benign(self, caplog):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "bybit"
+        bot.cca = MagicMock()
+        bot.cca.cancel_order = AsyncMock(
+            side_effect=Exception(
+                '{"retCode":110001,"retMsg":"order not exists or too late to cancel"}'
+            )
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = await bot.execute_cancellation(
+                {"id": "abc123def456", "symbol": "SUI/USDT:USDT"}
+            )
+
+        assert result == {}
+        assert "cancel skipped" in caplog.text
+        assert "order likely already filled or cancelled" in caplog.text
+        assert not any(record.levelname == "ERROR" for record in caplog.records)
+
+    def test_cross_only_blocks_isolated_only_symbol_for_entries(self, caplog):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot.markets_dict = {
+            "ISO/USDT:USDT": {
+                "info": {"onlyIsolated": True},
+                "marginModes": {"cross": False, "isolated": True},
+            }
+        }
+
+        with caplog.at_level("WARNING"):
+            filtered = bot._filter_approved_symbols("long", {"ISO/USDT:USDT"})
+
+        assert filtered == set()
+        assert bot._get_margin_mode_for_symbol("ISO/USDT:USDT") == "isolated"
+        assert "isolated margin support is currently disabled" in caplog.text
+
+    def test_live_margin_mode_is_preserved_when_symbol_has_existing_state(self):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot.markets_dict = {
+            "ISO/USDT:USDT": {
+                "marginModes": {"cross": True, "isolated": True},
+                "info": {},
+            }
+        }
+        bot.positions = {
+            "ISO/USDT:USDT": {
+                "long": {"size": 1.0, "price": 100.0},
+                "short": {"size": 0.0, "price": 0.0},
+            }
+        }
+        bot.open_orders = {}
+        bot._live_margin_modes = {"ISO/USDT:USDT": "isolated"}
+
+        policy = bot._resolve_margin_policy_for_symbol("ISO/USDT:USDT")
+
+        assert policy["mode"] == "isolated"
+        assert policy["blocked"] is False
+        assert policy["live_margin_mode"] == "isolated"
+
+    def test_normalize_positions_records_live_margin_mode(self):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot._live_margin_modes = {}
+        positions = bot._normalize_positions(
+            [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "long",
+                    "contracts": 1.0,
+                    "entryPrice": 100.0,
+                    "marginMode": "isolated",
+                }
+            ]
+        )
+
+        assert positions[0]["margin_mode"] == "isolated"
+        assert bot._live_margin_modes["BTC/USDT:USDT"] == "isolated"
+
+
 class TestCCXTBotSetMarketSpecificSettings:
     """Tests for set_market_specific_settings."""
 
@@ -474,6 +604,186 @@ class TestCCXTBotSetMarketSpecificSettings:
 
         assert bot.min_costs["ETH/USDT:USDT"] == 0.1  # Default fallback
         assert bot.c_mults["ETH/USDT:USDT"] == 1  # Default when missing
+
+    def test_clamps_nonpositive_min_qty_to_qty_step(self):
+        """Test that zero min_qty is normalized to qty_step for executable sizing."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+
+        bot.markets_dict = {
+            "SOL/USDT:USDT": {
+                "id": "SOLUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": 0.0},
+                },
+                "precision": {
+                    "amount": 1.0,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            }
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            bot.set_market_specific_settings()
+
+        assert bot.min_qtys["SOL/USDT:USDT"] == 1.0
+        assert bot.qty_steps["SOL/USDT:USDT"] == 1.0
+
+    def test_missing_min_qty_and_qty_step_fails_loudly(self):
+        """Test that incomplete executable sizing metadata fails with symbol context."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+
+        bot.markets_dict = {
+            "BAD/USDT:USDT": {
+                "id": "BADUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": None},
+                },
+                "precision": {
+                    "amount": None,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            }
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            with pytest.raises(
+                ValueError,
+                match="BAD/USDT:USDT: missing min qty and qty step",
+            ):
+                bot.set_market_specific_settings()
+
+    def test_skips_ineligible_market_missing_sizing_metadata(self):
+        """Incomplete metadata on non-executable exchange inventory must not block startup."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+        bot.eligible_symbols = {"BTC/USDT:USDT"}
+        bot.active_symbols = []
+        bot.coin_overrides = {}
+        bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+        bot.positions = {}
+        bot.open_orders = {}
+
+        bot.markets_dict = {
+            "BTC/USDT:USDT": {
+                "id": "BTCUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": 0.001},
+                },
+                "precision": {
+                    "amount": 0.001,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            },
+            "TRX-USD_UM_XPERP": {
+                "id": "TRX-USD_UM_XPERP",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": None},
+                },
+                "precision": {
+                    "amount": None,
+                    "price": 0.0001,
+                },
+                "contractSize": 1.0,
+            },
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            bot.set_market_specific_settings()
+
+        assert bot.min_qtys["BTC/USDT:USDT"] == 0.001
+        assert "TRX-USD_UM_XPERP" not in bot.min_qtys
+        assert "TRX-USD_UM_XPERP" not in bot.qty_steps
+
+    def test_position_symbol_missing_sizing_metadata_fails_even_when_ineligible(self):
+        """Live-state symbols remain executable sizing inputs and must fail loudly."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+        bot.eligible_symbols = {"BTC/USDT:USDT"}
+        bot.active_symbols = []
+        bot.coin_overrides = {}
+        bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+        bot.positions = {
+            "BAD/USDT:USDT": {
+                "long": {"size": 1.0},
+                "short": {"size": 0.0},
+            }
+        }
+        bot.open_orders = {}
+
+        bot.markets_dict = {
+            "BTC/USDT:USDT": {
+                "id": "BTCUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": 0.001},
+                },
+                "precision": {
+                    "amount": 0.001,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            },
+            "BAD/USDT:USDT": {
+                "id": "BADUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": None},
+                },
+                "precision": {
+                    "amount": None,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            },
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            with pytest.raises(
+                ValueError,
+                match="BAD/USDT:USDT: missing min qty and qty step",
+            ):
+                bot.set_market_specific_settings()
 
 
 class TestCCXTBotFetchTickers:

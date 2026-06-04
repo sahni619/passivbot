@@ -1,4 +1,5 @@
 from limit_utils import expand_limit_checks, compute_limit_violation
+from config.metrics import resolve_metric_value
 
 
 def _single_violation(entry, value, weights=None, penalty_weight=1000.0):
@@ -17,6 +18,30 @@ def test_less_than_limit_penalizes_deficit_with_custom_stat():
     entry = {"metric": "adg", "penalize_if": "less_than", "value": 0.001, "stat": "min"}
     violation = _single_violation(entry, value=0.0002, penalty_weight=5)
     assert violation == (0.001 - 0.0002) * 5
+
+
+def test_greater_than_or_equal_limit_penalizes_boundary_hit():
+    entry = {"metric": "drawdown_worst", "penalize_if": "greater_than_or_equal", "value": 0.5}
+    assert _single_violation(entry, value=0.49, penalty_weight=10) == 0.0
+    assert _single_violation(entry, value=0.5, penalty_weight=10) > 0.0
+
+
+def test_less_than_or_equal_limit_penalizes_boundary_hit():
+    entry = {"metric": "adg", "penalize_if": "less_than_or_equal", "value": 0.001, "stat": "min"}
+    assert _single_violation(entry, value=0.0011, penalty_weight=5) == 0.0
+    assert _single_violation(entry, value=0.001, penalty_weight=5) > 0.0
+
+
+def test_equal_to_limit_penalizes_exact_match_only():
+    entry = {"metric": "adg", "penalize_if": "equal_to", "value": 0.001, "stat": "mean"}
+    assert _single_violation(entry, value=0.001, penalty_weight=5) > 0.0
+    assert _single_violation(entry, value=0.0011, penalty_weight=5) == 0.0
+
+
+def test_not_equal_limit_penalizes_non_matching_values_only():
+    entry = {"metric": "adg", "penalize_if": "not_equal", "value": 0.001, "stat": "mean"}
+    assert _single_violation(entry, value=0.001, penalty_weight=5) == 0.0
+    assert _single_violation(entry, value=0.0011, penalty_weight=5) > 0.0
 
 
 def test_outside_range_penalty_hits_when_value_leaves_band():
@@ -40,3 +65,60 @@ def test_auto_penalize_if_respects_scoring_weight_sign():
     weights = {"adg": -1.0}
     violation = _single_violation(entry, value=0.0001, weights=weights, penalty_weight=3)
     assert violation == (0.0005 - 0.0001) * 3
+
+
+def test_disabled_limit_entry_is_skipped():
+    entry = {
+        "metric": "drawdown_worst",
+        "penalize_if": "greater_than",
+        "value": 0.5,
+        "enabled": False,
+    }
+    checks = expand_limit_checks([entry], {}, penalty_weight=1000.0)
+    assert checks == []
+
+
+def test_omitted_stat_uses_aggregate_default_instead_of_operator_direction():
+    entry = {"metric": "adg", "penalize_if": "less_than_or_equal", "value": 0.001}
+    checks = expand_limit_checks(
+        [entry],
+        {},
+        penalty_weight=1000.0,
+        aggregate_cfg={"default": "mean"},
+    )
+    assert checks[0]["stat"] == "mean"
+    assert checks[0]["metric_key"] == "adg_mean"
+
+
+def test_omitted_stat_uses_metric_specific_aggregate_override():
+    entry = {"metric": "drawdown_worst_hsl", "penalize_if": "greater_than", "value": 0.8}
+    checks = expand_limit_checks(
+        [entry],
+        {},
+        penalty_weight=1000.0,
+        aggregate_cfg={"default": "mean", "drawdown_worst_hsl": "max"},
+    )
+    assert checks[0]["stat"] == "max"
+    assert checks[0]["metric_key"] == "drawdown_worst_strategy_eq_max"
+
+
+def test_metric_value_resolution_accepts_deprecated_stat_suffix_aliases():
+    metrics = {
+        "adg_strategy_pnl_rebased_mean": 0.001,
+        "drawdown_worst_hsl_max": 0.42,
+    }
+
+    assert resolve_metric_value(metrics, "adg_strategy_eq_mean") == 0.001
+    assert resolve_metric_value(metrics, "drawdown_worst_strategy_eq_max") == 0.42
+
+
+def test_explicit_stat_overrides_aggregate_config():
+    entry = {"metric": "adg", "penalize_if": "less_than_or_equal", "value": 0.001, "stat": "min"}
+    checks = expand_limit_checks(
+        [entry],
+        {},
+        penalty_weight=1000.0,
+        aggregate_cfg={"default": "mean", "adg": "max"},
+    )
+    assert checks[0]["stat"] == "min"
+    assert checks[0]["metric_key"] == "adg_min"

@@ -4,14 +4,12 @@
 
 :warning: **Used at one's own risk** :warning:
 
-v7.7.0
-
 
 ## Overview
 
 Passivbot is a cryptocurrency trading bot written in Python and Rust, intended to require minimal user intervention.  
 
-It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements, it does not use technical indicators, nor does it follow trends. Rather, it is a contrarian market maker, providing resistance to price changes in both directions, thereby "serving the market" as a price stabilizer.  
+It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements or follow trends. Rather, it is a contrarian market maker, using price bands, EMA-derived context, and risk controls to provide resistance to price changes in both directions, thereby "serving the market" as a price stabilizer.
 
 Order planning is computed by a shared Rust orchestrator used by both live trading and backtesting for speed and consistency. Also included is an optimizer, which finds better configurations by iterating thousands of backtests with different candidates, converging on the optimal ones with an evolutionary algorithm.  
 
@@ -27,7 +25,7 @@ For trailing entries, the bot waits for the price to move beyond a specified thr
 Grid and trailing orders may be combined, such that the robot enters or closes a whole or a part of the position as grid orders and/or as trailing orders.
 
 ### Forager
-The Forager feature dynamically chooses the most volatile markets on which to open positions. Volatility is defined as the mean of the normalized relative range for the most recent 1m candles, i.e. `mean((ohlcv.high - ohlcv.low) / ohlcv.close)`.
+The Forager feature dynamically chooses which approved markets may open positions. It first prunes low relative-volume candidates, then ranks the remaining markets with configurable weights for quote volume, EMA readiness, and 1m log-range volatility.
 
 ### Unstucking Mechanism
 Passivbot manages underperforming, or "stuck", positions by realizing small losses over time. If multiple positions are stuck, the bot prioritizes positions with the smallest gap between the entry price and current market price for "unstucking". Losses are limited by ensuring that the account balance does not fall under a set percentage below the past peak balance.  
@@ -86,12 +84,20 @@ venv\Scripts\activate
 .\venv\Scripts\Activate.ps1
 ```
 
-### Step 4: Install Python Dependencies
+### Step 4: Install Passivbot
 
-Install all the required Python dependencies listed in the `requirements.txt` file:
+Choose the install profile that matches your use case:
+
+- **Live-only VPS**: `python3 -m pip install -e .`
+- **Backtesting / optimization / research workstation**: `python3 -m pip install -e ".[full]"`
+- **Contributing / docs / lint tooling**: `python3 -m pip install -e ".[dev]"`
+
+All profiles build the Rust extension and register the `passivbot` command.
+
+Typical live-only install:
 
 ```sh
-pip install -r requirements.txt
+python3 -m pip install -e .
 ```
 
 ### Step 5 (optional): Build Rust Extensions
@@ -125,22 +131,30 @@ Add your keys to api-keys.json.
 To start the bot with the default settings, run:
 
 ```sh
-python3 src/main.py -u {account_name_from_api-keys.json}
+passivbot live -u {account_name_from_api-keys.json}
 ```
 
-or make a new configuration file, using `configs/template.json` as a template, and start the bot with:
+or make a new configuration file, using `configs/examples/default_trailing_grid_long_npos7.json` as a starting point, and start the bot with:
 
 
 ```sh
-python3 src/main.py path/to/config.json
+passivbot live path/to/config.json
 ```
+
+Legacy direct-script entrypoints such as `python3 src/main.py ...`, `python3 src/backtest.py ...`,
+and `python3 src/optimize.py ...` still work unchanged for backwards compatibility.
+
+The canonical hardcoded defaults live in `src/config/schema.py`. The example config
+`configs/examples/default_trailing_grid_long_npos7.json` mirrors that default profile exactly, so
+copying it is the recommended starting point for new configs.
 
 ### Logging
 
 Passivbot uses Python's logging module throughout the bot, backtester, and supporting tools.  
-- Use `--debug-level {0-3}` (alias `--log-level`) on `src/main.py` or `src/backtest.py` to adjust verbosity at runtime: `0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`.  
-- Use `--verbose` on `src/main.py` to force debug logging (`--log-level debug`).  
+- Use `--log-level {warning|info|debug|trace}` or `--log-level {0-3}` on `passivbot live` or `passivbot backtest` to adjust verbosity at runtime: `0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`.
+- Use `--verbose` on `passivbot live` to force debug logging (`--log-level debug`).  
 - Persist a default by adding a top-level section to your config: `"logging": {"level": 2}`. The CLI flag always overrides the config value for that run.
+- `passivbot live` now writes a timestamped logfile under `logs/` by default and refreshes `logs/{user}.log` as a stable alias to the current run. Control this with `config.logging.persist_to_file`, `config.logging.dir`, and the optional rotation settings in `config.logging`.
 - CandlestickManager and other subsystems inherit the chosen level so EMA warm-up, data fetching, and cache behaviour can be inspected consistently.
 
 ### Running Multiple Bots
@@ -157,7 +171,9 @@ python3 -m jupyter lab
 ## Requirements
 
 - Python >= 3.12
-- [requirements.txt](requirements.txt) dependencies
+- `python3 -m pip install -e .` for live trading only
+- `python3 -m pip install -e ".[full]"` for backtesting, optimization, downloader, and advanced tools
+- `python3 -m pip install -e ".[dev]"` for contributor tooling on top of the full install
 
 ## Pre-optimized configurations
 
@@ -165,9 +181,19 @@ Coming soon...
 
 See also https://pbconfigdb.scud.dedyn.io/
 
-## Documentation:
+## Documentation
 
 For more detailed information about Passivbot, see documentation files here: [docs/](docs/)
+
+Useful entry points:
+
+- [Installation](docs/installation.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Backtesting](docs/backtesting.md)
+- [Optimizing](docs/optimizing.md)
+- [Metrics reference](docs/metrics.md)
+- [Equity Hard Stop Loss](docs/equity_hard_stop_loss.md)
+- [Monitor output](docs/monitor.md)
 
 ## Support
 
@@ -178,7 +204,7 @@ For more detailed information about Passivbot, see documentation files here: [do
 ## Third Party Links, Referrals and Tip Jar
 
 **Hyperliquid Reference Vault**
-Passivbot's default template config running on a Hyperliquid Vault:  
+Passivbot's reference long-only config profile running on a Hyperliquid Vault:
 https://app.hyperliquid.xyz/vaults/0x490af7d4a048a81db0f677517ed6373565b42349
 
 **Passivbot GUI**

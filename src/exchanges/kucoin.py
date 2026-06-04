@@ -5,7 +5,7 @@ import ccxt.pro as ccxt_pro
 import ccxt.async_support as ccxt_async
 import asyncio
 import passivbot_rust as pbr
-from utils import ts_to_date, utc_ms
+from utils import symbol_to_coin, ts_to_date, utc_ms
 from procedures import assert_correct_ccxt_version
 from collections import defaultdict
 import hmac
@@ -28,6 +28,26 @@ calc_order_price_diff = pbr.calc_order_price_diff
 # exchange classes when broker codes are defined.
 
 
+def _add_kucoin_broker_name_header(signed: dict, options: dict) -> dict:
+    partner_root = options.get("partner")
+    if not isinstance(partner_root, dict):
+        raise TypeError("KuCoin broker partner config must be a mapping")
+    partner_cfg = partner_root.get("future")
+    if not isinstance(partner_cfg, dict):
+        raise KeyError("KuCoin futures broker partner config missing 'future' section")
+    broker_name = partner_cfg.get("name")
+    if not isinstance(broker_name, str) or not broker_name:
+        raise ValueError("KuCoin futures broker-name must be a non-empty string")
+
+    headers = signed.get("headers")
+    if not isinstance(headers, dict):
+        raise TypeError("KuCoin signed request missing headers mapping")
+    headers = dict(headers)
+    headers["KC-BROKER-NAME"] = broker_name
+    signed["headers"] = headers
+    return signed
+
+
 class AsyncKucoinBrokerFutures(ccxt_async.kucoinfutures):
     """Asynchronous KuCoin futures exchange with broker tagging support."""
 
@@ -41,19 +61,8 @@ class AsyncKucoinBrokerFutures(ccxt_async.kucoinfutures):
 
     def sign(self, path, api="public", method="GET", params=None, headers=None, body=None):
         signed = super().sign(path, api, method, params or {}, headers, body)
-        try:
-            if api in {"private", "futuresPrivate", "broker"}:
-                partner_root = getattr(self, "options", {}).get("partner") or {}
-                partner_cfg = (
-                    partner_root.get("future", partner_root) if isinstance(partner_root, dict) else {}
-                )
-                broker_name = partner_cfg.get("name") if isinstance(partner_cfg, dict) else None
-                if broker_name:
-                    hdrs = dict(signed.get("headers") or {})
-                    hdrs["KC-BROKER-NAME"] = broker_name
-                    signed["headers"] = hdrs
-        except Exception:
-            pass
+        if api in {"private", "futuresPrivate", "broker"}:
+            return _add_kucoin_broker_name_header(signed, self.options)
         return signed
 
 
@@ -70,19 +79,8 @@ class ProKucoinBrokerFutures(ccxt_pro.kucoinfutures):
 
     def sign(self, path, api="public", method="GET", params=None, headers=None, body=None):
         signed = super().sign(path, api, method, params or {}, headers, body)
-        try:
-            if api in {"private", "futuresPrivate", "broker"}:
-                partner_root = getattr(self, "options", {}).get("partner") or {}
-                partner_cfg = (
-                    partner_root.get("future", partner_root) if isinstance(partner_root, dict) else {}
-                )
-                broker_name = partner_cfg.get("name") if isinstance(partner_cfg, dict) else None
-                if broker_name:
-                    hdrs = dict(signed.get("headers") or {})
-                    hdrs["KC-BROKER-NAME"] = broker_name
-                    signed["headers"] = hdrs
-        except Exception:
-            pass
+        if api in {"private", "futuresPrivate", "broker"}:
+            return _add_kucoin_broker_name_header(signed, self.options)
         return signed
 
 
@@ -104,47 +102,47 @@ class KucoinBot(CCXTBot):
         return base64.b64encode(digest).decode()
 
     def create_ccxt_sessions(self) -> None:
-        """Initialise CCXT sessions for KuCoin futures with optional broker support.
+        """Initialise CCXT sessions for KuCoin futures with broker support.
 
         If broker codes are defined under ``self.broker_code['futures']``, these
         values are used to configure partner signing so that private/futures
-        requests include the correct broker metadata.  Otherwise the bot
-        instantiates the standard CCXT classes.
+        requests include the correct broker metadata.
         """
-        broker_cfg = self.broker_code.get("futures", {}) if isinstance(self.broker_code, dict) else {}
-        partner_id = broker_cfg.get("partner")
-        partner_secret = broker_cfg.get("broker-key")
-        broker_name = broker_cfg.get("broker-name")
-        options = {}
-        if partner_id and partner_secret:
-            options = {
-                "partner": {
-                    "future": {
-                        "id": partner_id,
-                        "secret": partner_secret,
-                        "name": broker_name,
-                    }
+        if not isinstance(self.broker_code, dict):
+            raise TypeError("KuCoin broker code must be an object with a futures section")
+        if "futures" not in self.broker_code:
+            raise KeyError("KuCoin broker code missing 'futures' section")
+        broker_cfg = self.broker_code["futures"]
+        if not isinstance(broker_cfg, dict):
+            raise TypeError("KuCoin futures broker code must be an object")
+        required = {
+            "partner": broker_cfg.get("partner"),
+            "broker-key": broker_cfg.get("broker-key"),
+            "broker-name": broker_cfg.get("broker-name"),
+        }
+        missing = [key for key, value in required.items() if not isinstance(value, str) or not value]
+        if missing:
+            raise ValueError(f"KuCoin futures broker code missing required fields: {missing}")
+
+        options = {
+            "partner": {
+                "future": {
+                    "id": required["partner"],
+                    "secret": required["broker-key"],
+                    "name": required["broker-name"],
                 }
             }
+        }
         base_kwargs = {
             "apiKey": self.user_info["key"],
             "secret": self.user_info["secret"],
             "password": self.user_info["passphrase"],
             "enableRateLimit": True,
         }
-        if options:
-            base_kwargs["options"] = options
+        base_kwargs["options"] = options
 
-        async_cls = (
-            AsyncKucoinBrokerFutures
-            if partner_id and partner_secret and broker_name
-            else ccxt_async.kucoinfutures
-        )
-        pro_cls = (
-            ProKucoinBrokerFutures
-            if partner_id and partner_secret and broker_name
-            else ccxt_pro.kucoinfutures
-        )
+        async_cls = AsyncKucoinBrokerFutures
+        pro_cls = ProKucoinBrokerFutures
 
         self.cca = async_cls(dict(base_kwargs))
         self.cca.options.update(self._build_ccxt_options())
@@ -183,11 +181,11 @@ class KucoinBot(CCXTBot):
             return "short"
         raise Exception(f"unknown side {order['side']}")
 
-    async def fetch_open_orders(self, symbol: str = None) -> list:
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
         """KuCoin: Fetch open orders with pagination.
 
         Returns:
-            list: Orders sorted by timestamp with normalized fields.
+            list: Raw open orders across pages.
 
         Raises:
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
@@ -203,13 +201,83 @@ class KucoinBot(CCXTBot):
             for order in fetched:
                 order["position_side"] = self.determine_pos_side(order)
                 order["qty"] = order["amount"]
+                self._record_live_margin_mode_from_payload(order)
             open_orders.extend(fetched)
             if len(fetched) < page_size:
                 break
             if len(open_orders) >= self.MAX_OPEN_ORDERS:
                 break
             current_page += 1
-        return sorted(open_orders, key=lambda x: x["timestamp"])
+        return open_orders
+
+    def _normalize_open_orders(self, fetched: list) -> list:
+        for order in fetched:
+            order["position_side"] = self.determine_pos_side(order)
+            order["qty"] = order["amount"]
+            self._record_live_margin_mode_from_payload(order)
+        return sorted(fetched, key=lambda x: x["timestamp"])
+
+    async def fetch_open_orders(self, symbol: str = None) -> list:
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return self._normalize_open_orders(fetched)
+
+    @staticmethod
+    def _coerce_positive_ticker_price(value) -> float | None:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0.0 else None
+
+    def _normalize_tickers(self, fetched: dict) -> dict:
+        """Normalize KuCoin futures tickers with an explicit last-price fallback.
+
+        KuCoin futures CCXT ticker payloads commonly include `last`/`close` but no
+        bid/ask.  The staged market snapshot path requires bid/ask/last, so this
+        exchange-scoped fallback labels the synthetic top-of-book source instead
+        of letting the generic provider fabricate values silently.
+        """
+        tickers = {}
+        fallback_symbols = []
+        for symbol, data in fetched.items():
+            if symbol not in self.markets_dict or not isinstance(data, dict):
+                continue
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            last = (
+                self._coerce_positive_ticker_price(data.get("last"))
+                or self._coerce_positive_ticker_price(data.get("close"))
+                or self._coerce_positive_ticker_price(data.get("markPrice"))
+                or self._coerce_positive_ticker_price(info.get("lastTradePrice"))
+                or self._coerce_positive_ticker_price(info.get("markPrice"))
+                or self._coerce_positive_ticker_price(info.get("indexPrice"))
+            )
+            bid = self._coerce_positive_ticker_price(data.get("bid"))
+            ask = self._coerce_positive_ticker_price(data.get("ask"))
+            source = "kucoin_ccxt_ticker"
+            if (bid is None or ask is None) and last is not None:
+                bid = last
+                ask = last
+                source = "kucoin_last_fallback"
+                fallback_symbols.append(symbol)
+            if last is None or bid is None or ask is None:
+                continue
+            tickers[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "timestamp": data.get("timestamp"),
+                "source": source,
+            }
+        if fallback_symbols:
+            now_ms = utc_ms()
+            last_log_ms = int(getattr(self, "_kucoin_ticker_fallback_log_ms", 0) or 0)
+            if now_ms - last_log_ms >= 60 * 60 * 1000:
+                logging.warning(
+                    "[market] kucoin ticker bid/ask missing; using last as bid=ask | symbols=%s",
+                    ",".join(symbol_to_coin(symbol) for symbol in fallback_symbols[:12]),
+                )
+                self._kucoin_ticker_fallback_log_ms = now_ms
+        return tickers
 
     def _get_balance(self, fetched: dict) -> float:
         """KuCoin uses marginBalance in info.data."""
@@ -218,11 +286,17 @@ class KucoinBot(CCXTBot):
     async def calc_ideal_orders(self):
         # KuCoin enforces a 150 open-order cap; keep only the closest price targets.
         ideal_orders = await super().calc_ideal_orders()
+        market_prices = await self._get_live_last_prices(
+            ideal_orders.keys(),
+            max_age_ms=10_000,
+            context="kucoin_order_cap_sort",
+            allow_completed_candle_fallback=True,
+        )
         flattened = []
         for symbol, orders in ideal_orders.items():
             if not orders:
                 continue
-            market_price = await self.cm.get_current_close(symbol, max_age_ms=10_000)
+            market_price = market_prices[symbol]
             for order in orders:
                 price_diff = calc_order_price_diff(order["side"], order["price"], market_price)
                 flattened.append((price_diff, symbol, order))
@@ -366,13 +440,15 @@ class KucoinBot(CCXTBot):
                 matches.append((p, best_match))
                 timedelta = best_match["timestamp"] - p["lastUpdateTimestamp"]
                 if timedelta > 1000:
+                    log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
                     logging.debug(
-                        f"best match fill and pos close {symbol} timedelta>1000ms: {best_match['timestamp'] - p['lastUpdateTimestamp']}ms"
+                        f"best match fill and pos close {log_symbol} timedelta>1000ms: {best_match['timestamp'] - p['lastUpdateTimestamp']}ms"
                     )
                 seen_trade_id.add(best_match["id"])
             if len(phd[symbol]) != len(cld[symbol]):
+                log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
                 logging.debug(
-                    f"len mismatch between closes and positions_history for {symbol}: {len(cld[symbol])} {len(phd[symbol])}"
+                    f"len mismatch between closes and positions_history for {log_symbol}: {len(cld[symbol])} {len(phd[symbol])}"
                 )
         # add pnls, dedup and return
         deduped = {}
@@ -417,10 +493,11 @@ class KucoinBot(CCXTBot):
         return events
 
     def _build_order_params(self, order: dict) -> dict:
+        margin_mode = self._get_margin_mode_for_symbol(order["symbol"])
         return {
             "timeInForce": "GTC",
             "reduceOnly": order.get("reduce_only", False),
-            "marginMode": "CROSS",
+            "marginMode": margin_mode.upper(),
             "clientOid": order.get("custom_id", None),
             "positionSide": order.get("position_side", "").upper(),
         }
@@ -434,18 +511,6 @@ class KucoinBot(CCXTBot):
             )
         except (KeyError, TypeError, AttributeError):
             return False
-
-    async def determine_utc_offset(self, verbose=True):
-        # returns millis to add to utc to get exchange timestamp
-        # call some endpoint which includes timestamp for exchange's server
-        # if timestamp is not included in self.cca.fetch_balance(),
-        # implement method in exchange child class
-        result = await self.cca.fetch_ticker("BTC/USDT:USDT")
-        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
-            1000 * 60 * 60
-        )
-        if verbose:
-            logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
 
     async def update_exchange_config(self):
         """Ensure account-level settings (hedge mode) are applied."""
@@ -462,9 +527,11 @@ class KucoinBot(CCXTBot):
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call = []
         for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             try:
+                margin_mode = self._get_margin_mode_for_symbol(symbol)
                 params = {
-                    "marginMode": "cross",
+                    "marginMode": margin_mode,
                     "symbol": symbol,
                 }
                 coros_to_call.append(
@@ -475,43 +542,45 @@ class KucoinBot(CCXTBot):
                     )
                 )
             except Exception as e:
-                logging.warning(f"{symbol}: error set_margin_mode {e}")
+                logging.warning(f"{log_symbol}: error set_margin_mode {e}")
         for symbol, task_name, task in coros_to_call:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             res = None
             to_print = ""
             try:
                 res = await task
                 to_print += f"{task_name}={format_exchange_config_response(res)}"
             except Exception as e:
-                logging.warning(f"{symbol} error {task_name} {e}")
+                logging.warning(f"{log_symbol} error {task_name} {e}")
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{log_symbol}: {to_print}")
 
         coros_to_call = []
         for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             try:
+                margin_mode = self._get_margin_mode_for_symbol(symbol)
+                leverage = self._calc_leverage_for_symbol(symbol)
                 params = {
-                    "leverage": int(
-                        min(
-                            self.max_leverage[symbol],
-                            self.config_get(["live", "leverage"], symbol=symbol),
-                        )
-                    ),
+                    "leverage": leverage,
                     "symbol": symbol,
-                    "params": {"marginMode": "cross"},
+                    "params": {"marginMode": margin_mode},
                 }
                 coros_to_call.append(
                     (symbol, "set_leverage", asyncio.create_task(self.cca.set_leverage(**params)))
                 )
+            except ValueError:
+                raise
             except Exception as e:
-                logging.warning(f"{symbol}: error set_leverage {e}")
+                logging.warning(f"{log_symbol}: error preparing set_leverage {e}")
         for symbol, task_name, task in coros_to_call:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             res = None
             to_print = ""
             try:
                 res = await task
                 to_print += f"{task_name}={format_exchange_config_response(res)}"
             except Exception as e:
-                logging.warning(f"{symbol} error {task_name} {e}")
+                logging.warning(f"{log_symbol} error {task_name} {e}")
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{log_symbol}: {to_print}")

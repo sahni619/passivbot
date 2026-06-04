@@ -1,12 +1,15 @@
 # Metrics reference
 
 This page documents the main backtest metrics exposed by `passivbot-rust`. Values may appear with
-`_usd`/`_btc` suffixes, depending on the denomination used for a run. Metrics without a suffix are
-currency-agnostic (e.g., position counts) or already expressed as percentages/ratios.
+`_usd`/`_btc` suffixes. `_usd` metrics are computed from USD-denominated balance/equity, while
+`_btc` metrics are computed from BTC-denominated balance/equity even when the backtest never holds
+BTC collateral. Metrics without a suffix are currency-agnostic (e.g., position counts) or already
+expressed as percentages/ratios.
 
 ## Core growth metrics
-- `gain`: Terminal equity divided by starting equity (after EMA smoothing of daily equity).
-- `adg`: Average daily gain derived from smoothed daily equity (`gain.powf(1 / n_days) - 1`).
+- `gain`: Terminal equity divided by starting equity, where terminal equity is the mean of the
+  last up to three daily equity values.
+- `adg`: Average daily gain derived from that smoothed terminal equity (`gain.powf(1 / n_days) - 1`).
 - `adg_w`: Mean of `adg` computed on the trailing 10% slices (full run, last half, last third, …).
 - `adg_pnl`: Collateral-agnostic daily PnL ratio. For each day, sum all `pnl` and divide by that
   day’s last recorded `usd_total_balance`, then average those daily ratios across the run.
@@ -33,17 +36,48 @@ and more stable across collateral caps.
 - `omega_ratio`: Sum of positive daily returns divided by the absolute sum of negative daily returns.
 - `sterling_ratio`: `adg` divided by the average of the worst 1% drawdowns.
 - `calmar_ratio`: `adg` divided by the worst drawdown observed over the full equity curve.
+- `paper_loss_ratio`: `adg` divided by the worst absolute negative equity-vs-balance gap.
+- `paper_loss_mean_ratio`: `adg` divided by the mean absolute negative equity-vs-balance gap.
+- `exposure_ratio`: `adg` divided by the maximum absolute recorded wallet exposure.
+- `exposure_mean_ratio`: `adg` divided by the mean absolute recorded wallet exposure.
+
+Weighted `_w` variants use the same trailing-slice averaging as the rest of the `_w` metrics.
 
 ## Drawdown and tail metrics
 - `drawdown_worst`: Maximum absolute drawdown over the equity curve.
-- `drawdown_worst_mean_1pct`: Mean of the worst 1% daily drawdowns.
+- `drawdown_worst_mean_1pct`: Mean of the worst 1% daily worst drawdowns, where drawdown is computed from the full-resolution equity curve before reducing each day to its worst underwater point.
 - `expected_shortfall_1pct`: Average loss of the worst 1% daily min-equity returns.
+
+## HSL metrics
+- `hard_stop_triggers`: Absolute count of RED trigger events during the run.
+- `hard_stop_restarts`: Absolute count of cooldown restarts after RED halts.
+- `hard_stop_total_loss_pct`: Total panic-close loss as a fraction of starting balance.
+- `hard_stop_triggers_per_year`: `hard_stop_triggers / n_days * 365.25`.
+- `hard_stop_restarts_per_year`: `hard_stop_restarts / n_days * 365.25`.
 
 ## Exposure, volume, and timing
 - `total_wallet_exposure_max/mean/median`: Stats over recorded wallet exposure values.
 - `volume_pct_per_day_avg`: Average daily traded notional as a percentage of balance at fill time.
 - `positions_held_per_day`: Average number of positions opened per day.
 - `position_held_hours_mean/median/max`: Holding-time stats for closed (or still-open) positions.
+- `position_held_days_mean/median/max`: Same holding-time stats converted to days.
 - `position_unchanged_hours_max`: Longest span with no fills on an open position.
+- `position_unchanged_days_max`: Same unchanged-position span converted to days.
 - `peak_recovery_hours_equity`: Longest time to make a new high on the equity curve.
+- `peak_recovery_days_equity`: Same equity recovery duration converted to days.
 - `peak_recovery_hours_pnl`: Same calculation on cumulative realized PnL.
+- `peak_recovery_days_pnl`: Same realized-PnL recovery duration converted to days.
+- `strategy_eq_recovery_days_*`: Distribution of per-sample strategy-equity recovery durations. For each strategy-equity sample, recovery is the time until a later sample strictly exceeds that equity; samples not exceeded by the end use the open tail to the final timestamp. Available summaries are `mean`, `median`, `p95`, `p99`, `mean_worst_5pct`, `mean_worst_1pct`, and `max`.
+- `peak_recovery_days_strategy_eq`: Legacy alias for `strategy_eq_recovery_days_max`.
+
+## Trade-level metrics
+- `win_rate`: Fraction of completed trades with positive net realized PnL.
+- `win_rate_w`: Mean `win_rate` across the same trailing-slice weighted analysis used for other
+  `_w` metrics.
+- `trade_loss_max`: Worst completed-trade loss as a fraction of the account balance at trade open.
+- `trade_loss_mean`: Mean losing-trade loss fraction in that same unit.
+- `trade_loss_median`: Median losing-trade loss fraction in that same unit.
+
+A completed trade is one full position lifecycle from open to flat for a single `coin + side`.
+Realized PnL is accumulated from `fill.pnl` over that lifecycle. Positions that remain open at the
+end of the backtest are excluded from these trade-level metrics.

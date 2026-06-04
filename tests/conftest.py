@@ -3,7 +3,7 @@ import os
 import sys
 import types
 
-# Ensure we can import modules from the src/ directory as "downloader"
+# Ensure we can import modules from the src/ directory directly.
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 if SRC_DIR not in sys.path:
@@ -17,6 +17,20 @@ def _install_passivbot_rust_stub():
     try:
         import importlib
 
+        importlib.import_module("passivbot_rust")
+        return
+    except Exception:
+        pass
+
+    # If pytest is launched outside the venv, try the project venv site-packages
+    # before falling back to the lightweight stub.
+    try:
+        import importlib
+
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        venv_site = os.path.join(ROOT_DIR, "venv", "lib", pyver, "site-packages")
+        if os.path.isdir(venv_site) and venv_site not in sys.path:
+            sys.path.insert(0, venv_site)
         importlib.import_module("passivbot_rust")
         return
     except Exception:

@@ -1,7 +1,7 @@
 import glob
 import json
+import logging
 import os
-import traceback
 import asyncio
 from datetime import datetime, timezone
 from time import time
@@ -52,9 +52,9 @@ def get_all_eligible_symbols(exchange="binance"):
     exchange_map = {
         "bybit": "bybit",
         "binance": "binanceusdm",
+        "gateio": "gateio",
         # "bitget": "bitget", TODO
         # "hyperliquid": "hyperliquid", TODO
-        # "gateio": "gateio", TODO
     }
     quote_map = {k: "USDT" for k in exchange_map}
     quote_map["hyperliquid"] = "USDC"
@@ -202,13 +202,55 @@ def load_exchange_key_secret_passphrase(
         raise Exception("API KeyFile Missing!")
 
 
-def load_broker_code(exchange: str) -> str:
+def _broker_codes_path() -> Path:
+    env_path = os.environ.get("PASSIVBOT_BROKER_CODES_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+
+    repo_path = Path(__file__).resolve().parents[1] / "broker_codes.hjson"
+    if repo_path.exists():
+        return repo_path
+
+    # Packaged/container deployments may keep broker_codes.hjson beside the
+    # process working directory instead of beside the source checkout.
+    return Path.cwd() / "broker_codes.hjson"
+
+
+def load_broker_codes() -> dict[str, Any]:
+    path = _broker_codes_path()
     try:
-        return hjson.load(open("broker_codes.hjson")).get(exchange, "")
-    except Exception as e:
-        print(f"failed to load broker code", e)
-        traceback.print_exc()
+        with path.open() as f:
+            codes = hjson.load(f)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"broker code registry not found at {path}. "
+            "Run from the Passivbot checkout, include broker_codes.hjson in the deployment, "
+            "or set PASSIVBOT_BROKER_CODES_PATH."
+        ) from e
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"failed to load broker code registry from {path}: {e}") from e
+
+    if not isinstance(codes, dict):
+        raise TypeError(f"broker code registry {path} must contain a top-level object")
+    return codes
+
+
+def load_broker_code(exchange: str) -> Any:
+    codes = load_broker_codes()
+    if exchange not in codes:
+        raise KeyError(
+            f"broker code registry has no entry for exchange {exchange!r}. "
+            "Add a broker code, or add an explicit null entry for supported exchanges "
+            f"without broker-code attribution. Known entries: {sorted(codes)}"
+        )
+    code = codes[exchange]
+    if code is None:
         return ""
+    if not isinstance(code, (str, dict)):
+        raise TypeError(
+            f"broker code registry entry for {exchange!r} must be a string, object, or null"
+        )
+    return code
 
 
 def print_(args, r=False, n=False):
@@ -307,40 +349,54 @@ async def get_first_timestamps_unified(coins: List[str], exchange: str = None):
         try:
             with open(cache_fpath, "r") as f:
                 ftss = json.load(f)
-            print(f"Loaded from main cache: {cache_fpath}")
+            logging.debug("loaded first_ohlcv_timestamps from %s (%d coins)", cache_fpath, len(ftss))
         except Exception as e:
-            print(f"Error reading {cache_fpath}: {e}")
+            logging.warning("error reading %s: %s", cache_fpath, e)
 
     # Load exchange-specific cache if it exists
     if os.path.exists(cache_fpath_exchange_specific):
         try:
             with open(cache_fpath_exchange_specific, "r") as f:
                 ftss_exchange_specific = json.load(f)
-            print(f"Loaded from exchange-specific cache: {cache_fpath_exchange_specific}")
+            logging.debug(
+                "loaded first_ohlcv_timestamps (exchange-specific) from %s (%d coins)",
+                cache_fpath_exchange_specific,
+                len(ftss_exchange_specific),
+            )
         except Exception as e:
-            print(f"Error reading {cache_fpath_exchange_specific}: {e}")
+            logging.warning("error reading %s: %s", cache_fpath_exchange_specific, e)
 
     # If an exchange is specified, handle "binance" alias
     if exchange == "binance":
         exchange = "binanceusdm"
 
-    # 1) If no exchange is specified and all coins are in ftss, just return ftss
+    def _valid_first_timestamp(value: Any) -> bool:
+        try:
+            return float(value) > 0.0
+        except Exception:
+            return False
+
+    # 1) If no exchange is specified and all coins have valid cached timestamps, just return ftss
     if exchange is None:
-        if all(coin in ftss for coin in coins):
+        if all(_valid_first_timestamp(ftss.get(coin)) for coin in coins):
             return ftss
 
     # 2) If a specific exchange is requested:
     else:
         # If all coins exist in the exchange-specific cache for that exchange, return them
-        if all(coin in ftss_exchange_specific for coin in coins):
-            if all(exchange in ftss_exchange_specific[coin] for coin in coins):
-                # Return a simplified dict coin->timestamp
-                return {c: ftss_exchange_specific[c][exchange] for c in coins}
+        if all(_valid_first_timestamp(ftss_exchange_specific.get(coin, {}).get(exchange)) for coin in coins):
+            return {c: ftss_exchange_specific[c][exchange] for c in coins}
 
-    # Figure out which coins are missing from the main dictionary
-    missing_coins = {c for c in coins if c not in ftss}
+    # Figure out which coins are missing from the relevant cache or have invalid cached timestamps
+    if exchange is None:
+        missing_coins = {c for c in coins if not _valid_first_timestamp(ftss.get(c))}
+    else:
+        missing_coins = {
+            c for c in coins if not _valid_first_timestamp(ftss_exchange_specific.get(c, {}).get(exchange))
+        }
     if not missing_coins:
-        # No missing coins => all already in ftss
+        if exchange is not None:
+            return {c: ftss_exchange_specific.get(c, {}).get(exchange, 0.0) for c in coins}
         return ftss
 
     print("Missing coins:", sorted(missing_coins))

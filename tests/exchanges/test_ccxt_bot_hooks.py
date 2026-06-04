@@ -113,9 +113,151 @@ class TestWatchOrdersTemplateMethod:
         assert call_args[0]["position_side"] == "long"
         assert call_args[0]["qty"] == 1.0
 
+    @pytest.mark.asyncio
+    async def test_reconnect_backoff_increases_after_consecutive_failures(self, monkeypatch):
+        """Repeated watch failures should back off instead of reconnecting every second."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.ccp = MagicMock()
+        bot.ccp.has = {"watchOrders": True}
+        bot.exchange = "test_exchange"
+        bot.stop_websocket = False
+        bot.stop_signal_received = False
+        bot._shutdown_in_progress = False
+        bot._health_ws_reconnects = 0
+        bot._ws_reconnect_warning_last_ms = 0
+        bot._do_watch_orders = AsyncMock(side_effect=[RuntimeError("ws down"), RuntimeError("ws down")])
+        bot.handle_order_update = MagicMock()
+        delays = []
+
+        async def fake_sleep(_self, seconds, *, stage):
+            delays.append((seconds, stage))
+            if len(delays) >= 2:
+                bot.stop_websocket = True
+
+        monkeypatch.setattr(Passivbot, "_sleep_unless_shutdown", fake_sleep)
+
+        await bot.watch_orders()
+
+        assert [delay for delay, _stage in delays] == [1.0, 2.0]
+        assert all(stage == "watch_orders_reconnect" for _delay, stage in delays)
+
+    @pytest.mark.asyncio
+    async def test_timestamp_error_refreshes_clock_before_watch_reconnect(self, monkeypatch):
+        """Timestamp/nonce websocket failures should refresh CCXT time offset."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.ccp = MagicMock()
+        bot.ccp.has = {"watchOrders": True}
+        bot.ccp.options = {"timeDifference": 0}
+        bot.ccp.load_time_difference = AsyncMock()
+        bot.cca = None
+        bot.exchange = "kucoin"
+        bot.stop_websocket = False
+        bot.stop_signal_received = False
+        bot._shutdown_in_progress = False
+        bot._health_ws_reconnects = 0
+        bot._ws_reconnect_warning_last_ms = 0
+        bot._do_watch_orders = AsyncMock(
+            side_effect=RuntimeError('kucoinfutures {"code":"400002","msg":"Invalid KC-API-TIMESTAMP"}')
+        )
+        bot.handle_order_update = MagicMock()
+        bot._log_ws_reconnect = MagicMock()
+
+        async def fake_sleep(_self, _seconds, *, stage):
+            assert stage == "watch_orders_reconnect"
+            bot.stop_websocket = True
+
+        monkeypatch.setattr(Passivbot, "_sleep_unless_shutdown", fake_sleep)
+
+        await bot.watch_orders()
+
+        bot.ccp.load_time_difference.assert_awaited_once()
+        bot._log_ws_reconnect.assert_called_once()
+        assert bot._log_ws_reconnect.call_args.kwargs["reason"] == "time_sync"
+
 
 class TestCreateCcxtSessionsWebSocketOptional:
     """Test that WebSocket is optional in create_ccxt_sessions()."""
+
+    def test_prefers_exchange_ccxt_id_when_available(self):
+        """Should instantiate CCXT clients with futures-specific id when present."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {"exchange": "binance", "apiKey": "test", "options": {"user_opt": "x"}}
+        bot.exchange = "binance"
+        bot.exchange_ccxt_id = "binanceusdm"
+        bot.ws_enabled = True
+        bot.endpoint_override = None
+        bot._build_ccxt_config = MagicMock(return_value={"apiKey": "test"})
+        bot._build_ccxt_options = MagicMock(return_value={"cfg_opt": "y"})
+        bot._apply_endpoint_override = MagicMock()
+
+        import ccxt.async_support as ccxt_async
+        import ccxt.pro as ccxt_pro
+
+        rest_ctor = MagicMock()
+        rest_ctor.return_value = MagicMock()
+        rest_ctor.return_value.options = {}
+        ws_ctor = MagicMock()
+        ws_ctor.return_value = MagicMock()
+        ws_ctor.return_value.options = {}
+        generic_rest_ctor = MagicMock()
+        generic_ws_ctor = MagicMock()
+
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(ccxt_async, "binanceusdm", rest_ctor, raising=False)
+            m.setattr(ccxt_pro, "binanceusdm", ws_ctor, raising=False)
+            m.setattr(ccxt_async, "binance", generic_rest_ctor, raising=False)
+            m.setattr(ccxt_pro, "binance", generic_ws_ctor, raising=False)
+            bot.create_ccxt_sessions()
+
+        rest_ctor.assert_called_once_with({"apiKey": "test"})
+        ws_ctor.assert_called_once_with({"apiKey": "test"})
+        generic_rest_ctor.assert_not_called()
+        generic_ws_ctor.assert_not_called()
+        assert bot.cca.options["cfg_opt"] == "y"
+        assert bot.cca.options["user_opt"] == "x"
+        assert bot.cca.options["defaultType"] == "swap"
+        assert bot.ccp.options["cfg_opt"] == "y"
+        assert bot.ccp.options["user_opt"] == "x"
+        assert bot.ccp.options["defaultType"] == "swap"
+
+    def test_falls_back_to_exchange_when_exchange_ccxt_id_missing(self):
+        """Should support test-created instances without exchange_ccxt_id."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {"exchange": "paradex", "apiKey": "test"}
+        bot.exchange = "paradex"
+        bot.ws_enabled = True
+        bot.endpoint_override = None
+        bot._build_ccxt_config = MagicMock(return_value={"apiKey": "test"})
+        bot._build_ccxt_options = MagicMock(return_value={})
+        bot._apply_endpoint_override = MagicMock()
+
+        import ccxt.async_support as ccxt_async
+        import ccxt.pro as ccxt_pro
+
+        rest_ctor = MagicMock()
+        rest_ctor.return_value = MagicMock()
+        rest_ctor.return_value.options = {}
+        ws_ctor = MagicMock()
+        ws_ctor.return_value = MagicMock()
+        ws_ctor.return_value.options = {}
+
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(ccxt_async, "paradex", rest_ctor, raising=False)
+            m.setattr(ccxt_pro, "paradex", ws_ctor, raising=False)
+            bot.create_ccxt_sessions()
+
+        rest_ctor.assert_called_once_with({"apiKey": "test"})
+        ws_ctor.assert_called_once_with({"apiKey": "test"})
 
     def test_sets_ccp_none_when_ws_disabled(self):
         """Should set ccp=None instead of raising when ws_enabled=False."""
@@ -141,6 +283,177 @@ class TestCreateCcxtSessionsWebSocketOptional:
             bot.create_ccxt_sessions()
 
         assert bot.ccp is None
+
+
+class TestBybitCreateCcxtSessions:
+    """Test Bybit broker attribution during CCXT session creation."""
+
+    def test_sets_passivbot_broker_id_on_rest_and_ws_clients(self):
+        from exchanges.bybit import BybitBot
+
+        bot = BybitBot.__new__(BybitBot)
+        bot.user_info = {"exchange": "bybit", "apiKey": "test", "options": {"brokerId": "CCXT"}}
+        bot.exchange = "bybit"
+        bot.exchange_ccxt_id = "bybit"
+        bot.ws_enabled = True
+        bot.endpoint_override = None
+        bot.broker_code = "passivbotbybit"
+        bot._build_ccxt_config = MagicMock(return_value={"apiKey": "test"})
+        bot._build_ccxt_options = MagicMock(return_value={})
+        bot._apply_endpoint_override = MagicMock()
+
+        import ccxt.async_support as ccxt_async
+        import ccxt.pro as ccxt_pro
+
+        rest_ctor = MagicMock()
+        rest_ctor.return_value = MagicMock()
+        rest_ctor.return_value.options = {"brokerId": "CCXT"}
+        ws_ctor = MagicMock()
+        ws_ctor.return_value = MagicMock()
+        ws_ctor.return_value.options = {"brokerId": "CCXT"}
+
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(ccxt_async, "bybit", rest_ctor, raising=False)
+            m.setattr(ccxt_pro, "bybit", ws_ctor, raising=False)
+            bot.create_ccxt_sessions()
+
+        assert bot.cca.options["brokerId"] == "passivbotbybit"
+        assert bot.ccp.options["brokerId"] == "passivbotbybit"
+
+    def test_rejects_missing_broker_code(self):
+        from exchanges.bybit import BybitBot
+
+        bot = BybitBot.__new__(BybitBot)
+        bot.user_info = {"exchange": "bybit", "apiKey": "test"}
+        bot.exchange = "bybit"
+        bot.exchange_ccxt_id = "bybit"
+        bot.ws_enabled = False
+        bot.endpoint_override = None
+        bot.broker_code = ""
+        bot._build_ccxt_config = MagicMock(return_value={"apiKey": "test"})
+        bot._build_ccxt_options = MagicMock(return_value={})
+        bot._apply_endpoint_override = MagicMock()
+
+        import ccxt.async_support as ccxt_async
+
+        rest_ctor = MagicMock()
+        rest_ctor.return_value = MagicMock()
+        rest_ctor.return_value.options = {"brokerId": "CCXT"}
+
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(ccxt_async, "bybit", rest_ctor, raising=False)
+            with pytest.raises(ValueError, match="Bybit broker code"):
+                bot.create_ccxt_sessions()
+
+    def test_ccxt_signed_order_request_contains_passivbot_referer(self):
+        import ccxt
+
+        client = ccxt.bybit({"apiKey": "test_key", "secret": "test_secret"})
+        client.options["brokerId"] = "passivbotbybit"
+
+        signed = client.sign(
+            "v5/order/create",
+            "private",
+            "POST",
+            {
+                "category": "linear",
+                "symbol": "BTCUSDT",
+                "side": "Buy",
+                "orderType": "Limit",
+                "qty": "0.001",
+                "price": "10000",
+            },
+        )
+
+        assert signed["headers"]["Referer"] == "passivbotbybit"
+
+
+class TestBitgetCreateCcxtSessions:
+    """Test Bitget broker attribution during CCXT session creation."""
+
+    def test_sets_passivbot_broker_on_rest_and_ws_clients(self):
+        from exchanges.bitget import BitgetBot
+
+        bot = BitgetBot.__new__(BitgetBot)
+        bot.user_info = {"exchange": "bitget", "apiKey": "test", "options": {"broker": "p4sve"}}
+        bot.exchange = "bitget"
+        bot.exchange_ccxt_id = "bitget"
+        bot.ws_enabled = True
+        bot.endpoint_override = None
+        bot.broker_code = "Passivbot"
+        bot._build_ccxt_config = MagicMock(return_value={"apiKey": "test"})
+        bot._build_ccxt_options = MagicMock(return_value={})
+        bot._apply_endpoint_override = MagicMock()
+
+        import ccxt.async_support as ccxt_async
+        import ccxt.pro as ccxt_pro
+
+        rest_ctor = MagicMock()
+        rest_ctor.return_value = MagicMock()
+        rest_ctor.return_value.options = {"broker": "p4sve"}
+        ws_ctor = MagicMock()
+        ws_ctor.return_value = MagicMock()
+        ws_ctor.return_value.options = {"broker": "p4sve"}
+
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(ccxt_async, "bitget", rest_ctor, raising=False)
+            m.setattr(ccxt_pro, "bitget", ws_ctor, raising=False)
+            bot.create_ccxt_sessions()
+
+        assert bot.cca.options["broker"] == "Passivbot"
+        assert bot.ccp.options["broker"] == "Passivbot"
+
+    def test_rejects_missing_broker_code(self):
+        from exchanges.bitget import BitgetBot
+
+        bot = BitgetBot.__new__(BitgetBot)
+        bot.user_info = {"exchange": "bitget", "apiKey": "test"}
+        bot.exchange = "bitget"
+        bot.exchange_ccxt_id = "bitget"
+        bot.ws_enabled = False
+        bot.endpoint_override = None
+        bot.broker_code = ""
+        bot._build_ccxt_config = MagicMock(return_value={"apiKey": "test"})
+        bot._build_ccxt_options = MagicMock(return_value={})
+        bot._apply_endpoint_override = MagicMock()
+
+        import ccxt.async_support as ccxt_async
+
+        rest_ctor = MagicMock()
+        rest_ctor.return_value = MagicMock()
+        rest_ctor.return_value.options = {"broker": "p4sve"}
+
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(ccxt_async, "bitget", rest_ctor, raising=False)
+            with pytest.raises(ValueError, match="Bitget broker code"):
+                bot.create_ccxt_sessions()
+
+    def test_ccxt_signed_order_request_contains_passivbot_channel_code(self):
+        import ccxt
+
+        client = ccxt.bitget(
+            {"apiKey": "test_key", "secret": "test_secret", "password": "test_passphrase"}
+        )
+        client.options["broker"] = "Passivbot"
+
+        signed = client.sign(
+            "v2/mix/order/place-order",
+            ["private", "mix"],
+            "POST",
+            {
+                "symbol": "BTCUSDT",
+                "productType": "USDT-FUTURES",
+                "marginMode": "crossed",
+                "marginCoin": "USDT",
+                "size": "0.001",
+                "price": "10000",
+                "side": "buy",
+                "orderType": "limit",
+                "force": "gtc",
+            },
+        )
+
+        assert signed["headers"]["X-CHANNEL-API-CODE"] == "Passivbot"
 
 
 class TestValidateWebsocketSupport:
@@ -368,14 +681,21 @@ class TestFetchBalanceHooks:
 
         assert result == 1234.56
 
-    def test_get_balance_returns_zero_when_missing(self, bot_with_mock_cca):
-        """_get_balance should return 0.0 when quote not in total."""
+    def test_get_balance_raises_when_quote_missing(self, bot_with_mock_cca):
+        """_get_balance should fail loudly when quote not in total."""
         bot = bot_with_mock_cca
         fetched = {"total": {"BTC": 0.5}}
 
-        result = bot._get_balance(fetched)
+        with pytest.raises(KeyError, match="missing total\\['USDT'\\]"):
+            bot._get_balance(fetched)
 
-        assert result == 0.0
+    def test_get_balance_raises_when_total_missing(self, bot_with_mock_cca):
+        """_get_balance should fail loudly when total mapping is absent."""
+        bot = bot_with_mock_cca
+        fetched = {"free": {"USDT": 12.0}}
+
+        with pytest.raises(KeyError, match="missing 'total' mapping"):
+            bot._get_balance(fetched)
 
     @pytest.mark.asyncio
     async def test_fetch_balance_uses_hooks(self, bot_with_mock_cca):

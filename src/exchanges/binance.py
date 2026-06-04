@@ -1,18 +1,22 @@
 from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
 from passivbot import logging
+from passivbot_exceptions import FatalBotException
 
 import asyncio
 import random
-from utils import ts_to_date, utc_ms
+import re
+from utils import symbol_to_coin, ts_to_date, utc_ms
 from pure_funcs import flatten
 from procedures import load_broker_code
-from config_utils import require_live_value
+from config.access import require_live_value
 
 
 class BinanceBot(CCXTBot):
     def __init__(self, config: dict):
         super().__init__(config)
         self.custom_id_max_length = 36
+        # Binance fill refresh can take ~15s; wait long enough to avoid closing CCXT mid-request.
+        self._shutdown_execution_grace_seconds = 20.0
 
     def create_ccxt_sessions(self):
         """Binance: Add broker codes after standard setup."""
@@ -68,8 +72,8 @@ class BinanceBot(CCXTBot):
         print(front_pad + "#" * (max_len + 2) + back_pad)
         print("\n\n")
 
-    async def execute_to_exchange(self):
-        res = await super().execute_to_exchange()
+    async def execute_to_exchange(self, *, prepare_cycle: bool = True):
+        res = await super().execute_to_exchange(prepare_cycle=prepare_cycle)
         await self.print_new_user_suggestion()
         return res
 
@@ -87,16 +91,33 @@ class BinanceBot(CCXTBot):
         """Binance: Parse positionrisk response format."""
         positions = []
         for elm in fetched:
-            if float(elm["positionAmt"]) != 0.0:
-                positions.append(
-                    {
-                        "symbol": self.get_symbol_id_inv(elm["symbol"]),
-                        "position_side": elm["positionSide"].lower(),
-                        "size": float(elm["positionAmt"]),
-                        "price": float(elm["entryPrice"]),
-                    }
-                )
+            size = float(elm["positionAmt"])
+            if size != 0.0:
+                raw_symbol = str(elm["symbol"])
+                if self._raw_symbol_is_dated_future(raw_symbol):
+                    raise FatalBotException(
+                        "Unsupported dated futures position detected on Binance: "
+                        f"{raw_symbol}. Passivbot live supports perpetual swaps; close this "
+                        "dated futures position before starting the bot."
+                    )
+                normalized = {
+                    "symbol": self.get_symbol_id_inv(raw_symbol),
+                    "position_side": elm["positionSide"].lower(),
+                    "size": size,
+                    "price": float(elm["entryPrice"]),
+                }
+                margin_mode = self._extract_live_margin_mode(elm)
+                if margin_mode is not None:
+                    normalized["margin_mode"] = margin_mode
+                    self._record_live_margin_mode(normalized["symbol"], margin_mode)
+                positions.append(normalized)
         return positions
+
+    def _raw_symbol_is_dated_future(self, raw_symbol: str) -> bool:
+        for market in (getattr(self, "markets_dict", {}) or {}).values():
+            if str(market.get("id") or "") == raw_symbol:
+                return self._market_has_settlement_date(market)
+        return bool(re.search(r"_\d{6}$", raw_symbol))
 
     def _get_balance(self, fetched: dict) -> float:
         """Binance uses totalCrossWalletBalance in info."""
@@ -104,7 +125,7 @@ class BinanceBot(CCXTBot):
 
     # ═══════════════════ BINANCE-SPECIFIC METHODS ═══════════════════
 
-    async def fetch_open_orders(self, symbol: str = None, all=False) -> list:
+    async def _do_fetch_open_orders(self, symbol: str = None, all=False) -> list:
         """Binance: Parallel fetch per-symbol to avoid expensive all-symbols query."""
         if all:
             self.cca.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
@@ -112,29 +133,134 @@ class BinanceBot(CCXTBot):
             fetched = await self.cca.fetch_open_orders()
             self.cca.options["warnOnFetchOpenOrdersWithoutSymbol"] = True
         else:
-            symbols_ = set()
-            symbols_.update([s for s in self.open_orders if self.open_orders[s]])
-            symbols_.update([s for s in self.get_symbols_with_pos()])
-            if hasattr(self, "active_symbols") and self.active_symbols:
-                symbols_.update(list(self.active_symbols))
-            results = await asyncio.gather(
-                *[self.cca.fetch_open_orders(symbol=s) for s in sorted(symbols_)]
-            )
-            fetched = [x for sublist in results for x in sublist]
+            symbols_ = {symbol} if symbol is not None else self._select_open_order_symbols()
+            fetched = await self._do_fetch_open_orders_for_symbols(symbols_)
+        return fetched
 
+    def _select_open_order_symbols(
+        self,
+        extra_symbols: set[str] | list[str] | tuple[str, ...] | None = None,
+        *,
+        include_approved_if_unseeded: bool = False,
+    ) -> set[str]:
+        symbols_ = set()
+        symbols_.update([s for s in self.open_orders if self.open_orders[s]])
+        symbols_.update([s for s in self.get_symbols_with_pos()])
+        if hasattr(self, "active_symbols") and self.active_symbols:
+            symbols_.update(list(self.active_symbols))
+        if extra_symbols:
+            symbols_.update(extra_symbols)
+        if include_approved_if_unseeded and not symbols_:
+            for side_symbols in getattr(self, "approved_coins_minus_ignored_coins", {}).values():
+                symbols_.update(side_symbols)
+        markets = getattr(self, "markets_dict", {}) or {}
+        if markets:
+            symbols_ = {s for s in symbols_ if s in markets}
+        return symbols_
+
+    async def _do_fetch_open_orders_for_symbols(self, symbols: set[str]) -> list:
+        if not symbols:
+            return []
+        results = await asyncio.gather(
+            *[self.cca.fetch_open_orders(symbol=s) for s in sorted(symbols)]
+        )
+        return [x for sublist in results for x in sublist]
+
+    def _normalize_open_orders(self, fetched: list) -> list:
         open_orders = {}
         for elm in fetched:
+            raw_symbol = str(elm.get("info", {}).get("symbol") or "")
+            if raw_symbol and self._raw_symbol_is_dated_future(raw_symbol):
+                raise FatalBotException(
+                    "Unsupported dated futures open order detected on Binance: "
+                    f"{raw_symbol}. Passivbot live supports perpetual swaps; cancel this "
+                    "dated futures order before starting the bot."
+                )
             elm["position_side"] = elm["info"]["positionSide"].lower()
             elm["qty"] = elm["amount"]
+            self._record_live_margin_mode_from_payload(elm)
             open_orders[elm["id"]] = elm
         return sorted(open_orders.values(), key=lambda x: x["timestamp"])
+
+    async def fetch_open_orders(self, symbol: str = None, all=False) -> list:
+        fetched = await self._do_fetch_open_orders(symbol=symbol, all=all)
+        return self._normalize_open_orders(fetched)
+
+    async def capture_authoritative_state_staged_snapshot(
+        self, plan: set[str], timings_ms: dict[str, int]
+    ) -> dict | None:
+        """Fetch Binance positions before open orders so symbol-scoped order fetches are seeded.
+
+        Binance open-order fetching intentionally avoids the expensive all-symbols endpoint.
+        The generic staged path fetches positions and open orders concurrently, which means
+        Binance's symbol selection can see stale local positions during startup. Sequence this
+        exchange-specific surface pair while keeping independent balance/fill fetches parallel.
+        """
+        if "open_orders" not in plan or "positions" not in plan:
+            return None
+
+        out = {"plan": set(plan), "pnls_ok": True}
+        tasks = {}
+        if "balance" in plan:
+            tasks["balance"] = asyncio.create_task(
+                self._timed_authoritative_fetch(
+                    "balance", self.capture_balance_snapshot(), timings_ms
+                )
+            )
+        tasks["positions"] = asyncio.create_task(
+            self._timed_authoritative_fetch(
+                "positions", self.capture_positions_snapshot(), timings_ms
+            )
+        )
+        try:
+            _raw_positions, positions = await tasks["positions"]
+            out["positions"] = positions
+            symbols = self._select_open_order_symbols(
+                [position["symbol"] for position in positions],
+                include_approved_if_unseeded=True,
+            )
+            out["open_orders"] = await self._timed_authoritative_fetch(
+                "open_orders",
+                self._fetch_open_orders_for_staged_symbols(symbols),
+                timings_ms,
+            )
+            if "fills" in plan:
+                position_symbols = {position["symbol"] for position in positions}
+                open_order_symbols = {order["symbol"] for order in out.get("open_orders", [])}
+                self._fill_symbol_scope = sorted(position_symbols | open_order_symbols)
+                try:
+                    out["pnls_ok"] = await self._timed_authoritative_fetch(
+                        "fills", self.update_pnls(source="staged_blocking"), timings_ms
+                    )
+                finally:
+                    try:
+                        delattr(self, "_fill_symbol_scope")
+                    except AttributeError:
+                        pass
+            if "balance" in tasks:
+                _raw_balance, balance = await tasks["balance"]
+                out["balance"] = balance
+            return out
+        except Exception:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            raise
+
+    async def _fetch_open_orders_for_staged_symbols(self, symbols: set[str]) -> list:
+        fetched = await self._do_fetch_open_orders_for_symbols(symbols)
+        return self._normalize_open_orders(fetched)
 
     async def fetch_tickers(self) -> dict:
         """Binance: Use bookticker endpoint for efficiency."""
         fetched = await self.cca.fapipublic_get_ticker_bookticker()
         tickers = {}
         for elm in fetched:
-            symbol = self.get_symbol_id_inv(elm["symbol"])
+            raw_symbol = str(elm["symbol"])
+            if self._raw_symbol_is_dated_future(raw_symbol):
+                continue
+            symbol = self.get_symbol_id_inv(raw_symbol)
             if symbol in self.markets_dict:
                 bid = float(elm["bidPrice"])
                 ask = float(elm["askPrice"])
@@ -353,51 +479,41 @@ class BinanceBot(CCXTBot):
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call_lev, coros_to_call_margin_mode = {}, {}
         for symbol in symbols:
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
             coros_to_call_margin_mode[symbol] = asyncio.create_task(
-                self.cca.set_margin_mode("cross", symbol=symbol)
+                self.cca.set_margin_mode(margin_mode, symbol=symbol)
             )
             coros_to_call_lev[symbol] = asyncio.create_task(
                 self.cca.set_leverage(
-                    int(self.config_get(["live", "leverage"], symbol=symbol)), symbol=symbol
+                    self._calc_leverage_for_symbol(symbol), symbol=symbol
                 )
             )
         for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             res = None
             to_print = ""
             try:
                 res = await coros_to_call_lev[symbol]
                 to_print += f"leverage={format_exchange_config_response(res)} "
             except Exception as e:
-                logging.error(f"{symbol}: error setting leverage {e}")
+                logging.error(f"{log_symbol}: error setting leverage {e}")
             try:
                 res_margin = await coros_to_call_margin_mode[symbol]
                 to_print += f"margin={format_exchange_config_response(res_margin)}"
             except Exception as e:
-                logging.error(f"{symbol}: error setting cross mode {e}")
+                logging.error(f"{log_symbol}: error setting cross mode {e}")
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{log_symbol}: {to_print}")
 
     async def update_exchange_config(self):
         try:
             res = await self.cca.set_position_mode(True)
-            logging.info(f"set hedge mode {res}")
+            logging.debug("[config] set hedge mode response: %s", res)
         except Exception as e:
             if '"code":-4059' in str(e):
-                logging.info(f"hedge mode: {e}")
+                logging.debug("[config] hedge mode unchanged: %s", e)
             else:
-                logging.error(f"error setting hedge mode {e}")
-
-    async def determine_utc_offset(self, verbose=True):
-        # returns millis to add to utc to get exchange timestamp
-        # call some endpoint which includes timestamp for exchange's server
-        # if timestamp is not included in self.cca.fetch_balance(),
-        # implement method in exchange child class
-        result = await self.cca.fetch_ticker("BTC/USDT:USDT")
-        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
-            1000 * 60 * 60
-        )
-        if verbose:
-            logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
+                logging.error("[config] error setting hedge mode: %s", e)
 
     def format_custom_id_single(self, order_type_id: int) -> str:
         formatted = super().format_custom_id_single(order_type_id)
