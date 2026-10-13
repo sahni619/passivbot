@@ -28,7 +28,7 @@ class BinancePortfolioBot(BinanceBot):
     _normalize_positions / _build_order_params / order-fill parsing are reused
     unchanged below.
 
-    Three things ccxt does NOT bridge, all overridden below:
+    Four things ccxt does NOT bridge, all overridden below:
     - set_margin_mode has no papi branch at all (PM risk is unified account-wide;
       there is no per-symbol isolated/cross toggle to set). update_exchange_config_by_symbols
       drops the set_margin_mode call and keeps only set_leverage.
@@ -39,32 +39,55 @@ class BinancePortfolioBot(BinanceBot):
       fetch_position_mode() as a startup safety gate and raises if it doesn't report
       hedged mode; inheriting it unchanged would check the wrong account state on a
       PM account and could either falsely block startup or falsely pass. Overridden
-      below to call the raw papi* endpoint directly.
-    - _get_balance: regular futures reads a single info.totalCrossWalletBalance
-      field; PM's papiGetBalance returns one entry per collateral asset instead.
+      below to call the raw papi* endpoint directly. Confirmed against a real PM
+      test account: the endpoint works and returns the expected dualSidePosition
+      field, currently false (one-way mode) on that fresh account.
+    - _get_balance / _do_fetch_balance: confirmed as a REAL BUG against a real PM
+      test account, not just inferred. ccxt's unified fetch_balance() resolves
+      `type` to 'linear' (passivbot sets defaultType=swap; binanceusdm defaults
+      defaultSubType=linear), which makes parse_balance_custom's PM branch read
+      only umWalletBalance/umUnrealizedPNL into total[quote] -- the UM-futures
+      sub-ledger, not overall usable PM collateral. Live capture: an account with
+      $500 of real, transferred-in collateral showed fetch_balance()'s
+      total["USDT"] as exactly 0.0 (umWalletBalance was 0, nothing had been
+      allocated to UM trading yet), while the SAME account's raw info showed
+      crossMarginFree=500 and papiGetAccount()'s accountEquity=499.32. The original
+      version of this class read fetch_balance()'s total[quote] directly and would
+      have treated this account as having zero balance. Fixed below by calling
+      papiGetAccount() directly instead (same shape of fix as OKX's totalEq-based
+      _get_balance -- a single, precomputed, account-wide equity figure).
+    - _normalize_balance_diagnostics (inherited from BinanceBot) assumes
+      fetch_balance()'s ccxt-unified total/free/used shape; since _do_fetch_balance
+      now returns papiGetAccount()'s raw shape instead, that diagnostics hook will
+      report "malformed/missing_total" for PM accounts. This is a monitoring-only
+      cosmetic gap, not a trading-correctness issue (nothing in the strategy path
+      reads it) -- left as a known gap rather than reworked, to keep this change
+      scoped to what actually affects trading.
 
-    NOT YET VALIDATED AGAINST A REAL PM ACCOUNT. Everything above is grounded in
-    ccxt's own source and response-shape comments, not a live capture -- this is a
-    structurally-complete first draft per the design doc's rollout plan, not
-    merge-ready. Specifically still open:
+    NOT YET FULLY VALIDATED. Live-tested against a real (currently flat,
+    zero-position) PM test sub-account: load_markets, papiGetBalance,
+    fetch_positions_risk, papiGetUmPositionSideDual, and papiGetAccount all
+    confirmed working with real data. Specifically still open:
     1. fetch_positions_risk() calls self.load_leverage_brackets() before issuing the
        request; whether that sub-call behaves correctly (or is even meaningful) for
        a PM account is unverified.
-    2. _get_balance below handles single quote-asset collateral (e.g. pure USDT
-       margin) correctly, but does NOT convert other collateral assets (e.g. BTC
-       held as cross-asset collateral) into quote terms the way OKX's
-       `_get_balance` (totalEq minus summed upl) does.
+    2. _get_balance now reads papiGetAccount()'s accountEquity field. On the one
+       real account tested, accountEquity (499.32) and actualEquity (499.37)
+       differed slightly, and the account was flat (zero positions, no unrealized
+       PnL) at the time, so there's no way yet to confirm which field does/doesn't
+       include uPNL. Regular BinanceBot's _get_balance deliberately excludes uPNL
+       (totalCrossWalletBalance); accountEquity is the closer-named match to that
+       convention, but re-confirm once the test account has an open position with
+       real floating PnL -- whichever field stays flat as uPNL moves is the
+       uPNL-excluded one.
     3. Whether PM's "margin mode / hedge mode already set" case returns the same
        error code BinanceBot already handles (-4059 for hedge mode via the inherited
        update_exchange_config; MarginModeAlreadySet is skipped entirely here rather
        than assumed) is unverified -- if PM uses a different code, update_exchange_config
        could raise on every restart once hedge mode is already correctly set.
-    4. _prepare_protective_account's exact response field name (dualSidePosition) for
-       the papi endpoint is inferred from the regular endpoint's shape, not captured.
-    5. No real papi balance/position/order response has been captured against this
-       code. Per the design doc's Testing & Rollout section, do that via
-       ccxt_contracts fixture capture against a real small-capital PM sub-account
-       before any of this touches meaningful capital.
+    4. No order placement/cancellation has been tested against the real account yet
+       (read-only validation only, deliberately -- no leverage/order changes were
+       made to real capital during this round of testing).
     """
 
     def __init__(self, config: dict):
@@ -93,22 +116,27 @@ class BinancePortfolioBot(BinanceBot):
         BinanceBot._normalize_positions handles it unchanged."""
         return await self.cca.fetch_positions_risk()
 
-    def _get_balance(self, fetched: dict) -> float:
-        """PM: papiGetBalance returns one entry per collateral asset rather than a
-        single account-wide field. ccxt's parse_balance_custom already folds each
-        asset's own wallet balance plus UM/CM unrealized PnL into
-        fetched["total"][asset_code]; read the quote asset's own entry.
+    async def _do_fetch_balance(self) -> dict:
+        """PM: call papiGetAccount() directly rather than ccxt's unified
+        fetch_balance() -- see class docstring for the confirmed-real bug this
+        avoids (fetch_balance()'s total[quote] read as 0 against a real account
+        with real collateral)."""
+        return await self.cca.papiGetAccount()
 
-        Known gap (see class docstring): this does not convert non-quote collateral
-        assets into quote terms. Correct for quote-only collateral; not yet correct
-        for true multi-asset-collateral PM accounts.
+    def _get_balance(self, fetched: dict) -> float:
+        """PM: papiGetAccount()'s accountEquity field -- a single, precomputed,
+        account-wide equity figure, confirmed against a real account. See class
+        docstring Open Item 2 for the still-unresolved accountEquity vs
+        actualEquity question.
+
+        Known gap: this is a single account-wide number by construction, so it
+        already handles multi-asset collateral correctly (unlike reading a single
+        asset's entry from papiGetBalance would) -- this resolves what was
+        previously flagged as an open gap for BTC-collateral-style accounts.
         """
-        total = fetched.get("total")
-        if not isinstance(total, dict) or self.quote not in total:
-            raise KeyError(
-                f"{self.exchange}: fetch_balance response missing total[{self.quote!r}]"
-            )
-        return float(total[self.quote])
+        if "accountEquity" not in fetched:
+            raise KeyError(f"{self.exchange}: papiGetAccount response missing accountEquity")
+        return float(fetched["accountEquity"])
 
     async def update_exchange_config_by_symbols(self, symbols):
         """PM: no per-symbol margin-mode toggle exists -- risk is unified account-wide,
