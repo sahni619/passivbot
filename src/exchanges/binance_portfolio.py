@@ -83,6 +83,13 @@ class BinancePortfolioBot(BinanceBot):
       (This was caught when a test harness manually added reduceOnly on top of the
       real method's output to test a close; removing it and using the real,
       unmodified output closed the position correctly.)
+    - Limit orders + cancellation: confirmed. Placed a real GTC limit sell
+      (positionSide=SHORT, timeInForce=GTC via _build_order_params's limit
+      branch) 5% above market via the exact real execute_order() param
+      structure; confirmed it appeared in fetch_open_orders; cancelled it via
+      the exact real execute_cancellation() structure (cca.cancel_order(id,
+      symbol=symbol)); confirmed it was gone and no position was left open
+      (order was priced to never fill -- zero market exposure during this test).
 
     Still open, in order of what's left:
     1. fetch_positions_risk()'s internal load_leverage_brackets() sub-call has run
@@ -97,10 +104,7 @@ class BinancePortfolioBot(BinanceBot):
        again once already in hedge mode) returns the same -4059 code BinanceBot
        already handles is still unverified -- only a one-way-to-hedge transition
        has been tested, not a hedge-to-hedge no-op call.
-    4. Order placement has only been tested for plain market orders with
-       positionSide set; limit orders (timeInForce branch in _build_order_params)
-       and cancellation have not been live-tested yet.
-    5. All live testing used a direct, faithful-copy harness of the real method
+    4. All live testing used a direct, faithful-copy harness of the real method
        bodies (see test history), not a full instantiated BinancePortfolioBot --
        full passivbot.py cannot be imported in arbitrary environments without its
        compiled Rust extension and polars, so this was the closest practical
