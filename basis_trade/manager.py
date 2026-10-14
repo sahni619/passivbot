@@ -63,18 +63,81 @@ def unimmr_tier(cfg: BasisTradeConfig, unimmr: float) -> str:
     return "normal"
 
 
-def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, target_notional: float):
+RECONCILE_MIN_NOTIONAL = 10.0  # matches resize_coin's own min-worth-a-round-trip floor
+
+
+def reconcile_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState) -> bool:
+    """If a previous pass crashed between the spot and perp legs of resize_coin (confirmed
+    live: a post-only reject partway through left spot bought with the matching perp short
+    never placed), the two legs can be left at different notionals with no automatic path
+    back to delta-neutral -- the normal target-vs-current-spot delta in resize_coin only
+    reacts to the TARGET, not to this kind of divergence, so it would never close on its
+    own. Always pulls the AHEAD leg down to match the LAGGING leg (never grows either leg),
+    so calling this every pass can only shrink mismatch, never add net exposure. Returns
+    whether any correction was placed, so the caller knows to re-read state afterward."""
+    divergence = state.spot_notional - state.perp_notional
+    threshold = max(RECONCILE_MIN_NOTIONAL, DELTA_NEUTRALITY_WARN_PCT * max(state.spot_notional, state.perp_notional))
+    if abs(divergence) <= threshold or state.price <= 0:
+        return False
+
+    spot_symbol = f"{state.coin}/{cfg.quote}"
+    perp_symbol = f"{state.coin}/{cfg.quote}:{cfg.quote}"
+    kwargs = dict(
+        reprice_interval_seconds=cfg.reprice_interval_seconds,
+        timeout_minutes=cfg.timeout_minutes,
+        book_depth_levels=cfg.book_depth_levels,
+        max_book_participation_pct=cfg.max_book_participation_pct,
+        dry_run=cfg.dry_run,
+    )
+    if divergence > 0:
+        qty = min(divergence / state.price, ex.spot_holding(state.coin))
+        if qty <= 0:
+            return False
+        place_and_fill_maker_first(ex.spot, spot_symbol, "sell", qty, **kwargs)
+        print(f"[RECONCILE] {state.coin}: sold back ${divergence:,.2f} of unhedged excess spot")
+    else:
+        pos = ex.perp_position(perp_symbol)
+        shortable = abs(pos["qty"]) if pos else 0.0
+        qty = min(abs(divergence) / state.price, shortable)
+        if qty <= 0:
+            return False
+        place_and_fill_maker_first(ex.perp, perp_symbol, "buy", qty,
+                                    order_params={"positionSide": "SHORT"}, **kwargs)
+        print(f"[RECONCILE] {state.coin}: bought back ${abs(divergence):,.2f} of excess short")
+    return True
+
+
+def _min_amount(market: dict) -> float:
+    return float(market.get("limits", {}).get("amount", {}).get("min") or 0.0)
+
+
+def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, target_notional: float) -> bool:
     """Moves one coin's spot+perp pair from its current notional to target_notional.
     Opens the spot leg before the perp leg when increasing (matches the order validated
     live), and the perp leg before the spot leg when decreasing -- close the short first
-    so the position is never net-long with no hedge, even transiently."""
+    so the position is never net-long with no hedge, even transiently. Returns whether it
+    actually placed anything, so callers can log what really happened rather than assuming
+    every call resized."""
     spot_symbol = f"{state.coin}/{cfg.quote}"
     perp_symbol = f"{state.coin}/{cfg.quote}:{cfg.quote}"
     delta_notional = target_notional - state.spot_notional
     if abs(delta_notional) < max(10.0, 0.01 * max(target_notional, state.spot_notional)):
-        return  # below min-notional / not worth a round trip
+        return False  # below min-notional / not worth a round trip
 
     qty_delta = abs(delta_notional) / state.price
+
+    if delta_notional > 0:
+        # Perp futures markets commonly use a coarser minimum lot size than the matching
+        # spot market (confirmed live: BTC/USDT:USDT requires >=0.001 BTC while BTC/USDT
+        # spot allows 0.00001) -- a target too small to satisfy the PERP leg's minimum
+        # can never be hedged, no matter how many times it's retried. Checked before
+        # touching either leg so a too-small target never buys spot it can't hedge.
+        perp_min_qty = _min_amount(ex.perp.market(perp_symbol))
+        if qty_delta < perp_min_qty:
+            print(f"[SKIP] {state.coin}: target increase {qty_delta:.6f} is below the perp "
+                  f"market's minimum tradable amount {perp_min_qty:.6f} -- cannot be hedged "
+                  f"at this account size, not opening either leg")
+            return False
     kwargs = dict(
         reprice_interval_seconds=cfg.reprice_interval_seconds,
         timeout_minutes=cfg.timeout_minutes,
@@ -92,6 +155,7 @@ def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, ta
         place_and_fill_maker_first(ex.spot, spot_symbol, "buy", qty_delta, **kwargs)
         place_and_fill_maker_first(ex.perp, perp_symbol, "sell", qty_delta,
                                     order_params={"positionSide": "SHORT"}, **kwargs)
+        return True
     else:
         # decreasing exposure: close the short first, then sell the now-unhedged spot.
         # Spot qty is read fresh (not assumed from nominal target) -- trading fees are
@@ -100,13 +164,14 @@ def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, ta
         actual_spot_qty = ex.spot_holding(state.coin)
         close_qty = min(qty_delta, actual_spot_qty, abs(state.perp_qty))
         if close_qty <= 0:
-            return
+            return False
         place_and_fill_maker_first(ex.perp, perp_symbol, "buy", close_qty,
                                     order_params={"positionSide": "SHORT"}, **kwargs)
         # re-read: a market/taker fallback on the perp leg settles near-instantly, but a
         # maker-first spot close should only ever sell what's confirmed free right now
         sellable = ex.spot_holding(state.coin)
         place_and_fill_maker_first(ex.spot, spot_symbol, "sell", min(close_qty, sellable), **kwargs)
+        return True
 
 
 def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
@@ -118,6 +183,10 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
     all_coins = list(cfg.coins.keys())
 
     states = {c: read_coin_state(ex, c, cfg.quote) for c in all_coins}
+    reconciled = [c for c in all_coins if reconcile_coin(ex, cfg, states[c])]
+    if reconciled:
+        states = {c: read_coin_state(ex, c, cfg.quote) for c in all_coins}
+
     total_current_notional = sum(s.spot_notional for s in states.values())
     current_pct = (total_current_notional / equity) if equity > 0 else 0.0
 
@@ -127,7 +196,7 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
         "unimmr_tier": tier,
         "current_exposure_pct": current_pct,
         "band": (cfg.min_exposure_pct, cfg.max_exposure_pct),
-        "actions": [],
+        "actions": [f"{c}: reconciled spot/perp divergence" for c in reconciled],
     }
 
     # uniMMR emergency tier overrides everything else, including the master enable
@@ -163,7 +232,8 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
             target = min(total_target_notional * weight, states[coin].spot_notional)
             resize_coin(ex, cfg, states[coin], target)
         report["actions"].append(
-            f"DERISK: uniMMR={unimmr:.3f} <= {cfg.unimmr_derisk} -- reduced toward band floor"
+            f"DERISK: uniMMR={unimmr:.3f} <= {cfg.unimmr_derisk} -- reduced toward band floor "
+            "(per-coin skips, if any, logged separately above)"
         )
         return report
 
@@ -183,7 +253,8 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
                 f"{coin}: skipped increase (uniMMR={unimmr:.3f} in caution tier)"
             )
             continue
-        resize_coin(ex, cfg, states[coin], target)
-        report["actions"].append(f"{coin}: resized toward ${target:,.2f} (was ${states[coin].spot_notional:,.2f})")
+        acted = resize_coin(ex, cfg, states[coin], target)
+        if acted:
+            report["actions"].append(f"{coin}: resized toward ${target:,.2f} (was ${states[coin].spot_notional:,.2f})")
 
     return report

@@ -15,11 +15,26 @@ what would have been placed (including the depth/slicing decision) and returns i
 """
 import time
 
+import ccxt
+
 
 def _round_to_tick(price: float, tick_size: float) -> float:
     if not tick_size:
         return price
     return round(round(price / tick_size) * tick_size, 10)
+
+
+def _safe_maker_price(side: str, best_bid: float, best_ask: float, tick_size: float) -> float:
+    """Posting exactly at best_bid/best_ask leaves zero margin: if the book ticks against
+    us in the round-trip between fetching it and the order reaching the exchange, Binance
+    rejects the post-only order as immediately fillable (confirmed live on a real BTC/USDT
+    order during real-account testing). Backing off one extra tick from the opposing side
+    gives a one-tick buffer against that race, at the cost of being one tick less
+    aggressive as a maker."""
+    step = tick_size or 0.0
+    if side == "buy":
+        return _round_to_tick(min(best_bid, best_ask - step), tick_size)
+    return _round_to_tick(max(best_ask, best_bid + step), tick_size)
 
 
 def estimate_depth_notional(book: dict, side: str, levels: int) -> float:
@@ -66,11 +81,16 @@ def place_and_fill_maker_first(
     order_params = dict(order_params or {})
     market = ex.market(symbol)
     tick_size = market.get("precision", {}).get("price")
+    # A dust remainder below the exchange's minimum tradable amount can never be placed
+    # as its own order (confirmed live: a 0.000009 BTC leftover after a partial fill hit
+    # Binance's InvalidOrder for being under the 0.00001 minimum) -- treat it as filled
+    # rather than retrying it forever or crashing the pass.
+    min_amount = (market.get("limits", {}).get("amount", {}).get("min") or 0.0)
 
     if dry_run:
         book = ex.fetch_order_book(symbol, limit=book_depth_levels)
         best_bid, best_ask = book["bids"][0][0], book["asks"][0][0]
-        price = _round_to_tick(best_bid if side == "buy" else best_ask, tick_size)
+        price = _safe_maker_price(side, best_bid, best_ask, tick_size)
         depth_notional = estimate_depth_notional(book, side, book_depth_levels)
         slice_qty = size_slice_for_depth(qty, price, depth_notional, max_book_participation_pct)
         print(f"[DRY RUN] would place post-only {side} {qty} {symbol} @ ~{price} "
@@ -85,10 +105,10 @@ def place_and_fill_maker_first(
     order_id = None
     deadline = time.time() + timeout_minutes * 60
 
-    while remaining > 1e-9 and time.time() < deadline:
+    while remaining > max(1e-9, min_amount) and time.time() < deadline:
         book = ex.fetch_order_book(symbol, limit=book_depth_levels)
         best_bid, best_ask = book["bids"][0][0], book["asks"][0][0]
-        price = _round_to_tick(best_bid if side == "buy" else best_ask, tick_size)
+        price = _safe_maker_price(side, best_bid, best_ask, tick_size)
         depth_notional = estimate_depth_notional(book, side, book_depth_levels)
         slice_qty = size_slice_for_depth(remaining, price, depth_notional, max_book_participation_pct)
         _log_depth(symbol, side, remaining, price, depth_notional, slice_qty)
@@ -98,9 +118,17 @@ def place_and_fill_maker_first(
                 ex.cancel_order(order_id, symbol)
             except Exception:
                 pass  # may have already filled or been cancelled -- next fetch_order confirms which
+            order_id = None
 
         params = {**order_params, "postOnly": True}
-        order = ex.create_order(symbol, "limit", side, slice_qty, price, params=params)
+        try:
+            order = ex.create_order(symbol, "limit", side, slice_qty, price, params=params)
+        except ccxt.OrderImmediatelyFillable:
+            # Book moved between fetch and submit despite the one-tick buffer above --
+            # Binance never placed the order, so there is nothing to cancel. Just loop
+            # around and reprice off a fresh book rather than aborting the whole pass.
+            print(f"[REPRICE] {symbol} {side}: post-only would have crossed, refreshing book")
+            continue
         order_id = order["id"]
         time.sleep(reprice_interval_seconds)
 
@@ -113,7 +141,7 @@ def place_and_fill_maker_first(
         remaining = qty - filled_qty
 
     taker_fallback = False
-    if remaining > 1e-9:
+    if remaining > max(1e-9, min_amount):
         taker_fallback = True
         if order_id is not None:
             try:

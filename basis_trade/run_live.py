@@ -29,6 +29,10 @@ def main():
     parser.add_argument("--min-exposure-pct", type=float, default=0.10)
     parser.add_argument("--max-exposure-pct", type=float, default=0.15)
     parser.add_argument("--disabled", action="store_true", help="master switch off: unwind everything")
+    parser.add_argument("--timeout-minutes", type=float, default=45.0,
+                         help="maker-first timeout before taker fallback, per order slice")
+    parser.add_argument("--reprice-interval-seconds", type=float, default=60.0)
+    parser.add_argument("--leverage", type=int, default=10)
     args = parser.parse_args()
 
     cfg = BasisTradeConfig(
@@ -37,6 +41,9 @@ def main():
         target_exposure_pct=args.target_exposure_pct,
         min_exposure_pct=args.min_exposure_pct,
         max_exposure_pct=args.max_exposure_pct,
+        timeout_minutes=args.timeout_minutes,
+        reprice_interval_seconds=args.reprice_interval_seconds,
+        leverage=args.leverage,
         dry_run=not args.live,
     )
     ex = PMBasisExchange(args.account_label)
