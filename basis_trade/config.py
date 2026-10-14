@@ -33,10 +33,21 @@ class BasisTradeConfig:
     coins: dict = field(default_factory=lambda: {
         "BTC": CoinConfig(enabled=True, weight=0.40),
         "ETH": CoinConfig(enabled=True, weight=0.35),
-        # SOL's economics under this always-on approach are unconfirmed (only BTC/ETH
-        # were backtested with always-on specifically) -- enabled here per the original
-        # 3-coin scope, but worth validating against real data before sizing it up.
-        "SOL": CoinConfig(enabled=True, weight=0.25),
+        # Disabled 2026-10-14: real 2yr Binance funding history showed SOL averaging only
+        # 1.20% annualized (2yr) and -0.52% over the trailing 365d -- weaker and less
+        # consistent than LINK below. Left in the dict (not deleted) so the disabled-coin
+        # unwind path (manager.py) closes out any existing SOL position cleanly rather than
+        # orphaning it.
+        "SOL": CoinConfig(enabled=False, weight=0.25),
+        # Added 2026-10-14, replacing SOL: real 2yr Binance funding history showed LINK
+        # averaging 6.17% annualized (2yr), 4.61% (365d), consistently positive across every
+        # window checked (negative only ~19% of periods, vs SOL's ~39%) -- better and more
+        # consistent than either BTC or ETH, not just a recent hot streak. NOTE: LINK perp's
+        # $20 MIN_NOTIONAL means this weight's target allocation won't actually open until
+        # account equity clears roughly weight * target_exposure_pct * equity >= $20 (same
+        # kind of per-coin minimum-lot constraint BTC already hits at small scale) --
+        # resize_coin's pre-check already handles this gracefully (skips, doesn't crash).
+        "LINK": CoinConfig(enabled=True, weight=0.25),
     })
 
     quote: str = "USDT"

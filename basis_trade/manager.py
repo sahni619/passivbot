@@ -111,6 +111,10 @@ def _min_amount(market: dict) -> float:
     return float(market.get("limits", {}).get("amount", {}).get("min") or 0.0)
 
 
+def _min_cost(market: dict) -> float:
+    return float(market.get("limits", {}).get("cost", {}).get("min") or 0.0)
+
+
 def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, target_notional: float) -> bool:
     """Moves one coin's spot+perp pair from its current notional to target_notional.
     Opens the spot leg before the perp leg when increasing (matches the order validated
@@ -127,16 +131,24 @@ def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, ta
     qty_delta = abs(delta_notional) / state.price
 
     if delta_notional > 0:
-        # Perp futures markets commonly use a coarser minimum lot size than the matching
-        # spot market (confirmed live: BTC/USDT:USDT requires >=0.001 BTC while BTC/USDT
-        # spot allows 0.00001) -- a target too small to satisfy the PERP leg's minimum
-        # can never be hedged, no matter how many times it's retried. Checked before
-        # touching either leg so a too-small target never buys spot it can't hedge.
-        perp_min_qty = _min_amount(ex.perp.market(perp_symbol))
-        if qty_delta < perp_min_qty:
-            print(f"[SKIP] {state.coin}: target increase {qty_delta:.6f} is below the perp "
-                  f"market's minimum tradable amount {perp_min_qty:.6f} -- cannot be hedged "
-                  f"at this account size, not opening either leg")
+        # Perp futures markets commonly impose a coarser floor than the matching spot
+        # market, via TWO INDEPENDENT filter types: a minimum quantity (LOT_SIZE -- e.g.
+        # BTC/USDT:USDT requires >=0.001 BTC while BTC/USDT spot allows 0.00001) and,
+        # separately, a minimum notional (MIN_NOTIONAL -- e.g. LINK/USDT:USDT rejected a
+        # real $15.44 order live with "notional must be greater than 20" despite the
+        # quantity itself clearing LOT_SIZE fine). A target too small for EITHER can never
+        # be hedged, no matter how many times it's retried -- checked before touching
+        # either leg so a too-small target never buys spot it can't hedge. Confirmed live:
+        # before this covered both filter types, LINK's MIN_NOTIONAL case slipped through,
+        # bought spot, failed to hedge, and only got caught by the fault-isolation
+        # reconcile fallback -- safe, but an avoidable extra round-trip of real fees.
+        perp_market = ex.perp.market(perp_symbol)
+        perp_min_qty = _min_amount(perp_market)
+        perp_min_notional = max(perp_min_qty * state.price, _min_cost(perp_market))
+        if abs(delta_notional) < perp_min_notional:
+            print(f"[SKIP] {state.coin}: target increase ${abs(delta_notional):,.2f} is below "
+                  f"the perp market's minimum tradable notional ${perp_min_notional:,.2f} -- "
+                  f"cannot be hedged at this account size, not opening either leg")
             return False
     kwargs = dict(
         reprice_interval_seconds=cfg.reprice_interval_seconds,
