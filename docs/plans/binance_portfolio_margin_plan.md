@@ -182,20 +182,38 @@ Resolved by reading ccxt's own source rather than guessing (no longer open):
   how `exchanges/` already handles every other exchange variant. Keeps the regular
   futures path's diff surface at zero.
 
-Still genuinely open (need a real account, not more reading):
+Resolved with a real account (a small-capital PM sub-account was stood up
+specifically for this — see Testing & Rollout below):
 
-1. Whether `fetch_positions_risk()`'s internal `self.load_leverage_brackets()` call
-   (made before issuing the request, in both the regular and PM branches) behaves
-   correctly — or is even meaningful — for a PM account. Unverified.
-2. `_get_balance`'s handling of *multi-asset* collateral (e.g. BTC posted as margin
-   rather than USDT). Current implementation only correctly sums the quote asset's own
-   entry; a true cross-asset equity calculation (OKX's `totalEq`-style) would need a
-   real multi-asset PM account to build and verify against.
-3. Any existing internal PM testing account/sandbox, or do we need to stand up a fresh
-   small-capital PM sub-account specifically for fixture capture (`capture_contract_snapshot`
-   in `src/ccxt_contracts.py` already works against it once `account_type` is set in
-   `api-keys.json` — no further tooling work needed, just a real account to point it at)
-   and live validation?
-4. Nothing in this draft has executed against Binance's real `papi*` endpoints. Treat
-   every claim above as "true per ccxt's source," not "true in production," until a
-   real capture confirms it.
+- ~~`load_leverage_brackets()` behavior for PM?~~ Confirmed directly via an isolated
+  `reload=True` call: `papiGetUmLeverageBracket` returns real tier data (1064
+  symbols, correct BTC bracket structure), composes cleanly with a following
+  `fetch_positions_risk()`.
+- ~~`_get_balance`'s accountEquity vs actualEquity?~~ Resolved with real floating
+  PnL: opened a position, polled through a real uPNL swing, found both fields move
+  together — **neither** excludes unrealized PnL (contrary to the original
+  assumption). `accountEquity` is correct to keep (it matched
+  `totalAvailableBalance` when flat); no code change needed. Multi-asset collateral
+  itself (e.g. BTC posted as margin) still hasn't been tested against a real mixed
+  account, but `accountEquity` is a single account-wide figure by construction, so
+  this is expected to already be correct.
+- ~~Does this execute against Binance's real `papi*` endpoints?~~ Yes — balance,
+  positions, hedge-mode setting (both the one-way→hedge transition and the
+  already-set idempotent case, which returns the same `-4059` code `BinanceBot`
+  already handles), leverage setting, market orders, limit orders, and
+  cancellation were all placed/confirmed for real. A genuine `BinancePortfolioBot`
+  was also constructed via the real `setup_bot()` (not just a hook-level harness)
+  against the real account, confirming the hook layer behaves identically either
+  way — see `src/exchanges/binance_portfolio.py`'s docstring for the full,
+  itemized account.
+
+Still open, by design rather than oversight:
+
+1. `execute_order()`/`execute_cancellation()`'s real HSL write-coordination gate
+   (`src/live/hsl_live.py`'s `connector_write`) requires a full async bootstrap
+   (candle warmup, staged balance/position/fill refresh, HSL owner init) to admit
+   writes — confirmed this live, not guessed. This is deliberate, exchange-agnostic
+   safety machinery identical for every exchange, not PM-specific, and it gates the
+   exact papi calls already validated above — not a gap in this connector.
+2. A real multi-asset-collateral account (BTC *and* USDT posted as margin
+   simultaneously) hasn't been tested, as noted above.
