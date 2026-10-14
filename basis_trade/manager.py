@@ -174,6 +174,37 @@ def resize_coin(ex: PMBasisExchange, cfg: BasisTradeConfig, state: CoinState, ta
         return True
 
 
+def _resize_or_reconcile(ex: PMBasisExchange, cfg: BasisTradeConfig, coin: str, state: CoinState,
+                          target_notional: float):
+    """Wraps resize_coin with fault isolation. Confirmed live (twice): a leg's order can
+    fail mid-resize (a transient NetworkError; a ccxt post-only race rejection not
+    covered by order_execution.py's own retry) leaving the two legs mismatched. Previously
+    that exception aborted the rest of THIS pass's coins and left the mismatch to be
+    caught by the next scheduled reconcile_coin call -- up to a full poll interval later
+    (default 5 minutes), which is a real, scale-dependent risk: at $100M the naked
+    exposure during that window is the account's actual per-coin position, not a few
+    dollars of test-account dust. This now retries immediately, within the same pass:
+    re-read this coin's real state right after the failure and reconcile it right away,
+    rather than waiting for the next poll. Returns (resize_acted, note_for_action_log)."""
+    try:
+        acted = resize_coin(ex, cfg, state, target_notional)
+        return acted, None
+    except Exception as e:
+        print(f"[FAULT] {coin}: resize failed mid-leg ({type(e).__name__}: {e}) -- "
+              f"attempting immediate reconciliation instead of waiting for next poll")
+        try:
+            fresh = read_coin_state(ex, coin, cfg.quote)
+            reconciled = reconcile_coin(ex, cfg, fresh)
+        except Exception as e2:
+            print(f"[FAULT] {coin}: immediate reconciliation ALSO failed "
+                  f"({type(e2).__name__}: {e2}) -- will retry on next scheduled poll")
+            return False, (f"{coin}: resize failed ({type(e).__name__}), reconciliation attempt "
+                            f"also failed ({type(e2).__name__}) -- needs next poll")
+        if reconciled:
+            return False, f"{coin}: resize failed ({type(e).__name__}), reconciled immediately within same pass"
+        return False, f"{coin}: resize failed ({type(e).__name__}), no reconciliation needed (already within tolerance)"
+
+
 def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
     account = ex.account_state()
     equity, unimmr = account["equity"], account["unimmr"]
@@ -205,7 +236,9 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
         for coin in all_coins:
             s = states[coin]
             if s.spot_notional > 1.0 or s.perp_notional > 1.0:
-                resize_coin(ex, cfg, s, target_notional=0.0)
+                _, note = _resize_or_reconcile(ex, cfg, coin, s, target_notional=0.0)
+                if note:
+                    report["actions"].append(note)
         report["actions"].append(
             f"EMERGENCY: uniMMR={unimmr:.3f} <= {cfg.unimmr_emergency} -- flattened all coins"
         )
@@ -215,8 +248,11 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
     for coin in disabled_coins:
         s = states[coin]
         if s.spot_notional > 1.0 or s.perp_notional > 1.0:
-            resize_coin(ex, cfg, s, target_notional=0.0)
-            report["actions"].append(f"{coin}: unwound (disabled)")
+            acted, note = _resize_or_reconcile(ex, cfg, coin, s, target_notional=0.0)
+            if acted:
+                report["actions"].append(f"{coin}: unwound (disabled)")
+            if note:
+                report["actions"].append(note)
 
     if not cfg.enabled:
         report["actions"].append("master switch disabled -- fully unwound" if disabled_coins else "already flat")
@@ -230,7 +266,9 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
         total_target_notional = equity * cfg.min_exposure_pct
         for coin, weight in weights.items():
             target = min(total_target_notional * weight, states[coin].spot_notional)
-            resize_coin(ex, cfg, states[coin], target)
+            _, note = _resize_or_reconcile(ex, cfg, coin, states[coin], target)
+            if note:
+                report["actions"].append(note)
         report["actions"].append(
             f"DERISK: uniMMR={unimmr:.3f} <= {cfg.unimmr_derisk} -- reduced toward band floor "
             "(per-coin skips, if any, logged separately above)"
@@ -253,8 +291,10 @@ def run_once(cfg: BasisTradeConfig, ex: PMBasisExchange) -> dict:
                 f"{coin}: skipped increase (uniMMR={unimmr:.3f} in caution tier)"
             )
             continue
-        acted = resize_coin(ex, cfg, states[coin], target)
+        acted, note = _resize_or_reconcile(ex, cfg, coin, states[coin], target)
         if acted:
             report["actions"].append(f"{coin}: resized toward ${target:,.2f} (was ${states[coin].spot_notional:,.2f})")
+        if note:
+            report["actions"].append(note)
 
     return report

@@ -1,22 +1,34 @@
-"""Live-loop entrypoint for the basis trade: runs manager.run_once on a fixed interval
-forever. dry_run defaults to True everywhere upstream (config.py, order_execution.py) --
-pass --live explicitly to place real orders. Nothing about this loop is adaptive/urgent;
-the strategy is a static, always-on allocation rebalanced only on band drift, so a
-coarse poll interval (default 5 minutes) is intentional, not a placeholder.
+"""Live-loop entrypoint for the basis trade: runs manager.run_once on a fixed interval,
+PLUS (by default) a real-time websocket watcher (pm_stream.py) that triggers an immediate
+out-of-cycle run_once() the moment Binance pushes an order/account/risk event, rather than
+waiting out the rest of the poll timer. dry_run defaults to True everywhere upstream
+(config.py, order_execution.py) -- pass --live explicitly to place real orders.
+
+The poll interval (default 5 minutes) is still the steady-state cadence for ordinary
+target-band rebalancing -- that part is deliberately coarse, not a placeholder (a static,
+always-on allocation doesn't need to be re-evaluated every second). The real-time watcher
+exists for a different, narrower reason: a leg failure or an exchange-side event (fill,
+ADL, margin call) leaving the position mismatched should be caught in roughly however long
+one run_once() pass takes, not however long is left on the poll timer -- confirmed live
+(2026-10-14) to matter: two real mid-resize failures this session left a coin briefly
+naked, self-healed only on the NEXT scheduled poll, up to several minutes later.
 
 Usage:
   python run_live.py <account_label>                  # dry run, prints what it would do
   python run_live.py <account_label> --live            # places real orders
   python run_live.py <account_label> --live --once     # single pass, for cron/manual runs
+  python run_live.py <account_label> --live --no-realtime  # poll-only, no websocket watcher
 """
 import argparse
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
 from config import BasisTradeConfig
 from exchange import PMBasisExchange
 from manager import run_once
+from pm_stream import run_watcher_in_thread
 
 
 def main():
@@ -33,6 +45,8 @@ def main():
                          help="maker-first timeout before taker fallback, per order slice")
     parser.add_argument("--reprice-interval-seconds", type=float, default=60.0)
     parser.add_argument("--leverage", type=int, default=10)
+    parser.add_argument("--no-realtime", action="store_true",
+                         help="disable the websocket watcher; poll on --poll-seconds only")
     args = parser.parse_args()
 
     cfg = BasisTradeConfig(
@@ -53,6 +67,18 @@ def main():
     print(f"exposure band: {cfg.min_exposure_pct:.1%}-{cfg.max_exposure_pct:.1%} "
           f"(target {cfg.target_exposure_pct:.1%}), enabled={cfg.enabled}")
 
+    urgent = threading.Event()
+    stop_watcher = threading.Event()
+    watcher_thread = None
+    if not args.no_realtime and not args.once:
+        def _on_event(event):
+            # Runs on the watcher's own background thread -- only ever touches this one
+            # thread-safe flag, never the main thread's ccxt clients (see pm_stream.py).
+            print(f"[REALTIME] {event['type']} -- triggering immediate check")
+            urgent.set()
+        watcher_thread = run_watcher_in_thread(args.account_label, _on_event, stop_watcher)
+        print("real-time websocket watcher started (pass --no-realtime to disable)")
+
     try:
         while True:
             ts = datetime.now(timezone.utc).isoformat()
@@ -63,8 +89,16 @@ def main():
                 print(f"[{ts}] ERROR during run_once: {type(e).__name__}: {e}")
             if args.once:
                 break
-            time.sleep(args.poll_seconds)
+            # Sleep in short slices rather than one long call, so an urgent signal from the
+            # watcher thread is noticed within ~1s instead of waiting out the full interval.
+            urgent.clear()
+            deadline = time.time() + args.poll_seconds
+            while time.time() < deadline and not urgent.is_set():
+                time.sleep(1.0)
     finally:
+        stop_watcher.set()
+        if watcher_thread is not None:
+            watcher_thread.join(timeout=5.0)
         ex.close()
 
 
