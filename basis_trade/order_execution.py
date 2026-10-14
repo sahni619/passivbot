@@ -123,10 +123,16 @@ def place_and_fill_maker_first(
         params = {**order_params, "postOnly": True}
         try:
             order = ex.create_order(symbol, "limit", side, slice_qty, price, params=params)
-        except ccxt.OrderImmediatelyFillable:
+        except (ccxt.OrderImmediatelyFillable, ccxt.OrderNotFillable):
             # Book moved between fetch and submit despite the one-tick buffer above --
-            # Binance never placed the order, so there is nothing to cancel. Just loop
-            # around and reprice off a fresh book rather than aborting the whole pass.
+            # Binance never placed the order, so there is nothing to cancel. Binance's
+            # spot/margin (papi) and futures (binanceusdm) endpoints raise two DIFFERENT
+            # ccxt exception classes for this same rejection (confirmed live: spot raised
+            # OrderImmediatelyFillable, futures raised OrderNotFillable, both siblings
+            # under InvalidOrder) -- catching both specifically, not the broad InvalidOrder
+            # base, so a genuinely different invalid-order bug still surfaces loudly
+            # instead of being silently retried forever. Just loop around and reprice off
+            # a fresh book rather than aborting the whole pass.
             print(f"[REPRICE] {symbol} {side}: post-only would have crossed, refreshing book")
             continue
         order_id = order["id"]
