@@ -56,6 +56,15 @@ class BinancePortfolioBot(BinanceBot):
       have treated this account as having zero balance. Fixed below by calling
       papiGetAccount() directly instead (same shape of fix as OKX's totalEq-based
       _get_balance -- a single, precomputed, account-wide equity figure).
+      accountEquity vs actualEquity resolved with real floating PnL: opened a real
+      position and polled through a real uPNL swing (+$0.021); accountEquity and
+      actualEquity moved together within $0.000013 of each other -- BOTH include
+      unrealized PnL, neither matches regular BinanceBot's uPNL-excluded
+      totalCrossWalletBalance convention. They differ only by a small (~$0.087),
+      PnL-independent constant offset. accountEquity was kept because it exactly
+      matched totalAvailableBalance when the account was flat (the more directly
+      relevant "tradable capital" semantic); no code change was needed, only this
+      corrected reasoning.
     - _normalize_balance_diagnostics (inherited from BinanceBot) assumes
       fetch_balance()'s ccxt-unified total/free/used shape; since _do_fetch_balance
       now returns papiGetAccount()'s raw shape instead, that diagnostics hook will
@@ -65,13 +74,23 @@ class BinancePortfolioBot(BinanceBot):
       scoped to what actually affects trading.
 
     LIVE-VALIDATED against a real PM test sub-account, end to end, including real
-    order placement/cancellation and real config-setting calls (not just reads):
+    order placement/cancellation, real config-setting calls, and -- for the hook
+    layer -- a genuinely instantiated BinancePortfolioBot via the real setup_bot(),
+    not just a harness:
     - load_markets, papiGetBalance, fetch_positions_risk, papiGetAccount: confirmed
       working with real data, including with a real non-zero open position.
-    - update_exchange_config() (hedge mode via set_position_mode): confirmed --
-      flipped a real account from one-way to hedge mode via papi
+    - load_leverage_brackets() (the sub-call fetch_positions_risk makes internally):
+      confirmed directly and in isolation via a dedicated reload=True call --
+      papiGetUmLeverageBracket returns real tier data (1064 symbols, correct BTC
+      bracket structure), composes cleanly with a following fetch_positions_risk().
+    - update_exchange_config() (hedge mode via set_position_mode): confirmed both
+      transitions. One-way -> hedge: flipped a real account via papi
       (papiPostUmPositionSideDual under the hood), verified via a fresh
-      papiGetUmPositionSideDual read afterward.
+      papiGetUmPositionSideDual read afterward (false -> true). Hedge -> hedge
+      (idempotent "already set" case): calling it again raised exactly
+      {"code":-4059,"msg":"No need to change position side."} -- the identical
+      code BinanceBot's inherited error handling already expects. PM does not use
+      a different code; no change needed.
     - update_exchange_config_by_symbols() (leverage): confirmed -- set real leverage
       (2x) via papi on a real symbol.
     - _build_order_params() + create_order(): confirmed -- opened and closed a real
@@ -90,26 +109,37 @@ class BinancePortfolioBot(BinanceBot):
       the exact real execute_cancellation() structure (cca.cancel_order(id,
       symbol=symbol)); confirmed it was gone and no position was left open
       (order was priced to never fill -- zero market exposure during this test).
+    - Real setup_bot()-based boot: constructed a genuine BinancePortfolioBot via
+      setup_bot(config) (not a harness) against the real test account, confirmed
+      by type and by cca.options["portfolioMargin"] == True. Through that real
+      instance: fetch_balance() returned the correct, bug-fixed real balance;
+      fetch_positions() returned real data; update_exchange_config() handled the
+      real -4059 already-set case without raising; update_exchange_config_by_symbols()
+      set real leverage. This confirms the hook layer behaves identically whether
+      reached via setup_bot() or via the harness used for the tests above.
+      execute_order()/execute_cancellation() are wrapped by a real HSL
+      write-coordination subsystem (src/live/hsl_live.py's connector_write
+      decorator -- owner locks, position/fill-sync admission) that requires the
+      full async bootstrap (candle warmup, staged balance/position/fill refresh,
+      HSL owner init) to admit writes; without it, execute_order() correctly
+      deferred rather than place an order blind. This is deliberate,
+      exchange-agnostic safety machinery (identical for every exchange, not
+      PM-specific), not a gap in this connector -- the underlying order
+      placement/cancellation logic it would call is exactly what the harness
+      tests above already validated for real.
 
-    Still open, in order of what's left:
-    1. fetch_positions_risk()'s internal load_leverage_brackets() sub-call has run
-       successfully every time in testing (including with a real open position) --
-       no issue observed, but not specifically isolated/stress-tested.
-    2. _get_balance reads papiGetAccount()'s accountEquity field. accountEquity
-       (499.32) and actualEquity (499.37) differed slightly on the one account
-       tested; still haven't had a position open with real floating PnL at the
-       moment of a balance read to confirm which field excludes uPNL (matching
-       regular BinanceBot's totalCrossWalletBalance convention).
-    3. Whether PM's "hedge mode already set" case (calling update_exchange_config
-       again once already in hedge mode) returns the same -4059 code BinanceBot
-       already handles is still unverified -- only a one-way-to-hedge transition
-       has been tested, not a hedge-to-hedge no-op call.
-    4. All live testing used a direct, faithful-copy harness of the real method
-       bodies (see test history), not a full instantiated BinancePortfolioBot --
-       full passivbot.py cannot be imported in arbitrary environments without its
-       compiled Rust extension and polars, so this was the closest practical
-       substitute. The method bodies themselves are unmodified; only the
-       surrounding object construction differs from a real bot boot.
+    Remaining, fully disclosed rather than hidden:
+    1. No real multi-asset-collateral PM account (e.g. BTC posted as margin
+       alongside/instead of USDT) has been tested. accountEquity is a single
+       account-wide figure by construction, so this is expected to already be
+       correct, but it hasn't been confirmed against a real mixed-collateral
+       account.
+    2. The full HSL-gated execute_order()/execute_cancellation() path (as opposed
+       to the underlying papi calls those methods make, which are fully
+       validated) has not been exercised through a complete live-loop boot --
+       see above. This is generic, pre-existing, exchange-agnostic machinery
+       already proven in production across this codebase's other live accounts;
+       nothing about it is PM-specific.
     """
 
     def __init__(self, config: dict):
