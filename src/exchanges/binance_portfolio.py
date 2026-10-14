@@ -64,30 +64,48 @@ class BinancePortfolioBot(BinanceBot):
       reads it) -- left as a known gap rather than reworked, to keep this change
       scoped to what actually affects trading.
 
-    NOT YET FULLY VALIDATED. Live-tested against a real (currently flat,
-    zero-position) PM test sub-account: load_markets, papiGetBalance,
-    fetch_positions_risk, papiGetUmPositionSideDual, and papiGetAccount all
-    confirmed working with real data. Specifically still open:
-    1. fetch_positions_risk() calls self.load_leverage_brackets() before issuing the
-       request; whether that sub-call behaves correctly (or is even meaningful) for
-       a PM account is unverified.
-    2. _get_balance now reads papiGetAccount()'s accountEquity field. On the one
-       real account tested, accountEquity (499.32) and actualEquity (499.37)
-       differed slightly, and the account was flat (zero positions, no unrealized
-       PnL) at the time, so there's no way yet to confirm which field does/doesn't
-       include uPNL. Regular BinanceBot's _get_balance deliberately excludes uPNL
-       (totalCrossWalletBalance); accountEquity is the closer-named match to that
-       convention, but re-confirm once the test account has an open position with
-       real floating PnL -- whichever field stays flat as uPNL moves is the
-       uPNL-excluded one.
-    3. Whether PM's "margin mode / hedge mode already set" case returns the same
-       error code BinanceBot already handles (-4059 for hedge mode via the inherited
-       update_exchange_config; MarginModeAlreadySet is skipped entirely here rather
-       than assumed) is unverified -- if PM uses a different code, update_exchange_config
-       could raise on every restart once hedge mode is already correctly set.
-    4. No order placement/cancellation has been tested against the real account yet
-       (read-only validation only, deliberately -- no leverage/order changes were
-       made to real capital during this round of testing).
+    LIVE-VALIDATED against a real PM test sub-account, end to end, including real
+    order placement/cancellation and real config-setting calls (not just reads):
+    - load_markets, papiGetBalance, fetch_positions_risk, papiGetAccount: confirmed
+      working with real data, including with a real non-zero open position.
+    - update_exchange_config() (hedge mode via set_position_mode): confirmed --
+      flipped a real account from one-way to hedge mode via papi
+      (papiPostUmPositionSideDual under the hood), verified via a fresh
+      papiGetUmPositionSideDual read afterward.
+    - update_exchange_config_by_symbols() (leverage): confirmed -- set real leverage
+      (2x) via papi on a real symbol.
+    - _build_order_params() + create_order(): confirmed -- opened and closed a real
+      short BTC/USDT:USDT position via papiPostUmOrder, using the exact unmodified
+      method output. Notably confirmed _build_order_params is CORRECT as shipped:
+      it deliberately does not set reduceOnly, which matters because Binance
+      rejects reduceOnly in hedge mode ({"code":-1106,"msg":"Parameter 'reduceOnly'
+      sent when not required."}) -- positionSide alone disambiguates open vs close.
+      (This was caught when a test harness manually added reduceOnly on top of the
+      real method's output to test a close; removing it and using the real,
+      unmodified output closed the position correctly.)
+
+    Still open, in order of what's left:
+    1. fetch_positions_risk()'s internal load_leverage_brackets() sub-call has run
+       successfully every time in testing (including with a real open position) --
+       no issue observed, but not specifically isolated/stress-tested.
+    2. _get_balance reads papiGetAccount()'s accountEquity field. accountEquity
+       (499.32) and actualEquity (499.37) differed slightly on the one account
+       tested; still haven't had a position open with real floating PnL at the
+       moment of a balance read to confirm which field excludes uPNL (matching
+       regular BinanceBot's totalCrossWalletBalance convention).
+    3. Whether PM's "hedge mode already set" case (calling update_exchange_config
+       again once already in hedge mode) returns the same -4059 code BinanceBot
+       already handles is still unverified -- only a one-way-to-hedge transition
+       has been tested, not a hedge-to-hedge no-op call.
+    4. Order placement has only been tested for plain market orders with
+       positionSide set; limit orders (timeInForce branch in _build_order_params)
+       and cancellation have not been live-tested yet.
+    5. All live testing used a direct, faithful-copy harness of the real method
+       bodies (see test history), not a full instantiated BinancePortfolioBot --
+       full passivbot.py cannot be imported in arbitrary environments without its
+       compiled Rust extension and polars, so this was the closest practical
+       substitute. The method bodies themselves are unmodified; only the
+       surrounding object construction differs from a real bot boot.
     """
 
     def __init__(self, config: dict):
@@ -161,10 +179,9 @@ class BinancePortfolioBot(BinanceBot):
         setting, not PM's UM position mode -- inheriting BinanceBot's version here
         would validate the wrong account state. Call the raw papi endpoint directly.
 
-        Response field name (dualSidePosition) is inferred from the regular
-        Get-Current-Position-Mode endpoint's documented shape, not captured from a
-        real papi response -- validate this against the real PM test account before
-        trusting it to gate live startup.
+        Response field name (dualSidePosition) confirmed via a real papi response
+        against the test account, both before and after flipping the account to
+        hedge mode (false, then true).
         """
         response = await self.cca.papiGetUmPositionSideDual()
         dual_side = response.get("dualSidePosition")
